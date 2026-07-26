@@ -1,14 +1,9 @@
-use std::io::Write;
-use std::string::ToString;
 use std::sync::{Arc, RwLock};
 use clap::Parser;
-use serde_json::Deserializer;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use oxide_kv::client::ClientHandler;
 use oxide_kv::config::Config;
 use oxide_kv::state_machine::StateMachine;
-use oxide_kv::protocol::Command;
 use oxide_kv::raft::node::{NodeState, RaftNode};
 use oxide_kv::raft::rpc::RpcServer;
 use oxide_kv::raft::timer::run_election_timer;
@@ -90,11 +85,12 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // 9. Graceful shutdown handling
-    let shutdown_node = raft_node.clone();
+    // TODO: Persist final state and cleanly drain in-flight RPCs before exit.
+    let _shutdown_node = raft_node.clone();
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.ok();
         println!("\n🛑 Shutdown signal received. Saving state...");
-        // TODO: Add explicit persistence/cleanup logic here
+        // Persistence/cleanup will land in a later PR (see CHANGELOG).
         std::process::exit(0);
     });
 
