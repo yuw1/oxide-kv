@@ -1,6 +1,9 @@
 use crate::config::Config;
-use crate::protocol::{Command, LogEntry};
-use crate::raft::rpc::{AppendEntriesArgs, AppendReplyArgs, RequestVoteArgs, RpcClient, VoteResponseArgs};
+use crate::protocol::{Command, LogEntry, Snapshot};
+use crate::raft::rpc::{
+    AppendEntriesArgs, AppendReplyArgs, InstallSnapshotArgs, InstallSnapshotReplyArgs,
+    RequestVoteArgs, RpcClient, VoteResponseArgs,
+};
 use crate::raft::storage::RaftStorage;
 use crate::state_machine::StateMachine;
 use std::collections::HashMap;
@@ -403,15 +406,103 @@ impl RaftNode {
 
         AppendReplyArgs { term: self.current_term, success: true }
     }
+
+    /// Handle an InstallSnapshot RPC from the Leader.
+    ///
+    /// Per §7 of the Raft thesis: replace local state machine with the snapshot,
+    /// discard log entries covered by it, and reset commit / applied indices.
+    pub fn handle_install_snapshot(&mut self, args: &InstallSnapshotArgs) -> InstallSnapshotReplyArgs {
+        // 1. Term check
+        if args.term < self.current_term {
+            return InstallSnapshotReplyArgs { term: self.current_term };
+        }
+        if args.term > self.current_term {
+            self.current_term = args.term;
+            self.state = NodeState::Follower;
+            self.vote_for = None;
+            let _ = self.storage.save_meta(self.current_term.clone(), self.vote_for.clone());
+        }
+        self.state = NodeState::Follower;
+        self.last_heartbeat = Instant::now();
+
+        // 2. Persist snapshot to disk (atomic via storage layer).
+        let _ = self.storage.save_snapshot(&args.snapshot);
+
+        // 3. Replace state machine contents with snapshot data.
+        {
+            let mut sm = self.state_machine.write().unwrap();
+            // Reset to empty, then re-populate from snapshot.
+            sm.clear_for_snapshot();
+            for (k, v) in &args.snapshot.data {
+                let _ = sm.set(k, v);
+            }
+        }
+
+        // 4. Discard log entries at or before last_included_index.
+        let last_included = args.last_included_index;
+        self.log.retain(|e| e.index as u64 > last_included);
+        let _ = self.storage.rewrite_wal_after_snapshot(last_included);
+
+        // 5. Reset indices: the snapshot's effect is already "applied".
+        if last_included > self.commit_index {
+            self.commit_index = last_included;
+        }
+        if last_included > self.last_applied {
+            self.last_applied = last_included;
+        }
+
+        InstallSnapshotReplyArgs { term: self.current_term }
+    }
+
+    /// Take a snapshot of the current state machine if the log has grown
+    /// beyond `threshold` entries, then truncate the WAL to free disk space.
+    ///
+    /// Returns `true` if a snapshot was taken.
+    pub fn maybe_snapshot(&mut self, threshold: usize) -> bool {
+        if self.state != NodeState::Leader || self.log.len() <= threshold {
+            return false;
+        }
+        // Snapshot at the last applied entry — only entries that have actually
+        // been committed can be safely captured.
+        let snapshot_index = self.commit_index;
+        if snapshot_index == 0 {
+            return false;
+        }
+        let snapshot_term = self
+            .log
+            .get(snapshot_index as usize - 1)
+            .map(|e| e.term)
+            .unwrap_or(0);
+
+        let data = {
+            let sm = self.state_machine.read().unwrap();
+            sm.snapshot_data()
+        };
+
+        let snap = Snapshot {
+            last_included_index: snapshot_index,
+            last_included_term: snapshot_term,
+            data,
+        };
+
+        if self.storage.save_snapshot(&snap).is_err() {
+            return false;
+        }
+        let _ = self.storage.rewrite_wal_after_snapshot(snapshot_index);
+        // Local in-memory log is preserved (other peers may still need entries
+        // in the snapshot range via AppendEntries), but the disk WAL is freed.
+        true
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{Command, LogEntry};
-    use crate::raft::rpc::{AppendEntriesArgs, RequestVoteArgs};
+    use crate::protocol::{Command, LogEntry, Snapshot};
+    use crate::raft::rpc::{AppendEntriesArgs, InstallSnapshotArgs, RequestVoteArgs};
     use crate::raft::storage::RaftStorage;
     use crate::state_machine::StateMachine;
+    use std::collections::HashMap;
     use std::sync::{Arc, RwLock};
     use tempfile::TempDir;
 
@@ -421,7 +512,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let wal = dir.path().join(format!("{node_id}.wal")).to_str().unwrap().to_string();
         let meta = dir.path().join(format!("{node_id}_meta.json")).to_str().unwrap().to_string();
-        let storage = RaftStorage::new_with_paths(wal, meta);
+        let snap = dir.path().join(format!("{node_id}_snapshot.json")).to_str().unwrap().to_string();
+        let storage = RaftStorage::new_with_paths(wal, meta, snap);
         let sm = Arc::new(RwLock::new(StateMachine::open().unwrap()));
         let node = RaftNode::new_with_storage(node_id.to_string(), peers, sm, storage);
         (dir, node)
@@ -832,7 +924,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let wal = dir.path().join(format!("{node_id}.wal")).to_str().unwrap().to_string();
         let meta = dir.path().join(format!("{node_id}_meta.json")).to_str().unwrap().to_string();
-        let storage = RaftStorage::new_with_paths(wal, meta);
+        let snap = dir.path().join(format!("{node_id}_snapshot.json")).to_str().unwrap().to_string();
+        let storage = RaftStorage::new_with_paths(wal, meta, snap);
 
         // Simulate a fresh WAL with three committed entries.
         storage.append_wal_log(&make_entry(1, 1, "a", "1")).unwrap();
@@ -913,5 +1006,205 @@ mod tests {
         // Calling again must not reset next_index (which would force a full log resend).
         node.become_leader();
         assert_eq!(node.next_index.get("n2"), Some(&next_idx_before));
+    }
+
+    // ---------- handle_install_snapshot ----------
+
+    fn snapshot_args(term: u64, leader: &str, last_idx: u64, last_term: u64,
+                     data: HashMap<String, String>) -> InstallSnapshotArgs {
+        InstallSnapshotArgs {
+            term,
+            leader_id: leader.to_string(),
+            last_included_index: last_idx,
+            last_included_term: last_term,
+            snapshot: Snapshot {
+                last_included_index: last_idx,
+                last_included_term: last_term,
+                data,
+            },
+        }
+    }
+
+    fn sm_data(node: &RaftNode) -> HashMap<String, String> {
+        node.state_machine.read().unwrap().snapshot_data()
+    }
+
+    #[test]
+    fn install_snapshot_rejects_stale_term() {
+        let (_d, mut node) = make_node("n1", vec!["n2".into()]);
+        node.current_term = 5;
+
+        let reply = node.handle_install_snapshot(&snapshot_args(4, "n2", 1, 1, HashMap::new()));
+
+        assert_eq!(reply.term, 5);
+        assert_eq!(node.current_term, 5, "must not regress term");
+    }
+
+    #[test]
+    fn install_snapshot_steps_down_and_updates_term_on_newer() {
+        let (_d, mut node) = make_node("n1", vec!["n2".into()]);
+        node.state = NodeState::Candidate;
+        node.current_term = 1;
+        node.vote_for = Some("n1".into());
+
+        let reply = node.handle_install_snapshot(&snapshot_args(2, "n2", 1, 1, HashMap::new()));
+
+        assert_eq!(reply.term, 2);
+        assert_eq!(node.state, NodeState::Follower);
+        assert_eq!(node.current_term, 2);
+        assert!(node.vote_for.is_none());
+    }
+
+    #[test]
+    fn install_snapshot_replaces_state_machine_contents() {
+        let (_d, mut node) = make_node("n1", vec!["n2".into()]);
+        // Seed local state with some data that must be wiped.
+        {
+            let mut sm = node.state_machine.write().unwrap();
+            let _ = sm.set("old", "stale");
+            let _ = sm.set("keep", "maybe");
+        }
+
+        let mut data = HashMap::new();
+        data.insert("alpha".into(), "1".into());
+        data.insert("beta".into(), "2".into());
+
+        node.handle_install_snapshot(&snapshot_args(1, "n2", 5, 1, data));
+
+        let sm = sm_data(&node);
+        assert_eq!(sm.get("alpha").map(String::as_str), Some("1"));
+        assert_eq!(sm.get("beta").map(String::as_str), Some("2"));
+        assert!(sm.get("old").is_none(), "snapshot must wipe stale data");
+        assert!(sm.get("keep").is_none(), "snapshot must wipe stale data");
+    }
+
+    #[test]
+    fn install_snapshot_discards_covered_log_entries() {
+        let (_d, mut node) = make_node("n1", vec!["n2".into()]);
+        node.log = vec![
+            make_entry(1, 1, "a", "1"),
+            make_entry(1, 2, "b", "2"),
+            make_entry(1, 3, "c", "3"),
+            make_entry(1, 4, "d", "4"),
+        ];
+
+        node.handle_install_snapshot(&snapshot_args(1, "n2", 3, 1, HashMap::new()));
+
+        // Entries 1..=3 are covered, only index 4 must remain.
+        assert_eq!(node.log.len(), 1);
+        assert_eq!(node.log[0].index, 4);
+    }
+
+    #[test]
+    fn install_snapshot_persists_snapshot_file_to_disk() {
+        let (d, mut node) = make_node("n1", vec!["n2".into()]);
+        let mut data = HashMap::new();
+        data.insert("k".into(), "v".into());
+
+        node.handle_install_snapshot(&snapshot_args(1, "n2", 1, 1, data));
+
+        let snap_path = d.path().join("n1_snapshot.json");
+        assert!(snap_path.exists(), "snapshot file must be on disk");
+        let raw = std::fs::read_to_string(&snap_path).unwrap();
+        assert!(raw.contains("\"last_included_index\": 1"), "raw: {raw}");
+        assert!(raw.contains("\"k\""), "raw: {raw}");
+    }
+
+    #[test]
+    fn install_snapshot_advances_commit_index_to_snapshot_position() {
+        let (_d, mut node) = make_node("n1", vec!["n2".into()]);
+        node.log = vec![make_entry(1, 1, "a", "1"), make_entry(1, 2, "b", "2")];
+        node.commit_index = 0;
+        node.last_applied = 0;
+
+        node.handle_install_snapshot(&snapshot_args(1, "n2", 2, 1, HashMap::new()));
+
+        assert_eq!(node.commit_index, 2);
+        assert_eq!(node.last_applied, 2);
+    }
+
+    #[test]
+    fn install_snapshot_rewrites_wal_on_disk() {
+        let (_d, mut node) = make_node("n1", vec!["n2".into()]);
+        node.log = vec![make_entry(1, 1, "a", "1"), make_entry(1, 2, "b", "2"), make_entry(1, 3, "c", "3")];
+
+        // Persist the log to WAL so we can verify it's rewritten.
+        for entry in &node.log {
+            node.storage.append_wal_log(entry).unwrap();
+        }
+        assert_eq!(node.storage.restore_wal_log().len(), 3);
+
+        node.handle_install_snapshot(&snapshot_args(1, "n2", 2, 1, HashMap::new()));
+
+        // After install, the WAL on disk must retain only the post-snapshot entry.
+        assert_eq!(node.storage.restore_wal_log().len(), 1);
+    }
+
+    // ---------- maybe_snapshot ----------
+
+    #[test]
+    fn maybe_snapshot_noop_below_threshold() {
+        let (_d, mut node) = make_node("n1", vec!["n2".into()]);
+        node.state = NodeState::Leader;
+        node.current_term = 1;
+        node.log = vec![make_entry(1, 1, "a", "1")];
+        node.commit_index = 1;
+
+        assert!(!node.maybe_snapshot(100));
+    }
+
+    #[test]
+    fn maybe_snapshot_noop_when_not_leader() {
+        let (_d, mut node) = make_node("n1", vec!["n2".into()]);
+        node.state = NodeState::Follower;
+        // Even with a huge log, only the leader takes snapshots.
+        for i in 1..=10 {
+            node.log.push(make_entry(1, i, "k", "v"));
+        }
+        node.commit_index = 10;
+
+        assert!(!node.maybe_snapshot(5));
+    }
+
+    #[test]
+    fn maybe_snapshot_noop_when_commit_index_is_zero() {
+        let (_d, mut node) = make_node("n1", vec!["n2".into()]);
+        node.state = NodeState::Leader;
+        node.log = vec![make_entry(1, 1, "k", "v"), make_entry(1, 2, "k", "v")];
+
+        // commit_index=0 means nothing has been applied yet — no safe snapshot.
+        assert!(!node.maybe_snapshot(1));
+    }
+
+    #[test]
+    fn maybe_snapshot_takes_snapshot_above_threshold() {
+        let (d, mut node) = make_node("n1", vec!["n2".into()]);
+        node.state = NodeState::Leader;
+        node.current_term = 1;
+        // Apply some state to the machine so snapshot has data.
+        {
+            let mut sm = node.state_machine.write().unwrap();
+            let _ = sm.set("foo", "bar");
+        }
+        // Seed log + commit so commit_index > 0.
+        for i in 1..=5 {
+            node.log.push(make_entry(1, i, "k", "v"));
+        }
+        node.commit_index = 5;
+        for entry in &node.log {
+            node.storage.append_wal_log(entry).unwrap();
+        }
+
+        let took = node.maybe_snapshot(3);
+        assert!(took);
+
+        // Snapshot file must exist with the right metadata.
+        let snap_path = d.path().join("n1_snapshot.json");
+        let raw = std::fs::read_to_string(&snap_path).unwrap();
+        assert!(raw.contains("\"last_included_index\": 5"), "raw: {raw}");
+        assert!(raw.contains("\"foo\""), "raw: {raw}");
+
+        // WAL on disk must be truncated.
+        assert_eq!(node.storage.restore_wal_log().len(), 0);
     }
 }

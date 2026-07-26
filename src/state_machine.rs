@@ -23,6 +23,17 @@ impl StateMachine {
         self.index.remove(key);
         Ok(())
     }
+
+    /// Return an owned clone of the underlying key/value table for snapshotting.
+    pub fn snapshot_data(&self) -> std::collections::HashMap<String, String> {
+        self.index.clone()
+    }
+
+    /// Replace the contents with the given snapshot payload.
+    /// Used by followers installing a snapshot from the leader.
+    pub fn clear_for_snapshot(&mut self) {
+        self.index.clear();
+    }
 }
 
 #[cfg(test)]

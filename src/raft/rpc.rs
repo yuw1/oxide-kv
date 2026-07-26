@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::protocol::LogEntry;
+use crate::protocol::{LogEntry, Snapshot};
 pub use crate::raft::node::{NodeState, RaftNode};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
@@ -14,6 +14,8 @@ pub enum RaftMessage {
     VoteResponse(VoteResponseArgs),
     AppendEntries(AppendEntriesArgs),
     AppendReply(AppendReplyArgs),
+    InstallSnapshot(InstallSnapshotArgs),
+    InstallSnapshotReply(InstallSnapshotReplyArgs),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -44,6 +46,26 @@ pub struct AppendEntriesArgs {
 pub struct AppendReplyArgs {
     pub term: u64,    // Current term of follower, for leader to update itself
     pub success: bool, // True if follower contained entry matching prev_log_index and prev_log_term
+}
+
+/// Sent by the Leader to bring a lagging Follower (or a new Follower) up to
+/// date by transmitting a complete state-machine snapshot.
+///
+/// Note: this implementation transmits the snapshot in a single message. For
+/// very large state machines, chunked transfer (offset/done fields) should be
+/// layered on top — see Raft thesis §7.2.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct InstallSnapshotArgs {
+    pub term: u64,
+    pub leader_id: String,
+    pub last_included_index: u64,
+    pub last_included_term: u64,
+    pub snapshot: Snapshot,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct InstallSnapshotReplyArgs {
+    pub term: u64,
 }
 
 pub struct RpcClient;
@@ -84,6 +106,22 @@ impl RpcClient {
         match Self::call(&addr, RaftMessage::AppendEntries(args), Duration::from_secs(Config::rpc_append_entries_timeout_ms())).await? {
             RaftMessage::AppendReply(reply) => Ok(reply),
             _ => Err(anyhow::anyhow!("Unexpected RPC response type for AppendEntries")),
+        }
+    }
+
+    /// Send InstallSnapshot RPC to a peer
+    #[allow(dead_code)] // Wired up by future per-peer InstallSnapshot orchestration.
+    pub(crate) async fn send_install_snapshot_rpc(
+        addr: String,
+        args: InstallSnapshotArgs,
+    ) -> anyhow::Result<InstallSnapshotReplyArgs> {
+        match Self::call(
+            &addr,
+            RaftMessage::InstallSnapshot(args),
+            Duration::from_secs(Config::rpc_append_entries_timeout_ms()),
+        ).await? {
+            RaftMessage::InstallSnapshotReply(reply) => Ok(reply),
+            _ => Err(anyhow::anyhow!("Unexpected RPC response type for InstallSnapshot")),
         }
     }
 }
@@ -129,6 +167,15 @@ impl RpcServer {
                 let resp = serde_json::to_string(&RaftMessage::AppendReply(reply))? + "\n";
                 writer.write_all(resp.as_bytes()).await?;
                 println!("✅ Responded to heartbeat from Leader {} (Term {})", args.leader_id, args.term);
+            }
+            RaftMessage::InstallSnapshot(args) => {
+                let reply = {
+                    let mut node = raft_node.write().unwrap();
+                    node.handle_install_snapshot(&args)
+                };
+                let resp = serde_json::to_string(&RaftMessage::InstallSnapshotReply(reply))? + "\n";
+                writer.write_all(resp.as_bytes()).await?;
+                println!("📦 Responded to InstallSnapshot from Leader {} (Term {})", args.leader_id, args.term);
             }
             _ => {
                 println!("⚠️ Received unexpected RPC message type");
