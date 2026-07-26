@@ -21,7 +21,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `commit_index` and rewrite the WAL
 - State machine helpers `snapshot_data()` and `clear_for_snapshot()` to support
   snapshot serialization and install
-- **Test suite (61 tests, all passing)**:
+- **ReadIndex linearizable reads** (Raft thesis §6.4): `Get` no longer risks
+  stale data from a partitioned leader
+  - `RaftNode::begin_read(node_arc) -> Option<ReadIndex>` records the
+    leader's current `commit_index` and an `issued_at` timestamp, and
+    forces a heartbeat round to refresh the leader's quorum proof.
+  - `RaftNode::confirm_read(ri) -> bool` enforces three safety conditions:
+    still leader, state machine caught up, quorum proof recent and after
+    `issued_at`.
+  - `last_quorum_heartbeat_at: Option<Instant>` on `RaftNode`, refreshed in
+    `sync_logs` on every successful `AppendEntries` reply.
+  - Client `Get` handler (`src/client.rs::linearizable_get`) polls
+    `confirm_read` for up to 2s before reading the state machine.
+- `ReadIndex` value type in `protocol.rs` (in-process token; not serialized).
+- **Test suite (71 tests, all passing)**:
   - `state_machine`: set/get/delete/replace lifecycle
   - `raft::storage`: WAL round-trip, meta round-trip, atomic rename,
     cross-instance durability, snapshot round-trip, snapshot atomic rename,
@@ -30,18 +43,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     consistency, §5.4.2 commit safety, quorum calculation, propose rules,
     replay/apply, leader init idempotency, install snapshot (state machine
     replacement, log truncation, commit advance, term handling, disk
-    persistence, WAL rewrite), leader-side snapshot trigger
+    persistence, WAL rewrite), leader-side snapshot trigger, ReadIndex
+    begin/confirm with safety guards
 
 ### Changed
 - Cleaned up 18 compiler warnings (unused imports, unused variable, unnecessary
   parens, io::Result handling) — now 0 warnings
 - `RaftStorage::new_with_paths` now takes a third `snapshot_path` argument
 - `RaftNode::new` now delegates to `new_with_storage` for shared construction logic
+- Client `Get` handler now goes through the linearizable read path
+  (backward-compatible — server-side behavior unchanged for non-leaders)
 
 ### Notes
 - `RaftStorage` and `RaftNode` were refactored to accept explicit paths so
   tests can isolate each scenario in a temp dir without touching global `Config`.
 - Chunked InstallSnapshot transfer (offset/done fields) is a future optimization.
+- The ReadIndex implementation tracks *any* successful peer reply as proof
+  of liveness. A leader silent longer than `max_election_timeout_ms` will
+  fail `confirm_read`, partitioning reads away from a partitioned leader.
+  Per-read ack tracking is a future refinement.
 
 ## [0.1.0] - 2026-02-24
 

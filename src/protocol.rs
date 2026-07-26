@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::time::Instant;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum Command {
@@ -26,4 +27,17 @@ pub struct Snapshot {
     pub last_included_index: u64,
     pub last_included_term: u64,
     pub data: HashMap<String, String>,
+}
+
+/// Token returned by `RaftNode::begin_read` and consumed by `confirm_read`.
+///
+/// `index` is the log position the read is anchored to; the read is safe to
+/// serve once the leader has confirmed it remained leader at a time `>= issued_at`
+/// and the state machine has applied all entries up to `index`.
+///
+/// Not serializable on purpose: it's an in-process token with a monotonic timestamp.
+#[derive(Debug, Clone, Copy)]
+pub struct ReadIndex {
+    pub index: u64,
+    pub issued_at: Instant,
 }

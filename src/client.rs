@@ -1,6 +1,7 @@
 use crate::raft::node::{RaftNode, NodeState};
 use crate::protocol::Command;
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -53,31 +54,63 @@ impl ClientHandler {
 
     /// Routes the command based on its type and performs role validation.
     async fn dispatch_command(command: Command, node_arc: &Arc<RwLock<RaftNode>>) -> serde_json::Value {
-        // Role check and state machine access (Original logic step 5)
-        let (is_leader, state_machine_arc) = {
+        // Quick role check; Get does its own leader check via begin_read.
+        {
             let node = node_arc.read().unwrap();
-            (node.state == NodeState::Leader, node.state_machine.clone())
-        };
-
-        if !is_leader {
-            return serde_json::json!({"error":"Not a leader. Please connect to the leader node."});
+            if node.state != NodeState::Leader {
+                return serde_json::json!({"error":"Not a leader. Please connect to the leader node."});
+            }
         }
 
-        // Command execution (Original logic step 6)
         match command {
             Command::Set { .. } | Command::Delete { .. } => {
                 Self::apply_mutation(command, node_arc).await
             },
-            Command::Get { key } => {
-                let state_machine = state_machine_arc.read().unwrap();
-                match state_machine.get(&key) {
-                    Some(val) => serde_json::json!({"status": "ok", "data": val}),
-                    None => serde_json::json!({"status": "not_found"}),
-                }
-            },
+            Command::Get { key } => Self::linearizable_get(&key, node_arc).await,
             Command::Compact => {
                 serde_json::json!({"status": "error", "message": "compact not supported yet"})
             },
+        }
+    }
+
+    /// Linearizable Get via ReadIndex:
+    ///   1. begin_read() captures the leader's commit_index and triggers a heartbeat.
+    ///   2. Wait (poll) until confirm_read() reports safety.
+    ///   3. Read the value from the state machine at that point.
+    async fn linearizable_get(key: &str, node_arc: &Arc<RwLock<RaftNode>>) -> serde_json::Value {
+        let ri = match RaftNode::begin_read(node_arc.clone()) {
+            Some(ri) => ri,
+            None => return serde_json::json!({"error": "Not a leader. Please connect to the leader node."}),
+        };
+
+        let max_wait = Duration::from_millis(2000);
+        let poll_interval = Duration::from_millis(10);
+        let start = Instant::now();
+        loop {
+            let confirmed = {
+                let node = node_arc.read().unwrap();
+                node.confirm_read(ri)
+            };
+            if confirmed {
+                break;
+            }
+            if start.elapsed() > max_wait {
+                return serde_json::json!({
+                    "status": "error",
+                    "message": "read confirmation timeout (leader may have lost quorum)"
+                });
+            }
+            tokio::time::sleep(poll_interval).await;
+        }
+
+        let state_machine = {
+            let node = node_arc.read().unwrap();
+            node.state_machine.clone()
+        };
+        let sm = state_machine.read().unwrap();
+        match sm.get(key) {
+            Some(val) => serde_json::json!({"status": "ok", "data": val}),
+            None => serde_json::json!({"status": "not_found"}),
         }
     }
 
