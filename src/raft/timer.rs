@@ -1,5 +1,4 @@
 use crate::raft::node::{NodeState, RaftNode};
-use rand::Rng;
 use std::sync::{Arc, RwLock};
 use tokio::time::Duration;
 use crate::config::Config;
