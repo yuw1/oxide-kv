@@ -1,14 +1,15 @@
 use crate::config::Config;
 use crate::protocol::{LogEntry, Snapshot};
 pub use crate::raft::node::{NodeState, RaftNode};
+use prost::Message;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum RaftMessage {
     RequestVote(RequestVoteArgs),
     VoteResponse(VoteResponseArgs),
@@ -18,7 +19,7 @@ pub enum RaftMessage {
     InstallSnapshotReply(InstallSnapshotReplyArgs),
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct RequestVoteArgs {
     pub term: u64,
     pub candidate_id: String,
@@ -26,13 +27,13 @@ pub struct RequestVoteArgs {
     pub last_log_term: u64
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 pub struct VoteResponseArgs {
     pub term: u64,
     pub vote_granted: bool,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct AppendEntriesArgs {
     pub term: u64,              // Leader's current term
     pub leader_id: String,      // Leader's ID so follower can redirect clients
@@ -42,7 +43,7 @@ pub struct AppendEntriesArgs {
     pub leader_commit: u64,     // Leader's commit_index
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct AppendReplyArgs {
     pub term: u64,    // Current term of follower, for leader to update itself
     pub success: bool, // True if follower contained entry matching prev_log_index and prev_log_term
@@ -54,7 +55,7 @@ pub struct AppendReplyArgs {
 /// Note: this implementation transmits the snapshot in a single message. For
 /// very large state machines, chunked transfer (offset/done fields) should be
 /// layered on top — see Raft thesis §7.2.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct InstallSnapshotArgs {
     pub term: u64,
     pub leader_id: String,
@@ -63,7 +64,7 @@ pub struct InstallSnapshotArgs {
     pub snapshot: Snapshot,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct InstallSnapshotReplyArgs {
     pub term: u64,
 }
@@ -71,26 +72,20 @@ pub struct InstallSnapshotReplyArgs {
 pub struct RpcClient;
 
 impl RpcClient {
-    /// Internal helper to handle the common TCP transport logic
+    /// Internal helper to handle the common TCP transport logic.
+    ///
+    /// Wire format: 4-byte big-endian length prefix followed by a protobuf
+    /// payload. Length prefix is mandatory because protobuf is a binary
+    /// stream format with no self-delimiting frame boundary.
     async fn call(addr: &str, msg: RaftMessage, timeout_duration: Duration) -> anyhow::Result<RaftMessage> {
-        // 1. Establish connection with timeout
         let stream = timeout(timeout_duration, TcpStream::connect(addr)).await??;
-        let (reader, mut writer) = tokio::io::split(stream);
+        let (mut reader, mut writer) = stream.into_split();
 
-        // 2. Serialize and send (with newline as delimiter)
-        let mut msg_json = serde_json::to_string(&msg)?;
-        msg_json.push('\n');
-        writer.write_all(msg_json.as_bytes()).await?;
-        writer.flush().await?;
-
-        // 3. Read response line
-        let mut line = String::new();
-        let mut buf_reader = BufReader::new(reader);
-        buf_reader.read_line(&mut line).await?;
-
-        // 4. Deserialize and return
-        let resp = serde_json::from_str::<RaftMessage>(&line)?;
-        Ok(resp)
+        let payload = crate::raft::proto::encode_domain(&msg).encode_to_vec();
+        write_framed(&mut writer, &payload).await?;
+        let resp_buf = read_framed(&mut reader).await?;
+        let resp_pb = crate::raft::proto::pb::RaftMessage::decode(&resp_buf[..])?;
+        Ok(crate::raft::proto::decode_domain(resp_pb))
     }
 
     /// Send RequestVote RPC to a peer
@@ -137,50 +132,155 @@ impl RpcServer {
     }
 
     async fn handle_rpc_logic(stream: &mut TcpStream, raft_node: Arc<RwLock<RaftNode>>) -> Result<(), Box<dyn std::error::Error>> {
-        let (reader, mut writer) = stream.split();
-        let mut buf_reader = BufReader::new(reader);
-        let mut line = String::new();
+        let (mut reader, mut writer) = stream.split();
 
-        // 1. Read the JSON line from the stream
-        buf_reader.read_line(&mut line).await?;
-        if line.is_empty() { return Ok(()); }
+        // 1. Read a length-prefixed protobuf frame from the stream.
+        let req_buf = read_framed(&mut reader).await?;
+        if req_buf.is_empty() { return Ok(()); }
 
-        // 2. Parse the common RaftMessage enum
-        let msg: RaftMessage = serde_json::from_str(&line)?;
+        // 2. Decode to the domain enum.
+        let req_pb = crate::raft::proto::pb::RaftMessage::decode(&req_buf[..])?;
+        let msg: RaftMessage = crate::raft::proto::decode_domain(req_pb);
 
-        // 3. Dispatch to the specific handler in RaftNode
-        match msg {
+        // 3. Dispatch and reply (also length-prefixed protobuf).
+        let response = match msg {
             RaftMessage::RequestVote(args) => {
                 let reply = {
                     let mut node = raft_node.write().unwrap();
                     node.handle_request_vote(&args)
                 };
-                let resp = serde_json::to_string(&RaftMessage::VoteResponse(reply))? + "\n";
-                writer.write_all(resp.as_bytes()).await?;
                 println!("✅ Responded to vote request from node {}", args.candidate_id);
+                RaftMessage::VoteResponse(reply)
             }
             RaftMessage::AppendEntries(args) => {
                 let reply = {
                     let mut node = raft_node.write().unwrap();
                     node.handle_append_entries(&args)
                 };
-                let resp = serde_json::to_string(&RaftMessage::AppendReply(reply))? + "\n";
-                writer.write_all(resp.as_bytes()).await?;
                 println!("✅ Responded to heartbeat from Leader {} (Term {})", args.leader_id, args.term);
+                RaftMessage::AppendReply(reply)
             }
             RaftMessage::InstallSnapshot(args) => {
                 let reply = {
                     let mut node = raft_node.write().unwrap();
                     node.handle_install_snapshot(&args)
                 };
-                let resp = serde_json::to_string(&RaftMessage::InstallSnapshotReply(reply))? + "\n";
-                writer.write_all(resp.as_bytes()).await?;
                 println!("📦 Responded to InstallSnapshot from Leader {} (Term {})", args.leader_id, args.term);
+                RaftMessage::InstallSnapshotReply(reply)
             }
-            _ => {
-                println!("⚠️ Received unexpected RPC message type");
+            other => {
+                println!("⚠️ Received unexpected RPC message type: {:?}", other);
+                return Ok(());
             }
-        }
+        };
+
+        let resp_payload = crate::raft::proto::encode_domain(&response).encode_to_vec();
+        write_framed(&mut writer, &resp_payload).await?;
         Ok(())
+    }
+}
+
+/// Write a single length-prefixed protobuf frame.
+pub(crate) async fn write_framed<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    payload: &[u8],
+) -> std::io::Result<()> {
+    writer.write_all(&(payload.len() as u32).to_be_bytes()).await?;
+    writer.write_all(payload).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+/// Read a single length-prefixed protobuf frame. Returns an empty Vec on EOF.
+pub(crate) async fn read_framed<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+) -> std::io::Result<Vec<u8>> {
+    let mut len_buf = [0u8; 4];
+    match reader.read_exact(&mut len_buf).await {
+        Ok(0) => return Ok(Vec::new()),
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    }
+    let len = u32::from_be_bytes(len_buf) as usize;
+    let mut payload = vec![0u8; len];
+    reader.read_exact(&mut payload).await?;
+    Ok(payload)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prost::Message;
+    use tokio::io::duplex;
+
+    #[tokio::test]
+    async fn framed_roundtrip_small_payload() {
+        let payload = b"hello-protobuf";
+        let (mut a, mut b) = duplex(1024);
+
+        write_framed(&mut a, payload).await.unwrap();
+        let received = read_framed(&mut b).await.unwrap();
+        assert_eq!(received, payload);
+    }
+
+    #[tokio::test]
+    async fn framed_roundtrip_large_payload() {
+        // Force the 4-byte length prefix to exceed one byte.
+        let payload: Vec<u8> = (0..200_000).map(|i| (i % 256) as u8).collect();
+        let (mut a, mut b) = duplex(256 * 1024);
+
+        write_framed(&mut a, &payload).await.unwrap();
+        let received = read_framed(&mut b).await.unwrap();
+        assert_eq!(received.len(), payload.len());
+        assert_eq!(received, payload);
+    }
+
+    #[tokio::test]
+    async fn framed_read_returns_empty_on_eof() {
+        let (a, mut b) = duplex(16);
+        drop(a);
+        let received = read_framed(&mut b).await.unwrap();
+        assert!(received.is_empty());
+    }
+
+    #[tokio::test]
+    async fn end_to_end_rpc_over_duplex() {
+        // Verify the full client/server wire path on an in-memory duplex:
+        // domain -> proto -> framed bytes -> proto -> domain.
+        use crate::raft::proto::{decode_domain, encode_domain};
+        use crate::raft::rpc::{AppendEntriesArgs, VoteResponseArgs};
+
+        let original = RaftMessage::AppendEntries(AppendEntriesArgs {
+            term: 42,
+            leader_id: "n1".into(),
+            prev_log_index: 7,
+            prev_log_term: 41,
+            entries: vec![],
+            leader_commit: 7,
+        });
+
+        let (mut client_io, mut server_io) = duplex(64 * 1024);
+
+        // Client writes the request.
+        let payload = encode_domain(&original).encode_to_vec();
+        write_framed(&mut client_io, &payload).await.unwrap();
+
+        // Server reads and decodes it.
+        let buf = read_framed(&mut server_io).await.unwrap();
+        let decoded_pb = crate::raft::proto::pb::RaftMessage::decode(&buf[..]).unwrap();
+        let decoded = decode_domain(decoded_pb);
+        assert_eq!(decoded, original);
+
+        // Server writes a reply.
+        let reply = RaftMessage::VoteResponse(VoteResponseArgs { term: 42, vote_granted: true });
+        let resp_payload = encode_domain(&reply).encode_to_vec();
+        write_framed(&mut server_io, &resp_payload).await.unwrap();
+
+        // Client reads and decodes the reply.
+        let resp_buf = read_framed(&mut client_io).await.unwrap();
+        let resp_pb = crate::raft::proto::pb::RaftMessage::decode(&resp_buf[..]).unwrap();
+        let resp = decode_domain(resp_pb);
+        assert_eq!(resp, reply);
     }
 }
