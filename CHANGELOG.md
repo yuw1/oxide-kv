@@ -50,21 +50,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Storage formats (WAL, snapshot file, meta) and the external client
     command protocol keep their existing formats — only the bytes on the
     Raft RPC socket changed.
-- **Test suite (79 tests, all passing)**:
-  - `state_machine`: set/get/delete/replace lifecycle
-  - `raft::storage`: WAL round-trip, meta round-trip, atomic rename,
-    cross-instance durability, snapshot round-trip, snapshot atomic rename,
-    WAL truncation semantics
-  - `raft::node`: §5.4.1 vote safety + election restriction, AppendEntries
-    consistency, §5.4.2 commit safety, quorum calculation, propose rules,
-    replay/apply, leader init idempotency, install snapshot, leader-side
-    snapshot trigger, ReadIndex begin/confirm with safety guards
-  - `raft::proto`: protobuf encode/decode round-trip for every
-    `RaftMessage` variant, payload size sanity check vs JSON
-  - `raft::rpc`: length-prefixed framing round-trip (small + large +
-    EOF + end-to-end client/server on a tokio duplex)
 
 ### Changed
+- **Storage engine rewritten as a Log-Structured Merge (LSM) Tree**:
+  in-memory memtable (BTreeMap<String, MemEntry>) backed by an append-only
+  WAL (`memtable.wal`, JSON lines, fsync per write); on-disk SSTables in
+  `data_dir/sst/NNNNNN.sst` (JSON array of sorted entries + sidecar
+  `.meta`); automatic flush when memtable bytes exceed threshold;
+  manual `compact()` does size-tiered merge; read path traverses
+  memtable → SSTables newest to oldest.
+- **State machine API changes** (`src/state_machine.rs`):
+  - `open()` now takes `StateMachineConfig { data_dir, memtable_size_threshold }`.
+  - `get` returns owned `Option<String>` (data may come from disk).
+  - `snapshot_data()` returns `io::Result<HashMap<...>>`.
+  - `clear_for_snapshot()` returns `io::Result<()>`.
+  - `memtable_len()` and `sstable_count()` introspection helpers added.
+- Callers updated: `src/main.rs`, `src/raft/node.rs`, all state-machine tests.
 - Cleaned up 18 compiler warnings (unused imports, unused variable, unnecessary
   parens, io::Result handling) — now 0 warnings
 - `RaftStorage::new_with_paths` now takes a third `snapshot_path` argument
@@ -76,6 +77,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `Cargo.toml`: added `prost = "0.13"` (runtime) and `prost-build = "0.13"`
   (build-time)
 
+### Test suite (93 tests, all passing)
+- `state_machine`: set/get/delete/replace lifecycle + auto-flush
+  threshold + tombstone survival + manual flush + newest-wins
+  + range filtering + compaction + snapshot flatten + clear wipes
+  + WAL replay on reopen + SSTable discovery on reopen + empty
+  value + unicode round-trip
+- `raft::storage`: WAL round-trip, meta round-trip, atomic rename,
+  cross-instance durability, snapshot round-trip, snapshot atomic rename,
+  WAL truncation semantics
+- `raft::node`: §5.4.1 vote safety + election restriction, AppendEntries
+  consistency, §5.4.2 commit safety, quorum calculation, propose rules,
+  replay/apply, leader init idempotency, install snapshot, leader-side
+  snapshot trigger, ReadIndex begin/confirm with safety guards
+- `raft::proto`: protobuf encode/decode round-trip for every
+  `RaftMessage` variant, payload size sanity check vs JSON
+- `raft::rpc`: length-prefixed framing round-trip (small + large +
+  EOF + end-to-end client/server on a tokio duplex)
+
 ### Notes
 - `RaftStorage` and `RaftNode` were refactored to accept explicit paths so
   tests can isolate each scenario in a temp dir without touching global `Config`.
@@ -86,7 +105,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The protobuf RPC cutover is a hard breaking change on the wire format.
   All nodes must upgrade together. Storage formats (WAL / snapshot /
   meta) and the external client JSON API are unchanged.
-- Chunked InstallSnapshot transfer (offset/done fields) is a future optimization.
+- LSM deferred: bloom filters, block cache, background compaction thread,
+  leveled compaction. Current shape keeps the engine simple and in one file.
+- Chunked InstallSnapshot transfer (offset/done fields) is still deferred.
 
 ## [0.1.0] - 2026-02-24
 

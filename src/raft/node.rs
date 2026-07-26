@@ -275,7 +275,7 @@ impl RaftNode {
                         println!("✅ [Apply] Index {}: SET {} = {}", entry.index, key, value);
                     }
                     Command::Delete { key } => {
-                        let _ = state_machine.delete(key);
+                        let _ = state_machine.delete(&key);
                         println!("✅ [Apply] Index {}: DELETE {}", entry.index, key);
                     }
                     _ => println!("🔍 [Apply] Index {}: No-op", entry.index),
@@ -441,7 +441,7 @@ impl RaftNode {
         {
             let mut sm = self.state_machine.write().unwrap();
             // Reset to empty, then re-populate from snapshot.
-            sm.clear_for_snapshot();
+            sm.clear_for_snapshot().expect("clear_for_snapshot");
             for (k, v) in &args.snapshot.data {
                 let _ = sm.set(k, v);
             }
@@ -485,7 +485,7 @@ impl RaftNode {
 
         let data = {
             let sm = self.state_machine.read().unwrap();
-            sm.snapshot_data()
+            sm.snapshot_data().expect("snapshot_data")
         };
 
         let snap = Snapshot {
@@ -574,7 +574,12 @@ mod tests {
         let meta = dir.path().join(format!("{node_id}_meta.json")).to_str().unwrap().to_string();
         let snap = dir.path().join(format!("{node_id}_snapshot.json")).to_str().unwrap().to_string();
         let storage = RaftStorage::new_with_paths(wal, meta, snap);
-        let sm = Arc::new(RwLock::new(StateMachine::open().unwrap()));
+        let sm_dir = dir.path().join(format!("{node_id}_sm"));
+        let sm_config = crate::state_machine::StateMachineConfig {
+            data_dir: sm_dir,
+            memtable_size_threshold: 1024 * 1024,
+        };
+        let sm = Arc::new(RwLock::new(StateMachine::open(sm_config).unwrap()));
         let node = RaftNode::new_with_storage(node_id.to_string(), peers, sm, storage);
         (dir, node)
     }
@@ -613,7 +618,7 @@ mod tests {
 
     fn assert_node_state(node: &RaftNode, key: &str, expected: Option<&str>) {
         let sm = node.state_machine.read().unwrap();
-        assert_eq!(sm.get(key), expected.map(|s| s.to_string()).as_ref(),
+        assert_eq!(sm.get(key), expected.map(|s| s.to_string()),
             "state machine mismatch for key={key}");
     }
 
@@ -979,9 +984,12 @@ mod tests {
 
     #[test]
     fn replay_logs_restores_state_machine_from_scratch() {
-        let sm = Arc::new(RwLock::new(StateMachine::open().unwrap()));
         let node_id = "replay_node";
         let dir = tempfile::tempdir().unwrap();
+        let _sm_placeholder = Arc::new(RwLock::new(StateMachine::open(crate::state_machine::StateMachineConfig {
+            data_dir: dir.path().join(format!("{node_id}_sm_unused")),
+            memtable_size_threshold: 1024 * 1024,
+        }).unwrap()));
         let wal = dir.path().join(format!("{node_id}.wal")).to_str().unwrap().to_string();
         let meta = dir.path().join(format!("{node_id}_meta.json")).to_str().unwrap().to_string();
         let snap = dir.path().join(format!("{node_id}_snapshot.json")).to_str().unwrap().to_string();
@@ -992,20 +1000,30 @@ mod tests {
         storage.append_wal_log(&make_entry(1, 2, "b", "2")).unwrap();
         storage.append_wal_log(&make_entry(1, 3, "c", "3")).unwrap();
 
+        let sm_dir2 = dir.path().join(format!("{node_id}_sm2"));
+        let sm_config2 = crate::state_machine::StateMachineConfig {
+            data_dir: sm_dir2,
+            memtable_size_threshold: 1024 * 1024,
+        };
+        let sm2 = Arc::new(RwLock::new(StateMachine::open(sm_config2).unwrap()));
+
         // Construct node from disk; it should replay all three.
         let mut node = RaftNode::new_with_storage(
             node_id.to_string(),
             vec![],
-            sm.clone(),
+            sm2.clone(),
             storage,
         );
+        // Point the test's `sm` reference at the same state machine the node
+        // is mutating, so the assertions below see the replayed writes.
+        let sm = sm2.clone();
         node.replay_logs();
 
         assert_eq!(node.last_applied, 3);
         let sm_read = sm.read().unwrap();
-        assert_eq!(sm_read.get("a"), Some(&"1".to_string()));
-        assert_eq!(sm_read.get("b"), Some(&"2".to_string()));
-        assert_eq!(sm_read.get("c"), Some(&"3".to_string()));
+        assert_eq!(sm_read.get("a"), Some("1".to_string()));
+        assert_eq!(sm_read.get("b"), Some("2".to_string()));
+        assert_eq!(sm_read.get("c"), Some("3".to_string()));
     }
 
     #[test]
@@ -1086,7 +1104,7 @@ mod tests {
     }
 
     fn sm_data(node: &RaftNode) -> HashMap<String, String> {
-        node.state_machine.read().unwrap().snapshot_data()
+        node.state_machine.read().unwrap().snapshot_data().expect("snapshot_data")
     }
 
     #[test]
