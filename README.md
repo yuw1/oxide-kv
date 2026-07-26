@@ -1,93 +1,302 @@
-# Oxide-KV: A Distributed Key-Value Store in Rust
+# Oxide-KV
 
-A lightweight, reliable distributed key-value store built from scratch in Rust, implementing the **Raft Consensus Algorithm**. This project focuses on high availability, consistency, and crash recovery.
+A distributed key-value store in Rust implementing the **Raft Consensus
+Algorithm**, with a Log-Structured Merge-Tree storage engine, Protobuf
+inter-node RPC, and a Two-Phase Commit lifecycle for atomic multi-key
+writes.
 
-## 🚀 Key Features
+> Lightweight by design — every line is meant to be read.
 
-* **Leader Election**: Robust election mechanism with randomized timeouts and term-based logic.
-* **Election Restriction**: Implements the safety property ensuring only nodes with up-to-date logs can be elected as Leader.
-* **Persistent Storage**: Automatic recovery of Metadata (Term, VoteFor) and Write-Ahead Logs (WAL) from disk upon restart.
-* **State Machine Replication**: Synchronizes commands across the cluster via heartbeats and log entries.
-* **Asynchronous Architecture**: Powered by `Tokio` for high-performance RPC handling and concurrent client requests.
+[![CI](https://github.com/yuw1/oxide-kv/actions/workflows/rust.yml/badge.svg)](https://github.com/yuw1/oxide-kv/actions)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](./LICENSE)
+[![Rust](https://img.shields.io/badge/rust-edition_2024-orange.svg)](https://www.rust-lang.org)
+[![Tests](https://img.shields.io/badge/tests-105_passing-brightgreen.svg)](#development)
 
-## 🏗️ System Architecture
+---
 
-### Node States
+## Features
 
-* **Follower**: Passive state; responds to RPCs from Leaders and Candidates.
-* **Candidate**: Active state used to elect a new Leader.
-* **Leader**: Handles all client requests and manages log replication.
+### Consensus (Raft core, all of §5 + §6.4)
 
-### RPC Protocols
+- **Leader election** with randomized timeouts (3-5s) and term-based
+  step-down.
+- **Election restriction** (§5.4.1) — votes only for candidates with a
+  log at least as up-to-date as the voter's.
+- **AppendEntries** RPC with heartbeats; **commit safety** (§5.4.2) — a
+  leader never commits entries from previous terms by replica count
+  alone.
+- **Snapshot + InstallSnapshot RPC** (§7) — bounded WAL growth and
+  catch-up for lagging followers.
 
-The system communicates using two primary Raft RPCs:
+### Correctness hardening
 
-1. **RequestVote**: Initiated by Candidates during elections.
-2. **AppendEntries**: Initiated by Leaders to replicate log entries and serve as heartbeats.
+- **Linearizable reads via ReadIndex** (§6.4) — `Get` no longer risks
+  stale data from a partitioned leader. The leader proves it still
+  holds quorum before serving the value.
+- **Crash recovery** — on restart the WAL replays into the in-memory
+  table; SSTables are discovered from disk and the sparse key range
+  is used to skip irrelevant ones on read.
 
-### Storage Engine
+### Storage
 
-* **WAL (Write-Ahead Log)**: Every command is appended to a disk-based log before being applied to the state machine.
-* **Snapshot (JSON)**: Periodically saves the current state of the KV store to disk for fast recovery.
+- **Log-Structured Merge Tree** state machine: in-memory memtable
+  (BTreeMap) backed by an append-only WAL, with sorted on-disk
+  SSTables and size-tiered compaction.
+- **Atomic single-key writes** via the Raft log; **atomic multi-key
+  writes** via the 2PC lifecycle below.
 
-## 🛠️ Quick Start
+### Coordination
 
-### 1. Prerequisites
+- **Two-Phase Commit lifecycle** — `BeginTx` stages ops, `Vote`
+  records participant votes, `DecideTx` commits or aborts atomically.
+  Pending ops are isolated from reads until commit. Single-node
+  coordinator uses a fast path that appends BeginTx + DecideTx as one
+  Raft proposal.
 
-Ensure you have the Rust toolchain installed (Edition 2021+).
+### Plumbing
 
-### 2. Run the Cluster
+- **Protocol Buffers** over length-prefixed TCP for inter-node Raft
+  RPC. Replaces the original JSON encoding; ~30% smaller payloads,
+  faster encode/decode. Wire schema lives in `proto/raft.proto`.
+- **Async Tokio** runtime for RPC handling and concurrent client
+  connections.
+- **Apache-2.0** license. Zero compiler warnings. 105 unit tests.
 
-Open three terminals to start a local 3-node cluster:
+---
 
-**Node 1 (8001):**
-
-```bash
-cargo run -- --addr 127.0.0.1:8001 --client-addr 127.0.0.1:9001 --peers 127.0.0.1:8002 127.0.0.1:8003
+## Architecture
 
 ```
-
-**Node 2 (8002):**
-
-```bash
-cargo run -- --addr 127.0.0.1:8002 --client-addr 127.0.0.1:9002 --peers 127.0.0.1:8001 127.0.0.1:8003
-
+            ┌────────────────────────────────────────────────┐
+            │                  RaftNode                       │
+            │                                                │
+   Client → │   ┌──────┐  log entries  ┌──────────────┐      │
+   (JSON)   │   │ Get  │──────────────▶│ RaftStorage  │      │
+            │   │ Set  │  AppendEntries │  - meta.json │      │
+            │   │BeginTx│              │  - NNN.sst   │      │
+            │   │ Vote │              │  - NNN.meta  │      │
+            │   │Decide│              │  - WAL       │      │
+            │   └──────┘              └──────────────┘      │
+            │       │                       │                │
+            │       ▼                       ▼                │
+            │   ┌──────────┐         ┌─────────────┐          │
+            │   │ LSM tree │         │  Raft log   │          │
+            │   │ StateMch │         │  (bincode)  │          │
+            │   └──────────┘         └─────────────┘          │
+            │       │                                        │
+            │       ▼                                        │
+            │   pending_txs: BTreeMap<TxId, PendingTx>        │
+            │   (isolated from reads until DecideTx)         │
+            └────────────────────────────────────────────────┘
+                              │ TCP + length-prefixed protobuf
+                              ▼
+                    peer RaftNodes (same code)
 ```
 
-**Node 3 (8003):**
+### Node lifecycle
+
+- **Follower** — passive, responds to RPCs.
+- **Candidate** — active during election.
+- **Leader** — handles client requests and replicates the log.
+
+### Inter-node RPC
+
+| RPC | Purpose |
+|---|---|
+| `RequestVote` | Election |
+| `AppendEntries` | Log replication + heartbeat |
+| `InstallSnapshot` | Send a snapshot to a lagging follower |
+
+Wire schema: [`proto/raft.proto`](./proto/raft.proto). 4-byte big-endian
+length prefix + protobuf payload.
+
+### Storage engine
+
+- **Raft log** (`wal`): bincode-serialized log entries, replayed on
+  restart.
+- **State machine WAL** (`memtable.wal`): JSON-line op log, fsync per
+  write, replayed on restart.
+- **Memtable** (`BTreeMap<String, MemEntry>`): in-memory sorted
+  buffer, flushed when it crosses the size threshold.
+- **SSTables** (`sst/NNNNNN.sst` + `.meta`): sorted JSON entries on
+  disk; sparse key range used to skip irrelevant tables.
+- **Compaction** (size-tiered): merges all SSTables into one, drops
+  tombstones with no possible resurrection.
+
+### Two-phase commit
+
+- **BeginTx** (log entry): stages ops in `pending_txs`, NOT in
+  memtable. Reads cannot see them.
+- **Vote** (log entry): records a participant's Yes/No vote.
+- **DecideTx** (log entry): `Commit` applies all pending ops
+  atomically; `Abort` discards them.
+
+---
+
+## Quick Start
+
+### Prerequisites
+
+Rust 2024 edition (stable). For Protobuf code generation the build
+expects `protoc` to be on `PATH`; CI installs it automatically.
+
+### Run a 3-node cluster
+
+Three terminals:
 
 ```bash
-cargo run -- --addr 127.0.0.1:8003 --client-addr 127.0.0.1:9003 --peers 127.0.0.1:8001 127.0.0.1:8002
+# Node 1
+cargo run -- \
+  --addr 127.0.0.1:8001 --client-addr 127.0.0.1:9001 \
+  --peers 127.0.0.1:8002 127.0.0.1:8003
 
+# Node 2
+cargo run -- \
+  --addr 127.0.0.1:8002 --client-addr 127.0.0.1:9002 \
+  --peers 127.0.0.1:8001 127.0.0.1:8003
+
+# Node 3
+cargo run -- \
+  --addr 127.0.0.1:8003 --client-addr 127.0.0.1:9003 \
+  --peers 127.0.0.1:8001 127.0.0.1:8002
 ```
 
-### 3. Client Interaction
-
-Connect to the **Leader** node's client address (e.g., 9001) using `nc` or any TCP client:
+### Single-key ops (JSON over TCP to leader's client port)
 
 ```bash
-# Set a value
 echo '{"Set":{"key":"hello","value":"world"}}' | nc 127.0.0.1 9001
-
-# Get a value
 echo '{"Get":{"key":"hello"}}' | nc 127.0.0.1 9001
-
+echo '{"Delete":{"key":"hello"}}' | nc 127.0.0.1 9001
 ```
 
-## 🔍 Safety & Consistency
+`Get` uses the ReadIndex path, so a partitioned leader will refuse to
+serve stale data instead of returning it.
 
-The core voting logic (`handle_request_vote`) strictly follows **Section 5.4.1** of the Raft paper to ensure the **Leader Completeness Property**:
+### Multi-key atomic op (2PC fast path)
 
-* **Term Check**: Candidates with an outdated `current_term` are immediately rejected.
-* **Log Matching**: A node will only vote for a candidate if the candidate's log is at least as up-to-date as its own.
-* Comparison: `(last_log_term > my_term) || (last_log_term == my_term && last_log_index >= my_index)`
+```bash
+echo '{"BeginTx":{"tx_id":"t1","ops":[
+  {"Put":{"key":"a","value":"1"}},
+  {"Put":{"key":"b","value":"2"}}
+]}}' | nc 127.0.0.1 9001
+```
 
+In a single-node cluster the leader auto-pairs this with
+`DecideTx(Commit)` so the transaction applies atomically. For a
+multi-node cluster the commands are in the wire schema; the
+coordinator-side vote collection RPC is on the roadmap.
 
+### Manual 2PC control (for testing the lifecycle)
 
-## 📝 Roadmap / TODO
+```bash
+# Stage a tx
+echo '{"BeginTx":{"tx_id":"t2","ops":[{"Put":{"key":"k","value":"v"}}]}}' | nc 127.0.0.1 9001
+# Vote on it
+echo '{"Vote":{"tx_id":"t2","voter":"node-1","vote":{"Yes":null}}}' | nc 127.0.0.1 9001
+# Commit (or Abort instead)
+echo '{"DecideTx":{"tx_id":"t2","decision":"Commit"}}' | nc 127.0.0.1 9001
+```
 
-* [ ] **Linearizable Reads**: Implement `ReadIndex` or `Leasing` mechanisms to ensure GET requests always return the most recent committed data, preventing "stale reads" during network partitions without the overhead of disk I/O.
-* [ ] **Log Compaction**: Develop a snapshotting system to serialize the current StateMachine state and truncate the WAL (Write-Ahead Log), reclaiming disk space and significantly reducing node recovery time.
-* [ ] **Binary Protocol (Protobuf/gRPC)**: Migrate from JSON to a high-performance binary serialization layer using Protobuf and gRPC to minimize network latency and CPU overhead during cross-node communication.
-* [ ] **LSM-Tree Storage Engine**: Replace the in-memory HashMap with a Log-Structured Merge-Tree (LSM) to handle high-write throughput via MemTables, SSTables, and background compaction processes.
-* [ ] **Distributed Transactions (2PC)**: Implement a Two-Phase Commit protocol to ensure atomic operations across multiple shards or keys, maintaining ACID guarantees in a truly distributed environment.
+---
+
+## Safety & Consistency
+
+The following properties are verified by the test suite.
+
+- **§5.4.1 vote safety** — `(last_log_term > my_term) || (last_log_term == my_term && last_log_index >= my_index)`.
+- **§5.4.2 commit safety** — a leader only directly commits entries
+  from its own current term; previous-term entries are committed
+  implicitly when a current-term entry from the same index replicates.
+- **Linearizable reads** — `confirm_read` enforces three guards:
+  still leader, `last_applied >= ri.index`, and a fresh quorum proof
+  (`last_quorum_heartbeat_at`) at or after the read's `issued_at`.
+- **Snapshot install safety** — `handle_install_snapshot` rejects
+  stale terms, truncates the log to `> last_included_index`, resets
+  `commit_index` / `last_applied`, and persists before replying.
+- **LSM durability** — WAL is fsync'd per write; SSTables are written
+  via atomic rename. `restore_wal_log` is the single recovery path.
+- **2PC read isolation** — pending ops in `pending_txs` are not in
+  the memtable; `get` never returns a value that hasn't been
+  committed via `DecideTx(Commit)`.
+
+---
+
+## Development
+
+```bash
+cargo build --all-targets     # 0 warnings
+cargo test                    # 105 passed
+```
+
+Test layout: 8 modules, in-source `#[cfg(test)] mod tests` plus a few
+integration tests in `raft::proto` and `raft::rpc`. Each test runs
+against an isolated tempdir; the production binary is not required.
+
+### Project layout
+
+```
+src/
+├── client.rs          Client JSON protocol handler
+├── config.rs          Global config (OnceLock)
+├── lib.rs
+├── main.rs            CLI entry point
+├── protocol.rs        Command / LogEntry / Snapshot / 2PC types
+├── state_machine.rs   LSM tree (memtable + WAL + SSTable)
+├── raft/
+│   ├── node.rs        RaftNode (election, log, snapshot, 2PC, read-index)
+│   ├── proto.rs       Protobuf <-> domain conversions
+│   ├── rpc.rs         TCP+protobuf client/server
+│   ├── storage.rs     WAL + meta + snapshot on disk
+│   └── timer.rs       Election timer
+proto/
+└── raft.proto         Wire schema
+```
+
+---
+
+## Roadmap
+
+### Landed (see [CHANGELOG.md](./CHANGELOG.md) for per-PR detail)
+
+| Capability | Reference | PR |
+|---|---|---|
+| Apache-2.0 license, CHANGELOG, zero warnings, 43 unit tests | §0.1.0 cleanup | [#1](https://github.com/yuw1/oxide-kv/pull/1) |
+| Snapshot-based log compaction + InstallSnapshot RPC | Raft §7 | [#2](https://github.com/yuw1/oxide-kv/pull/2) |
+| Linearizable reads via ReadIndex | Raft §6.4 | [#3](https://github.com/yuw1/oxide-kv/pull/3) |
+| Protobuf binary RPC (length-prefixed framing) | wire format | [#4](https://github.com/yuw1/oxide-kv/pull/4) |
+| LSM-Tree state machine (memtable + WAL + SSTables) | storage | [#5](https://github.com/yuw1/oxide-kv/pull/5) |
+| Two-phase commit lifecycle (BeginTx / Vote / DecideTx) | transactions | [#6](https://github.com/yuw1/oxide-kv/pull/6) |
+
+### Candidate future directions (not promised, not ordered)
+
+- **Multi-node 2PC coordinator** — RPC plumbing to gather `Vote`
+  entries from peers; the state machine and wire schema are already
+  in place, only the network handshake is missing.
+- **Sharded multi-Raft** — split the keyspace across independent
+  Raft groups for horizontal scale. Requires key→shard routing and
+  cross-shard 2PC.
+- **Joint consensus for membership change** — Raft §6. Replace
+  static `--peers` configuration with safe online add/remove.
+- **Tx timeout + admin-driven abort** — close the coordinator-crash
+  hole that currently leaves a pending tx in the log forever.
+- **Client SDKs** — Python and Go clients against the same JSON
+  client protocol.
+- **Benchmark suite** — throughput / latency under partition,
+  leader failover, snapshot catch-up. Track regressions in CI.
+- **LSM polish** — bloom filters (faster negative lookups), block
+  cache (warm reads), background compaction thread, leveled
+  compaction.
+- **gRPC transport** — replace raw TCP+protobuf with tonic once the
+  inter-node protocol stabilizes.
+- **TLS** for inter-node RPC and the client API.
+- **Per-read ack tracking** for full ReadIndex (current
+  implementation uses any recent successful peer reply as the
+  liveness proof — slightly weaker than the textbook algorithm).
+- **Metrics** — Prometheus export of election count, replication
+  lag, snapshot age, LSM flush/compact frequency.
+
+---
+
+## License
+
+Apache-2.0. See [LICENSE](./LICENSE).
