@@ -3,7 +3,7 @@ use clap::Parser;
 use tokio::net::TcpListener;
 use oxide_kv::client::ClientHandler;
 use oxide_kv::config::Config;
-use oxide_kv::state_machine::StateMachine;
+use oxide_kv::state_machine::{StateMachine, StateMachineConfig};
 use oxide_kv::raft::node::{NodeState, RaftNode};
 use oxide_kv::raft::rpc::RpcServer;
 use oxide_kv::raft::timer::run_election_timer;
@@ -33,7 +33,12 @@ async fn main() -> anyhow::Result<()> {
     Config::init(config);
 
     // 2. Initialize Key-Value State Machine
-    let state_machine = Arc::new(RwLock::new(StateMachine::open().expect("Failed to open StateMachine")));
+    let sm_config = StateMachineConfig {
+        data_dir: Config::global().get_base_path(),
+        // 4 MiB memtable threshold: tunable later via Config if needed.
+        memtable_size_threshold: 4 * 1024 * 1024,
+    };
+    let state_machine = Arc::new(RwLock::new(StateMachine::open(sm_config).expect("Failed to open StateMachine")));
 
     // 3. Create Raft instance and inject restored state
     let mut raft_node_inner = RaftNode::new(
