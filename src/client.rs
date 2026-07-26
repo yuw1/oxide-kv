@@ -1,5 +1,5 @@
 use crate::raft::node::{RaftNode, NodeState};
-use crate::protocol::Command;
+use crate::protocol::{Command, TxDecision};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
@@ -67,6 +67,15 @@ impl ClientHandler {
                 Self::apply_mutation(command, node_arc).await
             },
             Command::Get { key } => Self::linearizable_get(&key, node_arc).await,
+            Command::BeginTx { tx_id, ops } => {
+                Self::begin_tx(tx_id, ops, node_arc).await
+            }
+            Command::Vote { .. } | Command::DecideTx { .. } => {
+                // Manual 2PC control commands — useful for tests and for a
+                // future coordinator that wants to drive the lifecycle
+                // explicitly. Treat as mutations so they go through Raft.
+                Self::apply_mutation(command, node_arc).await
+            }
             Command::Compact => {
                 serde_json::json!({"status": "error", "message": "compact not supported yet"})
             },
@@ -127,6 +136,39 @@ impl ClientHandler {
             // Trigger log synchronization to followers immediately
             RaftNode::sync_logs(node_arc.clone());
             serde_json::json!({"status": "ok", "index": index})
+        } else {
+            serde_json::json!({"status": "error"})
+        }
+    }
+
+    /// Begin a two-phase-commit transaction.
+    ///
+    /// On a single-node cluster the leader is the sole participant, so we
+    /// auto-append the matching `DecideTx(Commit)` right after `BeginTx`.
+    /// On a multi-node cluster the coordinator would instead solicit votes
+    /// via `Vote` entries and only then append `DecideTx`.
+    async fn begin_tx(
+        tx_id: String,
+        ops: Vec<crate::protocol::TxOp>,
+        node_arc: &Arc<RwLock<RaftNode>>,
+    ) -> serde_json::Value {
+        let mut entries = vec![Command::BeginTx { tx_id: tx_id.clone(), ops }];
+        entries.push(Command::DecideTx {
+            tx_id: tx_id.clone(),
+            decision: TxDecision::Commit,
+        });
+
+        // Propose both as a single batch so they commit together.
+        let (success, first_index) = {
+            let mut node = node_arc.write().unwrap();
+            let ok = node.propose_batch(entries);
+            let first = node.log.len().saturating_sub(1) as u64;
+            (ok, first)
+        };
+
+        if success {
+            RaftNode::sync_logs(node_arc.clone());
+            serde_json::json!({"status": "ok", "tx_id": tx_id, "index": first_index})
         } else {
             serde_json::json!({"status": "error"})
         }

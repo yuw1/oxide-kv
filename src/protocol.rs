@@ -8,6 +8,28 @@ pub enum Command {
     Get { key: String },
     Delete { key: String },
     Compact,
+    // ---- Two-phase commit lifecycle (Raft thesis §6.4, simplified) ----
+    BeginTx { tx_id: String, ops: Vec<TxOp> },
+    Vote { tx_id: String, voter: String, vote: Vote },
+    DecideTx { tx_id: String, decision: TxDecision },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub enum TxOp {
+    Put { key: String, value: String },
+    Delete { key: String },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub enum Vote {
+    Yes,
+    No(String),
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub enum TxDecision {
+    Commit,
+    Abort,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
