@@ -8,6 +8,7 @@
 
 use crate::protocol::{
     Command as DomainCommand, LogEntry as DomainLogEntry, Snapshot as DomainSnapshot,
+    TxDecision as DomainTxDecision, TxOp as DomainTxOp, Vote as DomainTxVote,
 };
 use crate::raft::rpc::{
     AppendEntriesArgs as DomainAppendArgs, AppendReplyArgs as DomainAppendReply,
@@ -38,8 +39,45 @@ impl From<&DomainCommand> for pb::Command {
                 pb::command::Body::Delete(pb::Delete { key: key.clone() })
             }
             DomainCommand::Compact => pb::command::Body::Compact(pb::Empty {}),
+            DomainCommand::BeginTx { tx_id, ops } => {
+                pb::command::Body::BeginTx(pb::BeginTx {
+                    tx_id: tx_id.clone(),
+                    ops: ops.iter().map(|o| o.into()).collect(),
+                })
+            }
+            DomainCommand::Vote { tx_id, voter, vote } => {
+                let (yes, no_reason) = match vote {
+                    DomainTxVote::Yes => (true, String::new()),
+                    DomainTxVote::No(reason) => (false, reason.clone()),
+                };
+                pb::command::Body::TxVote(pb::TxVote {
+                    tx_id: tx_id.clone(),
+                    voter: voter.clone(),
+                    yes,
+                    no_reason,
+                })
+            }
+            DomainCommand::DecideTx { tx_id, decision } => {
+                pb::command::Body::DecideTx(pb::DecideTx {
+                    tx_id: tx_id.clone(),
+                    commit: matches!(decision, DomainTxDecision::Commit),
+                })
+            }
         };
         pb::Command { body: Some(body) }
+    }
+}
+
+impl From<&DomainTxOp> for pb::TxOp {
+    fn from(op: &DomainTxOp) -> Self {
+        let body = match op {
+            DomainTxOp::Put { key, value } => pb::tx_op::Body::Put(pb::Set {
+                key: key.clone(),
+                value: value.clone(),
+            }),
+            DomainTxOp::Delete { key } => pb::tx_op::Body::Delete(pb::Delete { key: key.clone() }),
+        };
+        pb::TxOp { body: Some(body) }
     }
 }
 
@@ -169,11 +207,41 @@ impl From<pb::Empty> for DomainCommand {
 impl From<pb::Command> for DomainCommand {
     fn from(p: pb::Command) -> Self {
         match p.body {
-            Some(pb::command::Body::Set(s)) => s.into(),
-            Some(pb::command::Body::Get(g)) => g.into(),
-            Some(pb::command::Body::Delete(d)) => d.into(),
-            Some(pb::command::Body::Compact(e)) => e.into(),
+            Some(pb::command::Body::Set(s)) => DomainCommand::Set { key: s.key, value: s.value },
+            Some(pb::command::Body::Get(g)) => DomainCommand::Get { key: g.key },
+            Some(pb::command::Body::Delete(d)) => DomainCommand::Delete { key: d.key },
+            Some(pb::command::Body::Compact(_)) => DomainCommand::Compact,
+            Some(pb::command::Body::BeginTx(b)) => DomainCommand::BeginTx {
+                tx_id: b.tx_id,
+                ops: b.ops.into_iter().map(|o| o.into()).collect(),
+            },
+            Some(pb::command::Body::TxVote(v)) => {
+                let vote = if v.yes {
+                    DomainTxVote::Yes
+                } else {
+                    DomainTxVote::No(v.no_reason)
+                };
+                DomainCommand::Vote { tx_id: v.tx_id, voter: v.voter, vote }
+            }
+            Some(pb::command::Body::DecideTx(d)) => {
+                let decision = if d.commit {
+                    DomainTxDecision::Commit
+                } else {
+                    DomainTxDecision::Abort
+                };
+                DomainCommand::DecideTx { tx_id: d.tx_id, decision }
+            }
             None => DomainCommand::Compact, // No payload → treat as no-op
+        }
+    }
+}
+
+impl From<pb::TxOp> for DomainTxOp {
+    fn from(p: pb::TxOp) -> Self {
+        match p.body {
+            Some(pb::tx_op::Body::Put(s)) => DomainTxOp::Put { key: s.key, value: s.value },
+            Some(pb::tx_op::Body::Delete(d)) => DomainTxOp::Delete { key: d.key },
+            None => DomainTxOp::Delete { key: String::new() }, // best-effort no-op
         }
     }
 }

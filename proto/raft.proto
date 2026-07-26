@@ -27,6 +27,9 @@ message Command {
     Get get = 2;
     Delete delete = 3;
     Empty compact = 4;
+    BeginTx begin_tx = 5;
+    TxVote tx_vote = 6;
+    DecideTx decide_tx = 7;
   }
 }
 
@@ -46,6 +49,32 @@ message Delete {
 // Sentinel for the no-op Compact command (the wire format must always
 // carry a payload for a `oneof` field).
 message Empty {}
+
+message TxOp {
+  oneof body {
+    Set put = 1;
+    Delete delete = 2;
+  }
+}
+
+message BeginTx {
+  string tx_id = 1;
+  repeated TxOp ops = 2;
+}
+
+message TxVote {
+  string tx_id = 1;
+  string voter = 2;
+  // No reason field: a "No" vote carries an opaque string, kept short
+  // for log readability. Empty string == vote with no reason.
+  string no_reason = 3;
+  bool yes = 4;
+}
+
+message DecideTx {
+  string tx_id = 1;
+  bool commit = 2;
+}
 
 // ---- RPC arguments ----
 

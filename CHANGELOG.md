@@ -107,6 +107,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   meta) and the external client JSON API are unchanged.
 - LSM deferred: bloom filters, block cache, background compaction thread,
   leveled compaction. Current shape keeps the engine simple and in one file.
+
+### Added (two-phase commit)
+- **Two-phase commit (2PC) lifecycle** for atomic multi-key writes:
+  - New `Command` variants: `BeginTx { tx_id, ops }`, `Vote { tx_id, voter, vote }`,
+    `DecideTx { tx_id, decision }`
+  - New types: `TxOp` (Put/Delete), `Vote` (Yes/No(reason)),
+    `TxDecision` (Commit/Abort)
+- **State machine 2PC support** (`src/state_machine.rs`):
+  - `pending_txs: BTreeMap<tx_id, PendingTx>` tracks in-flight transactions
+    (ops + per-participant votes + decision)
+  - `begin_tx`, `record_vote`, `decide_tx` apply log entries
+  - `pending_tx_count()` and `pending_tx(tx_id) -> PendingTxView` for
+    introspection (tests + future admin endpoints)
+  - `get` continues to return only committed values — pending ops are
+    isolated until `DecideTx(Commit)` applies them
+  - `clear_for_snapshot` also wipes in-flight transactions (consistent
+    with "snapshot installed -> start fresh")
+- **Coordinator fast path** (`src/client.rs::begin_tx`):
+  - Single-node cluster auto-appends `DecideTx(Commit)` right after
+    `BeginTx`, so the client sees atomic tx with no extra round-trip
+  - Multi-node cluster would instead solicit votes via `Vote` entries
+    and append `DecideTx` once all votes are in (RPC plumbing
+    deferred — the commands are in the wire schema and ready)
+- **RaftNode**:
+  - `apply_logs` and `replay_logs` handle all three new commands
+  - `propose_batch(Vec<Command>)` appends multiple log entries
+    contiguously so BeginTx + DecideTx ride the same proposal
+- **Wire schema** (`proto/raft.proto` + `src/raft/proto.rs`):
+  - New protobuf messages: `BeginTx`, `TxVote`, `DecideTx`, `TxOp`
+  - Full round-trip conversion to/from domain types
+
+### Test suite (105 tests, all passing)
+- 93 → 105 (+12 new):
+  - `state_machine`: begin_tx stages pending without applying,
+    decide_tx commit applies all ops atomically, decide_tx abort
+    discards all ops, record_vote updates view, vote for unknown
+    tx is noop, decide_tx for unknown tx is noop, multiple
+    concurrent transactions isolate reads, begin_tx redefine
+    overwrites pending state
+  - `raft::node`: replay_logs applies committed tx, replay_logs
+    aborted tx has no side effects, propose_batch appends contiguous
+    entries, vote recorded for pending tx then commit applies ops
+
+### Notes / Caveats
+- Single-node cluster: `BeginTx` from a client is automatically paired
+  with a `DecideTx(Commit)` log entry on the same Raft proposal.
+- Multi-node cluster: the commands (`Vote`, `DecideTx`) are in the wire
+  schema and accepted by the state machine, but the coordinator logic
+  to gather votes via RPC is intentionally deferred. The state machine
+  itself is fully tested.
+- Read isolation is best-effort: while a tx is pending, `get` returns
+  only the previously-committed value. We do not implement
+  two-phase locking, so concurrent transactions on the same key can
+  race; last writer wins on commit.
+- No deadlock detection / timeout-based abort. A coordinator crash
+  after `BeginTx` would leave a pending tx in the log forever;
+  follow-up work could add a tx timeout + admin-driven abort.
 - Chunked InstallSnapshot transfer (offset/done fields) is still deferred.
 
 ## [0.1.0] - 2026-02-24

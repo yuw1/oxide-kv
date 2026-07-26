@@ -31,6 +31,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::protocol::{TxDecision, TxOp, Vote};
+
 /// Configuration for [`StateMachine`].
 #[derive(Debug, Clone)]
 pub struct StateMachineConfig {
@@ -53,6 +55,19 @@ impl Default for StateMachineConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct MemEntry {
     value: Option<String>,
+}
+
+/// State of an in-flight two-phase commit transaction. Pending ops live
+/// here (NOT in the memtable / SSTables) so reads don't see uncommitted
+/// writes. They are applied to the LSM only when the coordinator decides
+/// `Commit` via `decide_tx`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingTx {
+    ops: Vec<TxOp>,
+    /// Vote received from each participant; missing entry == no vote yet.
+    votes: BTreeMap<String, Vote>,
+    /// Final decision, if any. Once set, the pending tx can be discarded.
+    decision: Option<TxDecision>,
 }
 
 /// One WAL line. Encoded as JSON for human-debuggability; the WAL is the
@@ -103,6 +118,10 @@ pub struct StateMachine {
     /// SSTables in age order: index 0 is oldest, last is newest.
     sstables: Vec<SSTableHandle>,
     next_sst_id: u64,
+    /// Two-phase commit transactions currently in flight. Keyed by `tx_id`.
+    /// Rebuilt from Raft log replay on startup; not persisted to LSM WAL
+    /// because the WAL already records Set/Delete mutations.
+    pending_txs: BTreeMap<String, PendingTx>,
 }
 
 impl StateMachine {
@@ -180,6 +199,7 @@ impl StateMachine {
             wal,
             sstables,
             next_sst_id,
+            pending_txs: BTreeMap::new(),
         })
     }
 
@@ -307,7 +327,79 @@ impl StateMachine {
         }
         self.sstables.clear();
         self.next_sst_id = 0;
+        // 2PC pending txs are part of Raft log state, not LSM state, but
+        // wiping them too is consistent with "snapshot installed -> start fresh".
+        self.pending_txs.clear();
         Ok(())
+    }
+
+    // =================== Two-phase commit API ===================
+
+    /// Stage a new transaction. The ops are stored in `pending_txs` and
+    /// NOT applied to the LSM yet — reads cannot see them until the
+    /// coordinator appends a matching `DecideTx(Commit)` log entry.
+    pub fn begin_tx(&mut self, tx_id: String, ops: Vec<TxOp>) -> io::Result<()> {
+        // Idempotent: re-defining a tx_id with different ops overwrites the
+        // pending state. A well-behaved coordinator will not do this.
+        self.pending_txs.insert(
+            tx_id,
+            PendingTx { ops, votes: BTreeMap::new(), decision: None },
+        );
+        Ok(())
+    }
+
+    /// Record a participant's vote on a pending transaction.
+    pub fn record_vote(&mut self, tx_id: &str, voter: String, vote: Vote) -> io::Result<()> {
+        if let Some(tx) = self.pending_txs.get_mut(tx_id) {
+            tx.votes.insert(voter, vote);
+        }
+        // Unknown tx_id: silently ignore. The vote may have been emitted by
+        // a participant that already processed a DecideTx and purged the
+        // pending entry; later votes that arrive out of order are no-ops.
+        Ok(())
+    }
+
+    /// Apply the coordinator's final decision. On `Commit`, every op in
+    /// the transaction is applied atomically. On `Abort`, the transaction
+    /// is discarded without side effects.
+    pub fn decide_tx(&mut self, tx_id: &str, decision: TxDecision) -> io::Result<()> {
+        let tx = match self.pending_txs.remove(tx_id) {
+            Some(tx) => tx,
+            None => return Ok(()), // idempotent: already decided
+        };
+        if matches!(decision, TxDecision::Commit) {
+            for op in tx.ops {
+                match op {
+                    TxOp::Put { key, value } => {
+                        let _ = self.set(&key, &value);
+                    }
+                    TxOp::Delete { key } => {
+                        let _ = self.delete(&key);
+                    }
+                }
+            }
+        }
+        // For Abort: simply dropping the entry is sufficient.
+        Ok(())
+    }
+
+    /// Number of pending (in-flight) two-phase commit transactions.
+    pub fn pending_tx_count(&self) -> usize {
+        self.pending_txs.len()
+    }
+
+    /// Inspect a pending transaction (read-only). Returns `None` if the
+    /// `tx_id` is not in flight.
+    pub fn pending_tx(&self, tx_id: &str) -> Option<PendingTxView> {
+        self.pending_txs.get(tx_id).map(|tx| PendingTxView {
+            op_count: tx.ops.len(),
+            yes_votes: tx.votes.values().filter(|v| matches!(v, Vote::Yes)).count(),
+            no_votes: tx
+                .votes
+                .values()
+                .filter(|v| matches!(v, Vote::No(_)))
+                .count(),
+        })
     }
 
     /// Force a flush of the memtable to a new SSTable. No-op if empty.
@@ -455,9 +547,19 @@ fn estimate_entry(key: &str) -> usize {
     key.len() + 40
 }
 
+/// Read-only snapshot of a pending transaction's state, for tests and
+/// (eventually) admin / debug endpoints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingTxView {
+    pub op_count: usize,
+    pub yes_votes: usize,
+    pub no_votes: usize,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{TxDecision, TxOp, Vote};
 
     fn temp_config() -> (TempDir, StateMachineConfig) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -768,5 +870,146 @@ mod tests {
         assert_eq!(sm.get("键"), Some("值 🎉".to_string()));
         sm.flush().unwrap();
         assert_eq!(sm.get("键"), Some("值 🎉".to_string()));
+    }
+
+    // ---------- two-phase commit lifecycle ----------
+
+    #[test]
+    fn begin_tx_stages_pending_without_applying() {
+        let (_d, mut sm) = open_default();
+        sm.begin_tx(
+            "tx-1".into(),
+            vec![TxOp::Put { key: "a".into(), value: "1".into() }],
+        )
+        .unwrap();
+        // Reads must not see the pending op.
+        assert_eq!(sm.get("a"), None);
+        // The pending tx is tracked.
+        assert_eq!(sm.pending_tx_count(), 1);
+        let view = sm.pending_tx("tx-1").unwrap();
+        assert_eq!(view.op_count, 1);
+        assert_eq!(view.yes_votes, 0);
+    }
+
+    #[test]
+    fn decide_tx_commit_applies_all_ops_atomically() {
+        let (_d, mut sm) = open_default();
+        sm.begin_tx(
+            "tx-2".into(),
+            vec![
+                TxOp::Put { key: "a".into(), value: "1".into() },
+                TxOp::Put { key: "b".into(), value: "2".into() },
+                TxOp::Delete { key: "c".into() },
+            ],
+        )
+        .unwrap();
+        sm.decide_tx("tx-2", TxDecision::Commit).unwrap();
+
+        assert_eq!(sm.get("a"), Some("1".to_string()));
+        assert_eq!(sm.get("b"), Some("2".to_string()));
+        assert_eq!(sm.pending_tx_count(), 0);
+    }
+
+    #[test]
+    fn decide_tx_abort_discards_all_ops() {
+        let (_d, mut sm) = open_default();
+        // Pre-existing value to verify abort doesn't accidentally clear it.
+        sm.set("existing", "v0").unwrap();
+
+        sm.begin_tx(
+            "tx-3".into(),
+            vec![
+                TxOp::Put { key: "a".into(), value: "should-not-apply".into() },
+                TxOp::Put { key: "existing".into(), value: "should-not-overwrite".into() },
+            ],
+        )
+        .unwrap();
+        sm.decide_tx("tx-3", TxDecision::Abort).unwrap();
+
+        // Both new ops are gone; the pre-existing value is intact.
+        assert_eq!(sm.get("a"), None);
+        assert_eq!(sm.get("existing"), Some("v0".to_string()));
+        assert_eq!(sm.pending_tx_count(), 0);
+    }
+
+    #[test]
+    fn record_vote_updates_pending_tx_view() {
+        let (_d, mut sm) = open_default();
+        sm.begin_tx("tx-4".into(), vec![TxOp::Put { key: "k".into(), value: "v".into() }])
+            .unwrap();
+
+        sm.record_vote("tx-4", "node-A".into(), Vote::Yes).unwrap();
+        sm.record_vote("tx-4", "node-B".into(), Vote::No("conflict".into())).unwrap();
+
+        let view = sm.pending_tx("tx-4").unwrap();
+        assert_eq!(view.op_count, 1);
+        assert_eq!(view.yes_votes, 1);
+        assert_eq!(view.no_votes, 1);
+
+        // The pending op is still isolated from reads.
+        assert_eq!(sm.get("k"), None);
+    }
+
+    #[test]
+    fn vote_for_unknown_tx_is_noop() {
+        let (_d, mut sm) = open_default();
+        sm.record_vote("nonexistent", "node-A".into(), Vote::Yes).unwrap();
+        assert_eq!(sm.pending_tx_count(), 0);
+    }
+
+    #[test]
+    fn decide_tx_for_unknown_tx_is_noop() {
+        let (_d, mut sm) = open_default();
+        sm.decide_tx("nonexistent", TxDecision::Commit).unwrap();
+        assert_eq!(sm.pending_tx_count(), 0);
+    }
+
+    #[test]
+    fn multiple_concurrent_transactions_isolate_reads() {
+        let (_d, mut sm) = open_default();
+        sm.begin_tx(
+            "tx-A".into(),
+            vec![TxOp::Put { key: "shared".into(), value: "from-A".into() }],
+        )
+        .unwrap();
+        sm.begin_tx(
+            "tx-B".into(),
+            vec![TxOp::Put { key: "shared".into(), value: "from-B".into() }],
+        )
+        .unwrap();
+
+        // Neither tx's write is visible to reads.
+        assert_eq!(sm.get("shared"), None);
+        assert_eq!(sm.pending_tx_count(), 2);
+
+        // Committing A still doesn't expose the write until its decide fires.
+        sm.decide_tx("tx-A", TxDecision::Commit).unwrap();
+        assert_eq!(sm.get("shared"), Some("from-A".to_string()));
+        assert_eq!(sm.pending_tx_count(), 1);
+
+        // B aborts.
+        sm.decide_tx("tx-B", TxDecision::Abort).unwrap();
+        assert_eq!(sm.get("shared"), Some("from-A".to_string()));
+        assert_eq!(sm.pending_tx_count(), 0);
+    }
+
+    #[test]
+    fn begin_tx_redefine_overwrites_pending_state() {
+        // Documenting the current behavior: re-issuing begin_tx with the same
+        // id replaces the previous pending entry. This is intentionally
+        // simple; a production system would reject duplicate tx_ids.
+        let (_d, mut sm) = open_default();
+        sm.begin_tx(
+            "tx-dup".into(),
+            vec![TxOp::Put { key: "a".into(), value: "1".into() }],
+        )
+        .unwrap();
+        sm.begin_tx(
+            "tx-dup".into(),
+            vec![TxOp::Put { key: "b".into(), value: "2".into() }],
+        )
+        .unwrap();
+        let view = sm.pending_tx("tx-dup").unwrap();
+        assert_eq!(view.op_count, 1); // only the latest begin survived
     }
 }

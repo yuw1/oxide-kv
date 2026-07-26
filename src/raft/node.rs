@@ -173,6 +173,32 @@ impl RaftNode {
         true
     }
 
+    /// Propose a batch of commands that must commit together (same log
+    /// entries, contiguous indices). Used by the 2PC client path so that
+    /// `BeginTx` and its `DecideTx` ride the same Raft proposal.
+    ///
+    /// Returns true iff every entry was successfully appended.
+    pub fn propose_batch(&mut self, commands: Vec<Command>) -> bool {
+        if self.state != NodeState::Leader {
+            return false;
+        }
+        let mut next_index = self.log.len() as u64 + 1;
+        for command in commands {
+            let entry = LogEntry {
+                term: self.current_term,
+                index: next_index as usize,
+                command,
+            };
+            if let Err(e) = self.storage.append_wal_log(&entry) {
+                eprintln!("[Error] Failed to append wal log: {}", e);
+                return false;
+            }
+            self.log.push(entry);
+            next_index += 1;
+        }
+        true
+    }
+
     pub fn sync_logs(raft_node: Arc<RwLock<Self>>) {
         let (current_term, node_id, commit_index, peers, log_len) = {
             let n = raft_node.read().unwrap();
@@ -293,7 +319,10 @@ impl RaftNode {
         for entry in &self.log {
             match &entry.command {
                 Command::Set { key, value } => { let _ = state_machine.set(&*key.clone(), &*value.clone()); }
-                Command::Delete { key } => { let _ = state_machine.delete(key); }
+                Command::Delete { key } => { let _ = state_machine.delete(&key); }
+                Command::BeginTx { tx_id, ops } => { let _ = state_machine.begin_tx(tx_id.clone(), ops.clone()); }
+                Command::Vote { tx_id, voter, vote } => { let _ = state_machine.record_vote(tx_id, voter.clone(), vote.clone()); }
+                Command::DecideTx { tx_id, decision } => { let _ = state_machine.decide_tx(tx_id, decision.clone()); }
                 _ => {}
             }
         }
@@ -557,7 +586,7 @@ impl RaftNode {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::protocol::{Command, LogEntry, ReadIndex, Snapshot};
+    use crate::protocol::{Command, LogEntry, ReadIndex, Snapshot, TxDecision, TxOp, Vote};
     use crate::raft::rpc::{AppendEntriesArgs, InstallSnapshotArgs, RequestVoteArgs};
     use crate::raft::storage::RaftStorage;
     use crate::state_machine::StateMachine;
@@ -1422,5 +1451,135 @@ mod tests {
 
         node.state = NodeState::Follower;
         assert!(!node.confirm_read(ri), "stepped-down node must not serve reads");
+    }
+
+    // ---------- two-phase commit (apply_logs path) ----------
+
+    #[test]
+    fn replay_logs_applies_committed_tx() {
+        // BeginTx + DecideTx(Commit) replayed together should apply all
+        // ops atomically.
+        let (_d, mut node) = make_node("n1", vec!["n2".into()]);
+        node.log = vec![
+            LogEntry {
+                term: 1,
+                index: 1,
+                command: Command::BeginTx {
+                    tx_id: "tx-replay".into(),
+                    ops: vec![
+                        TxOp::Put { key: "a".into(), value: "1".into() },
+                        TxOp::Put { key: "b".into(), value: "2".into() },
+                    ],
+                },
+            },
+            LogEntry {
+                term: 1,
+                index: 2,
+                command: Command::DecideTx {
+                    tx_id: "tx-replay".into(),
+                    decision: TxDecision::Commit,
+                },
+            },
+        ];
+        node.commit_index = 2;
+        node.replay_logs();
+
+        assert_eq!(node.last_applied, 2);
+        assert_node_state(&node, "a", Some("1"));
+        assert_node_state(&node, "b", Some("2"));
+    }
+
+    #[test]
+    fn replay_logs_aborted_tx_has_no_side_effects() {
+        let (_d, mut node) = make_node("n1", vec!["n2".into()]);
+        node.log = vec![
+            LogEntry {
+                term: 1,
+                index: 1,
+                command: Command::BeginTx {
+                    tx_id: "tx-abort".into(),
+                    ops: vec![TxOp::Put {
+                        key: "a".into(),
+                        value: "should-not-apply".into(),
+                    }],
+                },
+            },
+            LogEntry {
+                term: 1,
+                index: 2,
+                command: Command::DecideTx {
+                    tx_id: "tx-abort".into(),
+                    decision: TxDecision::Abort,
+                },
+            },
+        ];
+        node.commit_index = 2;
+        node.replay_logs();
+
+        assert_node_state(&node, "a", None);
+        assert_eq!(node.last_applied, 2);
+    }
+
+    #[test]
+    fn propose_batch_appends_contiguous_entries() {
+        let (_d, mut node) = make_node("n1", vec!["n2".into()]);
+        node.state = NodeState::Leader;
+
+        let ok = node.propose_batch(vec![
+            Command::BeginTx {
+                tx_id: "tx-batch".into(),
+                ops: vec![TxOp::Put { key: "x".into(), value: "1".into() }],
+            },
+            Command::DecideTx {
+                tx_id: "tx-batch".into(),
+                decision: TxDecision::Commit,
+            },
+        ]);
+        assert!(ok);
+
+        assert_eq!(node.log.len(), 2);
+        assert_eq!(node.log[0].index, 1);
+        assert_eq!(node.log[1].index, 2);
+        assert!(matches!(node.log[0].command, Command::BeginTx { .. }));
+        assert!(matches!(node.log[1].command, Command::DecideTx { .. }));
+    }
+
+    #[test]
+    fn vote_recorded_for_pending_tx_then_commit_applies_ops() {
+        // End-to-end: BeginTx → Vote (Yes) → DecideTx(Commit), applied via
+        // apply_logs, ops are now visible.
+        let (_d, mut node) = make_node("n1", vec!["n2".into()]);
+        node.log = vec![
+            LogEntry {
+                term: 1,
+                index: 1,
+                command: Command::BeginTx {
+                    tx_id: "tx-vote".into(),
+                    ops: vec![TxOp::Put { key: "k".into(), value: "v".into() }],
+                },
+            },
+            LogEntry {
+                term: 1,
+                index: 2,
+                command: Command::Vote {
+                    tx_id: "tx-vote".into(),
+                    voter: "node-1".into(),
+                    vote: Vote::Yes,
+                },
+            },
+            LogEntry {
+                term: 1,
+                index: 3,
+                command: Command::DecideTx {
+                    tx_id: "tx-vote".into(),
+                    decision: TxDecision::Commit,
+                },
+            },
+        ];
+        node.commit_index = 3;
+        node.replay_logs();
+
+        assert_node_state(&node, "k", Some("v"));
+        assert_eq!(node.last_applied, 3);
     }
 }
