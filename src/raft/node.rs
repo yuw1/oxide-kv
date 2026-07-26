@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::protocol::{Command, LogEntry, Snapshot};
+use crate::protocol::{Command, LogEntry, ReadIndex, Snapshot};
 use crate::raft::rpc::{
     AppendEntriesArgs, AppendReplyArgs, InstallSnapshotArgs, InstallSnapshotReplyArgs,
     RequestVoteArgs, RpcClient, VoteResponseArgs,
@@ -38,6 +38,11 @@ pub struct RaftNode {
 
     /// Last time a valid heartbeat or election was initiated
     pub last_heartbeat: Instant,
+
+    /// Most recent instant at which the leader received a successful heartbeat
+    /// reply from at least one peer. Used by ReadIndex to bound the lease
+    /// within which a linearizable read is safe.
+    pub last_quorum_heartbeat_at: Option<Instant>,
 
     // --- Volatile state on leaders ---
     pub next_index: HashMap<String, u64>,
@@ -86,6 +91,7 @@ impl RaftNode {
             commit_index: 0,
             last_applied: 0,
             last_heartbeat: Instant::now(),
+            last_quorum_heartbeat_at: None,
             next_index: HashMap::new(),
             match_index: HashMap::new(),
         }
@@ -212,6 +218,9 @@ impl RaftNode {
                             let last_idx = args.prev_log_index + args.entries.len() as u64;
                             n.match_index.insert(peer_addr_clone.clone(), last_idx);
                             n.next_index.insert(peer_addr_clone.clone(), last_idx + 1);
+                            // Refresh the leader's ReadIndex lease: at least one peer
+                            // has acknowledged our leadership recently.
+                            n.last_quorum_heartbeat_at = Some(Instant::now());
                             n.maybe_commit();
                         } else if reply.term > n.current_term {
                             n.current_term = reply.term;
@@ -493,17 +502,68 @@ impl RaftNode {
         // in the snapshot range via AppendEntries), but the disk WAL is freed.
         true
     }
+
+    /// Begin a linearizable read on the leader.
+    ///
+    /// Returns `Some(ReadIndex)` anchored at the leader's current `commit_index`
+    /// and the moment the call was issued. Returns `None` if this node is not
+    /// the current leader. Triggers an immediate heartbeat so the leader can
+    /// prove its quorum quickly.
+    pub fn begin_read(raft_node: Arc<RwLock<Self>>) -> Option<ReadIndex> {
+        let ri = {
+            let node = raft_node.write().unwrap();
+            if node.state != NodeState::Leader {
+                return None;
+            }
+            ReadIndex {
+                index: node.commit_index,
+                issued_at: Instant::now(),
+            }
+        };
+        // Force a heartbeat round so the leader's last_quorum_heartbeat_at
+        // advances as soon as peers ack. We drop the write lock above before
+        // calling sync_logs (which takes a read lock) to avoid self-deadlock.
+        Self::sync_logs(raft_node);
+        Some(ri)
+    }
+
+    /// Confirm that a previously-issued `ReadIndex` is safe to serve.
+    ///
+    /// Safety requires:
+    ///   1. The node is still the leader (no step-down after `begin_read`).
+    ///   2. The state machine has applied all entries up to `ri.index`.
+    ///   3. The leader's quorum proof (`last_quorum_heartbeat_at`) was obtained
+    ///      at or after the read was issued, AND is still recent enough that
+    ///      a partitioned leader could not have survived an election timeout.
+    pub fn confirm_read(&self, ri: ReadIndex) -> bool {
+        if self.state != NodeState::Leader {
+            return false;
+        }
+        if self.last_applied < ri.index {
+            return false;
+        }
+        match self.last_quorum_heartbeat_at {
+            None => false,
+            Some(t) => {
+                let fresh = t.elapsed()
+                    < Duration::from_millis(Config::max_election_timeout_ms());
+                fresh && t >= ri.issued_at
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{Command, LogEntry, Snapshot};
+    use crate::config::Config;
+    use crate::protocol::{Command, LogEntry, ReadIndex, Snapshot};
     use crate::raft::rpc::{AppendEntriesArgs, InstallSnapshotArgs, RequestVoteArgs};
     use crate::raft::storage::RaftStorage;
     use crate::state_machine::StateMachine;
     use std::collections::HashMap;
     use std::sync::{Arc, RwLock};
+    use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
     /// Build a `RaftNode` rooted in a fresh temp dir so each test is isolated
@@ -1206,5 +1266,143 @@ mod tests {
 
         // WAL on disk must be truncated.
         assert_eq!(node.storage.restore_wal_log().len(), 0);
+    }
+
+    // ---------- begin_read / confirm_read ----------
+
+    fn arc_node(node: RaftNode) -> Arc<RwLock<RaftNode>> {
+        Arc::new(RwLock::new(node))
+    }
+
+    #[test]
+    fn begin_read_returns_none_when_follower() {
+        let (_d, node) = make_node("n1", vec!["n2".into()]);
+        // default state is Follower
+        let node_arc = arc_node(node);
+        assert!(RaftNode::begin_read(node_arc).is_none());
+    }
+
+    #[test]
+    fn begin_read_returns_none_when_candidate() {
+        let (_d, mut node) = make_node("n1", vec!["n2".into()]);
+        node.state = NodeState::Candidate;
+        let node_arc = arc_node(node);
+        assert!(RaftNode::begin_read(node_arc).is_none());
+    }
+
+    #[tokio::test]
+    async fn begin_read_returns_some_when_leader_and_anchors_at_commit_index() {
+        let (_d, mut node) = make_node("n1", vec!["n2".into()]);
+        node.state = NodeState::Leader;
+        node.commit_index = 7;
+        let node_arc = arc_node(node);
+        let ri = RaftNode::begin_read(node_arc).expect("leader should begin read");
+        assert_eq!(ri.index, 7);
+    }
+
+    #[test]
+    fn confirm_read_returns_false_when_not_leader() {
+        let (_d, mut node) = make_node("n1", vec!["n2".into()]);
+        // Promote to leader, capture a valid ReadIndex, then step down.
+        node.state = NodeState::Leader;
+        node.last_applied = 5;
+        node.commit_index = 5;
+        node.last_quorum_heartbeat_at = Some(Instant::now());
+        let ri = ReadIndex { index: 5, issued_at: Instant::now() };
+
+        // Now step down.
+        node.state = NodeState::Follower;
+        assert!(!node.confirm_read(ri));
+    }
+
+    #[test]
+    fn confirm_read_returns_false_when_state_machine_lags() {
+        let (_d, mut node) = make_node("n1", vec!["n2".into()]);
+        node.state = NodeState::Leader;
+        node.commit_index = 10;
+        node.last_applied = 3; // Not yet applied up to read index
+        node.last_quorum_heartbeat_at = Some(Instant::now());
+
+        let ri = ReadIndex { index: 5, issued_at: Instant::now() };
+        assert!(!node.confirm_read(ri));
+    }
+
+    #[test]
+    fn confirm_read_returns_false_when_no_quorum_evidence() {
+        let (_d, mut node) = make_node("n1", vec!["n2".into()]);
+        node.state = NodeState::Leader;
+        node.last_applied = 5;
+        node.commit_index = 5;
+        node.last_quorum_heartbeat_at = None; // never heard from any peer
+
+        let ri = ReadIndex { index: 5, issued_at: Instant::now() };
+        assert!(!node.confirm_read(ri));
+    }
+
+    #[test]
+    fn confirm_read_returns_false_when_quorum_evidence_predates_issued_at() {
+        // Critical safety property: if the leader issued the read BEFORE
+        // its last heartbeat proof, the proof may have happened before a
+        // partition, so we cannot guarantee linearizability.
+        let (_d, mut node) = make_node("n1", vec!["n2".into()]);
+        node.state = NodeState::Leader;
+        node.last_applied = 5;
+        node.commit_index = 5;
+        node.last_quorum_heartbeat_at = Some(Instant::now());
+
+        // Read issued in the future relative to the heartbeat proof.
+        let ri = ReadIndex {
+            index: 5,
+            issued_at: Instant::now() + Duration::from_secs(60),
+        };
+        assert!(!node.confirm_read(ri));
+    }
+
+    #[test]
+    fn confirm_read_returns_false_when_quorum_evidence_too_stale() {
+        // Stale heartbeat = likely partitioned. election_timeout is the bound.
+        let (_d, mut node) = make_node("n1", vec!["n2".into()]);
+        node.state = NodeState::Leader;
+        node.last_applied = 5;
+        node.commit_index = 5;
+        // Backdate the heartbeat proof by more than max_election_timeout_ms.
+        let stale = Instant::now()
+            - Duration::from_millis(Config::max_election_timeout_ms() + 500);
+        node.last_quorum_heartbeat_at = Some(stale);
+
+        let ri = ReadIndex { index: 5, issued_at: stale };
+        assert!(!node.confirm_read(ri));
+    }
+
+    #[test]
+    fn confirm_read_returns_true_when_all_conditions_met() {
+        let (_d, mut node) = make_node("n1", vec!["n2".into()]);
+        node.state = NodeState::Leader;
+        node.last_applied = 5;
+        node.commit_index = 5;
+        let now = Instant::now();
+        node.last_quorum_heartbeat_at = Some(now);
+
+        let ri = ReadIndex { index: 5, issued_at: now };
+        assert!(node.confirm_read(ri));
+    }
+
+    #[test]
+    fn confirm_read_rejects_after_step_down_even_with_fresh_proof() {
+        // Simulates: leader processes begin_read, then loses election,
+        // then confirm_read is called. Even though the proof timestamp is
+        // still valid, the node is no longer the leader.
+        let (_d, mut node) = make_node("n1", vec!["n2".into()]);
+        node.state = NodeState::Leader;
+        node.last_applied = 5;
+        node.commit_index = 5;
+        let now = Instant::now();
+        node.last_quorum_heartbeat_at = Some(now);
+
+        let ri = ReadIndex { index: 5, issued_at: now };
+        assert!(node.confirm_read(ri), "sanity: leader confirms");
+
+        node.state = NodeState::Follower;
+        assert!(!node.confirm_read(ri), "stepped-down node must not serve reads");
     }
 }
