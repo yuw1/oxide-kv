@@ -166,6 +166,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   follow-up work could add a tx timeout + admin-driven abort.
 - Chunked InstallSnapshot transfer (offset/done fields) is still deferred.
 
+### Fixed (election timer & heartbeat tuning)
+- **Election timer brain-split**: `run_election_timer` previously compared
+  `last_heartbeat.elapsed()` against the *sleep duration* of the loop
+  iteration, which was always true after waking up. The result was an
+  election triggered on every loop tick, term inflation, and constant
+  leader churn in multi-node clusters. The timer now compares against
+  a fixed `min_election_timeout_ms` threshold via the new pure helper
+  `should_start_election(state, last_heartbeat, now, threshold)`, and
+  re-checks state after a small post-threshold jitter to avoid split
+  votes between followers who expired in the same tick.
+- **Heartbeat-to-election ratio**: bumped `heartbeat_interval_ms` from
+  `1000` to `250`, and widened `min_election_timeout_ms` /
+  `max_election_timeout_ms` to `5000` / `10000`. The new ratio
+  (~1:20–40) tolerates transient RPC jitter without spurious elections
+  and brings the spread (max − min) well under 50% of min so two nodes
+  rarely draw overlapping timeout windows.
+- New unit tests for `raft::timer`:
+  leader never elects even after long silence; follower within threshold
+  does not elect; follower at/past threshold elects; candidate uses the
+  same threshold; the heartbeat:election ratio constraint holds.
+
 ### Fixed (single-node read fallback)
 - **`Get` on a single-node cluster no longer times out.** Previously, a
   leader with no peers would call `begin_read` (which triggers a
