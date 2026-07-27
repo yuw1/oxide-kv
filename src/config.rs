@@ -55,14 +55,20 @@ impl Config {
     // --- Time & Timeout Management ---
 
     /// Lower bound of the randomized election timeout.
-    /// Constraint: Must be significantly larger than (heartbeat_interval + rpc_append_entries_timeout)
-    pub fn min_election_timeout_ms() -> u64 { 3000 }
+    /// Constraint: Must be significantly larger than (heartbeat_interval + rpc_append_entries_timeout).
+    /// Tuned so the heartbeat-to-election ratio is ≥ 1:10 to tolerate transient RPC
+    /// jitter without spurious elections (industry standard is 1:10–1:20).
+    pub fn min_election_timeout_ms() -> u64 { 5000 }
 
     /// Upper bound of the randomized election timeout.
-    pub fn max_election_timeout_ms() -> u64 { 5000 }
+    /// Range (max - min) must be < 50% of min so two nodes rarely draw overlapping
+    /// windows and split their votes (industry standard).
+    pub fn max_election_timeout_ms() -> u64 { 10000 }
 
     /// How often the Leader sends heartbeats to maintain its authority.
-    pub fn heartbeat_interval_ms() -> u64 { 1000 }
+    /// Must be small enough that one tick fits well inside the election timeout
+    /// (see min/max_election_timeout_ms doc).
+    pub fn heartbeat_interval_ms() -> u64 { 250 }
 
     /// Max time to wait for a response of RequestVote RPC.
     pub fn rpc_request_vote_timeout_ms() -> u64 { 1000 }
