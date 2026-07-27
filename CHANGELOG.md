@@ -187,6 +187,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   does not elect; follower at/past threshold elects; candidate uses the
   same threshold; the heartbeat:election ratio constraint holds.
 
+### Fixed (single-node read fallback)
+- **`Get` on a single-node cluster no longer times out.** Previously, a
+  leader with no peers would call `begin_read` (which triggers a
+  heartbeat), then `confirm_read` would loop forever waiting for a
+  quorum heartbeat ack that could never arrive. The 2 s timeout then
+  fired and every `Get` returned `"read confirmation timeout"`. The
+  client path now detects `peers.is_empty()` and reads directly from
+  the state machine after `apply_logs()`, preserving the linearizable
+  guarantee (the node is Leader, commit_index is up-to-date, last_applied
+  catches up before the read).
+- **Single-node leader now actually advances `commit_index`.** The
+  previous `sync_logs` only ran `maybe_commit` from inside the
+  per-peer AppendEntries success handler. With zero peers the handler
+  never ran, so the leader's `commit_index` stayed at 0 forever and
+  mutations were never visible to subsequent reads. `sync_logs` now
+  short-circuits on `peers.is_empty()` and runs `maybe_commit` directly
+  before returning.
+- New `RaftNode::is_single_node()` accessor for tests / callers that
+  need the same predicate without exposing the private `peers` field.
+- `RaftNode::sync_logs` is now safe to call on a node with an empty
+  peer list (was a no-op before for commit advancement).
+- New unit tests for the client fast path (`src/client.rs::tests`):
+  `is_single_node_true_when_peers_empty`,
+  `is_single_node_false_when_peers_present`,
+  `linearizable_get_returns_value_on_single_node_without_timeout`,
+  `linearizable_get_returns_not_found_for_missing_key_on_single_node`,
+  `linearizable_get_rejects_non_leader_on_single_node`.
+- `client::dispatch_command` and `client::linearizable_get` are now
+  `pub` (was private) to support unit testing from the same crate
+  without an integration harness. No external API change.
+
 ## [0.1.0] - 2026-02-24
 
 ### Added

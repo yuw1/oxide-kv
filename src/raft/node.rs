@@ -97,6 +97,13 @@ impl RaftNode {
         }
     }
 
+    /// Returns true iff this node was started with no peers (single-node
+    /// standalone mode). Useful for fast-paths that would otherwise wait
+    /// forever for a quorum that can never form.
+    pub fn is_single_node(&self) -> bool {
+        self.peers.is_empty()
+    }
+
     /// Helper to get the last log's index and term
     fn get_last_log_info(&self) -> (u64, u64) {
         self.log.last().map_or((0, 0), |entry| (entry.index as u64, entry.term))
@@ -204,6 +211,19 @@ impl RaftNode {
             let n = raft_node.read().unwrap();
             (n.current_term, n.node_id.clone(), n.commit_index, n.peers.clone(), n.log.len() as u64)
         };
+
+        // Single-node fast path: with no peers, there is no AppendEntries RPC
+        // to send, and `maybe_commit` lives inside the per-peer success
+        // handler. Without this branch a single-node leader would never
+        // advance its `commit_index` after a proposal, so reads would never
+        // see the latest writes.
+        if peers.is_empty() {
+            let mut n = raft_node.write().unwrap();
+            if n.state == NodeState::Leader {
+                n.maybe_commit();
+            }
+            return;
+        }
 
         for peer_addr in peers {
             let raft_clone = raft_node.clone();
