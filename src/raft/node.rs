@@ -341,7 +341,10 @@ impl RaftNode {
                 Command::Set { key, value } => { let _ = state_machine.set(&*key.clone(), &*value.clone()); }
                 Command::Delete { key } => { let _ = state_machine.delete(&key); }
                 Command::BeginTx { tx_id, ops } => { let _ = state_machine.begin_tx(tx_id.clone(), ops.clone()); }
-                Command::Vote { tx_id, voter, vote } => { let _ = state_machine.record_vote(tx_id, voter.clone(), vote.clone()); }
+                // As of P6, votes no longer travel through the Raft log:
+                // they arrive on the side-channel `VoteRequest` RPC (see
+                // `proto/coordination.proto`) and are recorded directly on
+                // the state machine via `record_vote`, bypassing the log.
                 Command::DecideTx { tx_id, decision } => { let _ = state_machine.decide_tx(tx_id, decision.clone()); }
                 _ => {}
             }
@@ -606,7 +609,7 @@ impl RaftNode {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::protocol::{Command, LogEntry, ReadIndex, Snapshot, TxDecision, TxOp, Vote};
+    use crate::protocol::{Command, LogEntry, ReadIndex, Snapshot, TxDecision, TxOp};
     use crate::raft::rpc::{AppendEntriesArgs, InstallSnapshotArgs, RequestVoteArgs};
     use crate::raft::storage::RaftStorage;
     use crate::state_machine::StateMachine;
@@ -1564,42 +1567,12 @@ mod tests {
         assert!(matches!(node.log[1].command, Command::DecideTx { .. }));
     }
 
-    #[test]
-    fn vote_recorded_for_pending_tx_then_commit_applies_ops() {
-        // End-to-end: BeginTx → Vote (Yes) → DecideTx(Commit), applied via
-        // apply_logs, ops are now visible.
-        let (_d, mut node) = make_node("n1", vec!["n2".into()]);
-        node.log = vec![
-            LogEntry {
-                term: 1,
-                index: 1,
-                command: Command::BeginTx {
-                    tx_id: "tx-vote".into(),
-                    ops: vec![TxOp::Put { key: "k".into(), value: "v".into() }],
-                },
-            },
-            LogEntry {
-                term: 1,
-                index: 2,
-                command: Command::Vote {
-                    tx_id: "tx-vote".into(),
-                    voter: "node-1".into(),
-                    vote: Vote::Yes,
-                },
-            },
-            LogEntry {
-                term: 1,
-                index: 3,
-                command: Command::DecideTx {
-                    tx_id: "tx-vote".into(),
-                    decision: TxDecision::Commit,
-                },
-            },
-        ];
-        node.commit_index = 3;
-        node.replay_logs();
-
-        assert_node_state(&node, "k", Some("v"));
-        assert_eq!(node.last_applied, 3);
-    }
+    // `vote_recorded_for_pending_tx_then_commit_applies_ops` was removed
+    // in P6 (commit e329fe6 superseded): votes no longer travel through
+    // the Raft log — they arrive on the side-channel `VoteRequest` RPC
+    // (see `proto/coordination.proto`) and are recorded directly on the
+    // state machine via `record_vote`. The BeginTx + DecideTx replay
+    // path is covered by `replay_logs_applies_committed_tx` above, and
+    // `record_vote` itself is covered by
+    // `state_machine::tests::record_vote_updates_pending_tx_view`.
 }

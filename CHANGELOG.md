@@ -218,6 +218,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pub` (was private) to support unit testing from the same crate
   without an integration harness. No external API change.
 
+### Added (P6 — 2PC coordinator wire schema, PR #11)
+- New proto file `proto/coordination.proto` (package `oxide_kv.coordination`)
+  defining the 2PC coordinator side-channel RPC:
+  - `VoteRequest { term, tx_id, last_log_index, last_log_term }` — leader →
+    peer "please vote on this tx".
+  - `VoteResponse { term, vote_granted, reason }` — peer → leader "here is my
+    vote", with a short diagnostic on rejection.
+- `build.rs` now compiles both `proto/raft.proto` and `proto/coordination.proto`.
+- New module `src/coordination.rs` with generated `pb` types, plain
+  domain types (`VoteRequest`, `VoteResponse`), and `From`/`Into`
+  conversions in both directions.
+- 9 new unit tests covering: typed round-trip ×2, length-delimited
+  wire-format round-trip ×2, boundary values (term=0 / empty tx_id,
+  `last_log_index = u64::MAX`, empty reason) ×3, and forward-compat
+  (reader ignores unknown field tag 99 with multi-byte varint encoding) ×2.
+
+### Changed / Breaking (P6 — PR #11)
+- **Removed `Command::Vote` variant.** With the P6 coordinator design
+  (side-channel RPC for votes, log carries only `BeginTx` + `DecideTx`),
+  the log-side `Vote` entry has no purpose and is deleted from
+  `protocol.rs`. The in-memory `Vote` enum (`Yes` / `No(reason)`) is
+  retained as the internal representation inside
+  `StateMachine::pending_txs`.
+- **Removed `pb::TxVote` message and `Command::Body::TxVote = 6` body
+  variant** from `proto/raft.proto`. Tag 6 inside the `Command.oneof`
+  is left empty (proto3 does not allow `reserved` inside a `oneof`,
+  so we rely on omission). The inverse conversion in
+  `src/raft/proto.rs` silently treats a stale `TxVote` body as
+  `Command::Compact` for forward-compat with any in-flight peer
+  running the pre-P6 build.
+- **Removed `raft::node::replay_logs` arm for `Command::Vote`** and
+  the `vote_recorded_for_pending_tx_then_commit_applies_ops` test
+  (the BeginTx + DecideTx replay path is still covered by
+  `replay_logs_applies_committed_tx`).
+- **Removed `client::dispatch_command` arm for `Command::Vote`.**
+  External clients can no longer inject raw `Vote` JSON commands;
+  vote flow is now internal-only via the new RPC.
+
+### Test suite (124 tests, all passing)
+- 9 new in `coordination::tests`; 1 removed in `raft::node::tests`
+  (replaced by `replay_logs_applies_committed_tx` +
+  `state_machine::tests::record_vote_updates_pending_tx_view`). Net
+  +8 tests vs. PR #10 baseline (116 → 124).
+
 ## [0.1.0] - 2026-02-24
 
 ### Added

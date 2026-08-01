@@ -70,10 +70,14 @@ impl ClientHandler {
             Command::BeginTx { tx_id, ops } => {
                 Self::begin_tx(tx_id, ops, node_arc).await
             }
-            Command::Vote { .. } | Command::DecideTx { .. } => {
-                // Manual 2PC control commands — useful for tests and for a
-                // future coordinator that wants to drive the lifecycle
-                // explicitly. Treat as mutations so they go through Raft.
+            Command::DecideTx { .. } => {
+                // Manual 2PC control command for tests / admin: lets a test
+                // force a Commit/Abort without driving the full coordinator
+                // RPC. Treat as a mutation so it goes through Raft.
+                //
+                // As of P6, raw `Vote` entries no longer exist in the log
+                // (votes flow on the side-channel RPC), so the previous
+                // `Command::Vote` arm was removed alongside this one.
                 Self::apply_mutation(command, node_arc).await
             }
             Command::Compact => {
@@ -181,8 +185,11 @@ impl ClientHandler {
     ///
     /// On a single-node cluster the leader is the sole participant, so we
     /// auto-append the matching `DecideTx(Commit)` right after `BeginTx`.
-    /// On a multi-node cluster the coordinator would instead solicit votes
-    /// via `Vote` entries and only then append `DecideTx`.
+    /// On a multi-node cluster the coordinator (the leader) will instead
+    /// solicit votes via the side-channel `VoteRequest` RPC (see
+    /// `proto/coordination.proto`) and only then append `DecideTx`. The
+    /// auto-pair below is the single-node fast path; the multi-node path
+    /// lands in PR #13 (see `ROADMAP.md`).
     async fn begin_tx(
         tx_id: String,
         ops: Vec<crate::protocol::TxOp>,

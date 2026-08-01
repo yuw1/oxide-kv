@@ -28,7 +28,12 @@ message Command {
     Delete delete = 3;
     Empty compact = 4;
     BeginTx begin_tx = 5;
-    TxVote tx_vote = 6;
+    // Tag 6 (was `TxVote`) intentionally unused: in P6 the 2PC
+    // coordinator votes travel on the side-channel RPC defined in
+    // `proto/coordination.proto` rather than through the Raft log.
+    // The tag is left open rather than `reserved` because `reserved`
+    // cannot be declared inside a `oneof`; instead we simply omit the
+    // variant and rely on the absence to discourage reuse.
     DecideTx decide_tx = 7;
   }
 }
@@ -62,14 +67,9 @@ message BeginTx {
   repeated TxOp ops = 2;
 }
 
-message TxVote {
-  string tx_id = 1;
-  string voter = 2;
-  // No reason field: a "No" vote carries an opaque string, kept short
-  // for log readability. Empty string == vote with no reason.
-  string no_reason = 3;
-  bool yes = 4;
-}
+// `TxVote` was removed in P6 (see `proto/coordination.proto`).
+// Votes now travel on the side-channel RPC rather than through the
+// Raft log. The Command body tag 6 is reserved above to prevent reuse.
 
 message DecideTx {
   string tx_id = 1;
