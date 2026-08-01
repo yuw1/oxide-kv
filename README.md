@@ -256,44 +256,37 @@ proto/
 
 ## Roadmap
 
-### Landed (see [CHANGELOG.md](./CHANGELOG.md) for per-PR detail)
+The active roadmap lives in [ROADMAP.md](./ROADMAP.md). That file is
+the single source of truth for phase status, in-progress work, and
+acceptance criteria. The current phase is **P6 — Multi-node 2PC
+coordinator RPC**.
 
-| Capability | Reference | PR |
-|---|---|---|
-| Apache-2.0 license, CHANGELOG, zero warnings, 43 unit tests | §0.1.0 cleanup | [#1](https://github.com/yuw1/oxide-kv/pull/1) |
-| Snapshot-based log compaction + InstallSnapshot RPC | Raft §7 | [#2](https://github.com/yuw1/oxide-kv/pull/2) |
-| Linearizable reads via ReadIndex | Raft §6.4 | [#3](https://github.com/yuw1/oxide-kv/pull/3) |
-| Protobuf binary RPC (length-prefixed framing) | wire format | [#4](https://github.com/yuw1/oxide-kv/pull/4) |
-| LSM-Tree state machine (memtable + WAL + SSTables) | storage | [#5](https://github.com/yuw1/oxide-kv/pull/5) |
-| Two-phase commit lifecycle (BeginTx / Vote / DecideTx) | transactions | [#6](https://github.com/yuw1/oxide-kv/pull/6) |
+### Phase summary
 
-### Candidate future directions (not promised, not ordered)
+| Phase | Capability | Status | PR |
+|---|---|---|---|
+| P0 | LICENSE, CHANGELOG, unit tests, warning cleanup | ✅ | [#1](https://github.com/yuw1/oxide-kv/pull/1) |
+| P1 | Snapshot + InstallSnapshot RPC + log compaction | ✅ | [#2](https://github.com/yuw1/oxide-kv/pull/2) |
+| P2 | Linearizable reads via ReadIndex | ✅ | [#3](https://github.com/yuw1/oxide-kv/pull/3) |
+| P3 | Protobuf binary RPC | ✅ | [#4](https://github.com/yuw1/oxide-kv/pull/4) |
+| P4 | LSM-Tree state machine | ✅ | [#5](https://github.com/yuw1/oxide-kv/pull/5) |
+| P5 | 2PC lifecycle (BeginTx / Vote / DecideTx) | ✅ | [#6](https://github.com/yuw1/oxide-kv/pull/6) |
+| Bug | Election timer brain-split + heartbeat:election ratio | ✅ | [#8](https://github.com/yuw1/oxide-kv/pull/8) |
+| Bug | Single-node read fallback + commit advancement | ✅ | [#9](https://github.com/yuw1/oxide-kv/pull/9) |
+| **P6** | **Multi-node 2PC coordinator RPC** | **🔄 In progress** | [ROADMAP.md](./ROADMAP.md) |
 
-- **Multi-node 2PC coordinator** — RPC plumbing to gather `Vote`
-  entries from peers; the state machine and wire schema are already
-  in place, only the network handshake is missing.
-- **Sharded multi-Raft** — split the keyspace across independent
-  Raft groups for horizontal scale. Requires key→shard routing and
-  cross-shard 2PC.
-- **Joint consensus for membership change** — Raft §6. Replace
-  static `--peers` configuration with safe online add/remove.
-- **Tx timeout + admin-driven abort** — close the coordinator-crash
-  hole that currently leaves a pending tx in the log forever.
-- **Client SDKs** — Python and Go clients against the same JSON
-  client protocol.
-- **Benchmark suite** — throughput / latency under partition,
-  leader failover, snapshot catch-up. Track regressions in CI.
-- **LSM polish** — bloom filters (faster negative lookups), block
-  cache (warm reads), background compaction thread, leveled
-  compaction.
-- **gRPC transport** — replace raw TCP+protobuf with tonic once the
-  inter-node protocol stabilizes.
-- **TLS** for inter-node RPC and the client API.
-- **Per-read ack tracking** for full ReadIndex (current
-  implementation uses any recent successful peer reply as the
-  liveness proof — slightly weaker than the textbook algorithm).
-- **Metrics** — Prometheus export of election count, replication
-  lag, snapshot age, LSM flush/compact frequency.
+### Candidate future directions (see ROADMAP.md for full list)
+
+- Sharded multi-Raft
+- Joint consensus for membership change (Raft §6)
+- Tx timeout + admin-driven abort
+- Client SDKs (Python, Go)
+- Benchmark suite
+- LSM polish (bloom filters, block cache, background compaction, leveled)
+- gRPC transport
+- TLS for inter-node RPC and client API
+- Per-read ack tracking for full ReadIndex
+- Metrics export (Prometheus)
 
 ---
 
