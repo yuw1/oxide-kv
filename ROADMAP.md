@@ -1,0 +1,160 @@
+# Oxide-KV Roadmap
+
+> Living document for Oxide-KV's evolution. Past phases are summarized;
+> the active phase is at the bottom under "Current". Future directions
+> are candidate ideas, not commitments.
+
+This file is the single source of truth for roadmap status. The older
+"Roadmap" section in `README.md` is intentionally reduced to a
+backward-link; if something here disagrees with the README, this file
+wins.
+
+---
+
+## Phase status
+
+| Phase | Capability | Status | PR | Notes |
+|---|---|---|---|---|
+| P0 | LICENSE, CHANGELOG, unit tests, warning cleanup | ✅ Merged | [#1](https://github.com/yuw1/oxide-kv/pull/1) | Baseline |
+| P1 | Snapshot + InstallSnapshot RPC + log compaction | ✅ Merged | [#2](https://github.com/yuw1/oxide-kv/pull/2) | Raft §7 |
+| P2 | Linearizable reads via ReadIndex | ✅ Merged | [#3](https://github.com/yuw1/oxide-kv/pull/3) | Raft §6.4 |
+| P3 | Protobuf binary RPC (length-prefixed framing) | ✅ Merged | [#4](https://github.com/yuw1/oxide-kv/pull/4) | Wire format cutover |
+| P4 | LSM-Tree state machine (memtable + WAL + SSTables) | ✅ Merged | [#5](https://github.com/yuw1/oxide-kv/pull/5) | Storage rewrite |
+| P5 | Two-phase commit lifecycle (BeginTx / Vote / DecideTx) | ✅ Merged | [#6](https://github.com/yuw1/oxide-kv/pull/6) | State machine + wire schema; single-node fast path |
+| Bug | Election timer brain-split + heartbeat:election ratio | ✅ Merged | [#8](https://github.com/yuw1/oxide-kv/pull/8) | Timer/logic fix |
+| Bug | Single-node read fallback + commit advancement | ✅ Merged | [#9](https://github.com/yuw1/oxide-kv/pull/9) | Read fast path + sync_logs |
+| **P6** | **Multi-node 2PC coordinator RPC** | **🔄 In progress** | [#11](https://github.com/yuw1/oxide-kv/pull/11)+ | **Active** |
+
+---
+
+## P6 — Multi-node 2PC coordinator RPC
+
+### Problem statement
+
+After P5, the 2PC state machine and wire schema are fully in place.
+BeginTx and DecideTx are accepted `Command` variants, the state machine
+handles pending transactions in `pending_txs`, and the protobuf wire
+schema carries both.
+
+What is **not** in place is the **coordinator orchestration** on the
+leader. Today:
+
+- **Single-node cluster**: the client `BeginTx` auto-pairs with a
+  `DecideTx(Commit)` in the same proposal. Atomic with one round-trip.
+- **Multi-node cluster**: there is no automatic vote collection, no
+  quorum check, no abort path.
+
+The README and CHANGELOG both note "RPC plumbing deferred" — this
+phase closes that gap.
+
+### Locked architecture decisions (Calvin confirmed 2026-08-02)
+
+| Decision | Choice | Rationale |
+|---|---|---|
+| Coordinator role | **Leader of the Raft cluster also acts as the 2PC coordinator.** | Reuses Raft's leader election for coordinator liveness; one fewer set of election timers to reason about. BeginTx/DecideTx go through the Raft log as today. |
+| Quorum policy | **All-yes required.** Any peer returning No, timing out, or being unreachable aborts the tx. | Textbook 2PC. Majority quorum is intentionally **not** used here — a single slow peer would force Abort under majority, but All-Yes gives the cleanest semantics for the operator and matches classic 2PC intuition. |
+| Vote transport | **Side-channel RPC**, separate from the Raft log. Log carries only `BeginTx` + `DecideTx`. | Vote collection is a coordinator concern, not a consensus concern. Putting it in the log inflates log size per tx and confuses log readers. |
+| Wire schema for votes | New file `proto/coordination.proto` with `VoteRequest` / `VoteResponse` messages. **Physically isolated** from `proto/raft.proto`. | Two concerns, two files. The two schemas evolve independently and can be reviewed separately. |
+| Old `Command::Vote` variant | **Removed** (breaking). The `Vote` enum survives only as the in-memory representation inside `StateMachine::pending_txs`. | With votes out of the log, the log-side variant has no purpose. State machine still tracks Yes/No per peer internally. |
+| Failure recovery (priority A vs B) | **A first, B as TODO.** Coordinator-only recovery for now (new leader re-runs BeginTx + vote collection). Per-participant timeout-driven autonomous abort deferred. | Smallest correct thing; B has subtle correctness implications (coordinator / participant disagreement on outcome). |
+
+### Goal
+
+A client on a multi-node cluster can issue **one** BeginTx to the
+leader. The leader automatically:
+
+1. Replicates `BeginTx` through the Raft log so every node has the
+   pending tx in `pending_txs`.
+2. Asks every peer "is this tx safe to commit?" via a side-channel
+   `VoteRequest` RPC.
+3. Collects the votes. **All peers must vote Yes**, otherwise the tx
+   aborts.
+4. Proposes `DecideTx(Commit)` or `DecideTx(Abort)` as a second log
+   entry based on the vote outcome.
+
+The client sees one round-trip in (BeginTx) and one notification out
+(decision). The intermediate coordination is invisible.
+
+### Non-goals (deferred to P7+)
+
+- Cross-shard / multi-Raft 2PC.
+- Tx timeout + admin-driven abort (currently the state machine has no
+  timeout — a coordinator crash leaves a pending tx in the log).
+- Participant-side autonomous abort (priority B above): a follower
+  that times out the coordinator would unilaterally abort. Deferred
+  to a later phase; current policy is "wait forever, recovery is
+  coordinator-only".
+- Optimistic concurrency control / 2PL inside a tx. Current semantics
+  are "last writer wins on commit"; we keep that.
+- A Python / Go client SDK.
+- Benchmark suite for partition / failover / 2PC throughput.
+
+### Acceptance criteria
+
+P6 ships when **all** of these hold on `master`:
+
+1. **Three-node cluster runs a 2PC transaction end-to-end**
+   - Start 3 nodes, wait for a stable leader.
+   - Send one `BeginTx{tx_id:"t1", ops:[Put("a","1"), Put("b","2")]}` to the leader.
+   - Within ~250ms the leader responds with `{"status":"ok","tx_id":"t1","decision":"Commit"}` (or `Abort` with reason).
+   - `Get("a")` and `Get("b")` on any node return the new values.
+
+2. **Failure paths covered**
+   - At least one peer returns `No`: leader proposes `DecideTx(Abort)`; pending ops never become visible; subsequent `Get` returns the pre-tx value.
+   - At least one peer times out / is unreachable: leader aborts (failure-as-No); no partial commit.
+   - Concurrent transactions on disjoint keys: both commit; reads stay isolated until commit (existing isolation property holds).
+
+3. **Network resilience**
+   - Peer briefly disconnects mid-vote: leader times out the missing peer, aborts the tx; no leader step-down.
+   - Leader steps down mid-coordination: the partially-applied `BeginTx` log entry stays in the log but no `DecideTx` ever commits (state machine rejects `Commit` for stale leader log entries, or the new leader takes over and a future admin/abort completes).
+
+4. **Tests**
+   - Unit tests cover the coordinator state machine: vote collection, quorum decision, timeout → abort, all-yes → commit, any-no → abort.
+   - Integration test spins up 3 in-process nodes on a tempdir, drives a full happy-path 2PC.
+   - Integration test for the abort path: kill a peer's vote response.
+   - Existing 110+ tests still pass; P6 adds ~25.
+
+5. **No regressions**
+   - Single-node fast path (`BeginTx + DecideTx(Commit)` in one proposal) still works.
+   - Manual `DecideTx` JSON command still works for tests / admin (the `Command::Vote` arm is gone, but the rest of `Command` is unchanged).
+
+### PR plan (locked — Option A side-RPC)
+
+| PR | Title | Scope | Tests added |
+|---|---|---|---|
+| #10 | `docs: add ROADMAP.md and pin P6 as multi-node 2PC coordinator RPC` | New `ROADMAP.md`; README points at it. | Docs only. |
+| **#11** | `feat(coordination): Protobuf schema for 2PC coordinator RPC, remove old Command::Vote` | New `proto/coordination.proto` with `VoteRequest` / `VoteResponse`. New `src/coordination.rs` with domain types, `From` conversions, and wire round-trip tests (typed round-trip, length-delimited wire round-trip, boundary values, forward-compat with unknown tag 99). `build.rs` updated to compile the new proto. `Command::Vote` variant removed from `protocol.rs`; `Vote` enum retained only as the in-memory state-machine representation. `Command::Body::TxVote` removed from `raft.proto`; tag 6 left empty (cannot be `reserved` inside `oneof`). PR #11 sub-tasks: <br> 1. `proto/coordination.proto` with `VoteRequest { term, tx_id, last_log_index, last_log_term }` and `VoteResponse { term, vote_granted, reason }`.<br> 2. `build.rs` compiles both `proto/raft.proto` and `proto/coordination.proto`.<br> 3. `src/coordination.rs` with domain types + `From` conversions + 9 unit tests (typed round-trip ×2, wire round-trip ×2, boundary ×3, forward-compat ×2).<br> 4. `Command::Vote` removed from `protocol.rs`; `Vote` enum stays for `pending_txs`.<br> 5. `Command::Body::TxVote` removed from `raft.proto`; reverse conversion in `src/raft/proto.rs` silently treats stale `TxVote` body as Compact.<br> 6. ROADMAP.md updated: locked decisions table + PR #11 sub-tasks. | `coordination`: 9 unit tests (see src/coordination.rs). `raft/proto`: regression coverage on the inverse conversion. State-machine tests unchanged. |
+| #12 | `feat(raft): RequestTxVote RPC handler + RpcClient wrapper` | Server-side dispatch in `RpcServer::handle_rpc_logic` → `RaftNode::handle_tx_vote_request`. Client-side `RpcClient::send_request_tx_vote`. Transport: TBD (separate port vs. multiplexed socket on existing Raft port). | `raft::rpc`: end-to-end framed round-trip with the new RPC type. `raft::node`: tests for `handle_tx_vote_request` (Yes when tx is pending and ops are safe; No when tx is not pending or conflict). |
+| #13 | `feat(coordinator): leader-side BeginTx coordinator with vote collection` | New `Coordinator` struct (or methods on `RaftNode`) holding in-flight tx state: `InflightTx { tx_id, ops, voters: BTreeMap<peer, Vote>, deadline }`. `begin_tx_coordinate(tx_id, ops)` on leader: replicate BeginTx, fan out RequestTxVote with timeout, decide Commit/Abort, propose DecideTx. Apply All-Yes quorum. | `coordinator`: vote collection logic, all-yes quorum decision, timeout → abort, leader-step-down → recovery. `client::begin_tx` routes to coordinator on multi-node clusters. |
+| #14 | `test(2pc): 3-node in-process integration test for happy path + abort path` | Spin up 3 nodes on a tempdir, drive `BeginTx`, assert Commit + visible reads. Inject peer No-vote, assert Abort + isolation holds. Inject peer timeout, assert Abort. | `tests/integration_2pc.rs` (new integration test file). |
+
+PR #10 is the docs PR that introduced this roadmap.
+
+Estimated test growth: +20-25 tests across PRs #11-#14. Total target after P6: ~135-140.
+
+### Out of scope for these PRs
+
+- Client SDK in Python/Go.
+- Tx timeout for crash recovery (separate concern: how does the state machine decide "tx t1 has been pending too long, abort it?" — needs an admin RPC or a background sweeper).
+- Cross-Raft-group transactions.
+- Read-your-writes within a tx before commit (not a stated goal; can be layered later).
+- Participant-side autonomous abort (priority B from the decision table). Will be a separate phase if/when priority A turns out to leave real recovery holes.
+
+---
+
+## Future directions (not promised, not ordered)
+
+The full list lives in the README "Candidate future directions" section.
+When one of these becomes an active phase, it gets its own section here.
+
+- Sharded multi-Raft
+- Joint consensus for membership change
+- Tx timeout + admin-driven abort (close the coordinator-crash hole)
+- Participant-side autonomous abort (2PC priority B)
+- Client SDKs (Python, Go)
+- Benchmark suite
+- LSM polish (bloom filters, block cache, background compaction, leveled compaction)
+- gRPC transport (replace raw TCP + protobuf)
+- TLS for inter-node RPC and the client API
+- Per-read ack tracking for full ReadIndex
+- Metrics export (Prometheus)

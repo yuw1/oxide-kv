@@ -8,7 +8,7 @@
 
 use crate::protocol::{
     Command as DomainCommand, LogEntry as DomainLogEntry, Snapshot as DomainSnapshot,
-    TxDecision as DomainTxDecision, TxOp as DomainTxOp, Vote as DomainTxVote,
+    TxDecision as DomainTxDecision, TxOp as DomainTxOp,
 };
 use crate::raft::rpc::{
     AppendEntriesArgs as DomainAppendArgs, AppendReplyArgs as DomainAppendReply,
@@ -45,18 +45,9 @@ impl From<&DomainCommand> for pb::Command {
                     ops: ops.iter().map(|o| o.into()).collect(),
                 })
             }
-            DomainCommand::Vote { tx_id, voter, vote } => {
-                let (yes, no_reason) = match vote {
-                    DomainTxVote::Yes => (true, String::new()),
-                    DomainTxVote::No(reason) => (false, reason.clone()),
-                };
-                pb::command::Body::TxVote(pb::TxVote {
-                    tx_id: tx_id.clone(),
-                    voter: voter.clone(),
-                    yes,
-                    no_reason,
-                })
-            }
+            // `Command::Vote` was removed in P6 (see `proto/coordination.proto`).
+            // Votes now travel on the side-channel RPC; the Raft log carries
+            // only `BeginTx` and `DecideTx`.
             DomainCommand::DecideTx { tx_id, decision } => {
                 pb::command::Body::DecideTx(pb::DecideTx {
                     tx_id: tx_id.clone(),
@@ -215,14 +206,10 @@ impl From<pb::Command> for DomainCommand {
                 tx_id: b.tx_id,
                 ops: b.ops.into_iter().map(|o| o.into()).collect(),
             },
-            Some(pb::command::Body::TxVote(v)) => {
-                let vote = if v.yes {
-                    DomainTxVote::Yes
-                } else {
-                    DomainTxVote::No(v.no_reason)
-                };
-                DomainCommand::Vote { tx_id: v.tx_id, voter: v.voter, vote }
-            }
+            // `pb::command::Body::TxVote` was removed in P6 alongside
+            // `Command::Vote` (see `proto/coordination.proto`). If a stale
+            // peer ever sends one, treat it as a no-op rather than panicking;
+            // the side-channel RPC is the only legal vote path going forward.
             Some(pb::command::Body::DecideTx(d)) => {
                 let decision = if d.commit {
                     DomainTxDecision::Commit

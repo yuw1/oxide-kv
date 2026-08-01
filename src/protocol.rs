@@ -9,8 +9,15 @@ pub enum Command {
     Delete { key: String },
     Compact,
     // ---- Two-phase commit lifecycle (Raft thesis §6.4, simplified) ----
+    //
+    // As of P6 (see `ROADMAP.md`), the coordinator is the leader and votes
+    // travel on a side-channel RPC (`proto/coordination.proto` ->
+    // `crate::coordination::VoteRequest`/`VoteResponse`), **not** through the
+    // Raft log. The log therefore carries only `BeginTx` and `DecideTx`;
+    // `Vote` is no longer a `Command` variant. The internal `Vote` enum
+    // below still models an individual peer's decision inside
+    // `StateMachine::pending_txs`, but it is populated out-of-band.
     BeginTx { tx_id: String, ops: Vec<TxOp> },
-    Vote { tx_id: String, voter: String, vote: Vote },
     DecideTx { tx_id: String, decision: TxDecision },
 }
 
@@ -20,6 +27,14 @@ pub enum TxOp {
     Delete { key: String },
 }
 
+/// One peer's decision on a pending tx. Used internally by
+/// `StateMachine` to track votes received via the side-channel RPC;
+/// never written to the Raft log.
+///
+/// `Vote` was previously also a `Command` variant and showed up in WAL /
+/// JSON client payloads. P6 removes the log-side variant but keeps the
+/// in-memory representation: the state machine still needs to count Yes
+/// vs No to drive `DecideTx`.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum Vote {
     Yes,
