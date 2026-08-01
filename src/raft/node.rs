@@ -1,5 +1,6 @@
 use crate::config::Config;
-use crate::protocol::{Command, LogEntry, ReadIndex, Snapshot};
+use crate::coordination::{VoteRequest, VoteResponse};
+use crate::protocol::{Command, LogEntry, ReadIndex, Snapshot, Vote};
 use crate::raft::rpc::{
     AppendEntriesArgs, AppendReplyArgs, InstallSnapshotArgs, InstallSnapshotReplyArgs,
     RequestVoteArgs, RpcClient, VoteResponseArgs,
@@ -155,6 +156,136 @@ impl RaftNode {
                 term: self.current_term,
                 vote_granted: false,
             }
+        }
+    }
+
+    /// Handle a 2PC coordinator `VoteRequest` from the leader.
+    ///
+    /// Returns a `VoteResponse` reporting whether the local node
+    /// agrees to commit the transaction. This is the receiver-side
+    /// half of the side-channel RPC introduced in P6 PR #12; the
+    /// sender-side half (`RpcClient::send_tx_vote_rpc`) and the
+    /// wire envelope (`raft::transport::DispatchKind::Vote`) live
+    /// elsewhere.
+    ///
+    /// Decision policy (all-yes required by 2PC, see
+    /// `ROADMAP.md` P6 decision table):
+    ///   1. **Stale term**: if the request carries a term older
+    ///      than our `current_term`, reject with the local term
+    ///      so the leader can step down.
+    ///   2. **Not the leader's term**: if the request carries a
+    ///      newer term, step down to Follower and adopt it.
+    ///      **Reject the vote** rather than grant it: a new
+    ///      term means the sender is not the established leader
+    ///      of the new term yet (no election has been observed
+    ///      by us). The legitimate leader of the new term will
+    ///      re-broadcast `VoteRequest` after winning the
+    ///      election. Granting under a new term would let a
+    ///      stale partition-leader prematurely commit state.
+    ///   3. **Tx not pending locally**: the `BeginTx` log entry
+    ///      must have been replicated to us before we can vote.
+    ///      If `tx_id` is not in `pending_txs` we say No ("tx
+    ///      not pending") so the coordinator aborts instead of
+    ///      racing a future commit decision.
+    ///   4. **Log up-to-date check (mirrors RequestVote)**:
+    ///      the leader's `last_log_index` / `last_log_term`
+    ///      must be at least as fresh as our local log tip. A
+    ///      stale leader would otherwise induce a phantom vote.
+    ///   5. **Safety ack**: record the vote on the state
+    ///      machine via `record_vote` so a future `DecideTx`
+    ///      can apply the operations atomically. Persist the
+    ///      intent on the local log by returning Yes.
+    pub fn handle_tx_vote_request(&mut self, req: &VoteRequest) -> VoteResponse {
+        // 1. Stale term: reject without state change.
+        if req.term < self.current_term {
+            return VoteResponse {
+                term: self.current_term,
+                vote_granted: false,
+                reason: format!(
+                    "stale term: request term {} < current term {}",
+                    req.term, self.current_term
+                ),
+            };
+        }
+
+        // 2. Newer term: adopt it, step down to Follower, but
+        //    **reject the vote**. The sender is not yet the
+        //    established leader of the new term from our point
+        //    of view (we have not granted any leader election
+        //    vote for it). Granting a tx vote under a term
+        //    change would let a partitioned old leader commit
+        //    state in the new term. The new leader will
+        //    re-broadcast under the correct term after winning
+        //    its election.
+        if req.term > self.current_term {
+            self.current_term = req.term;
+            self.state = NodeState::Follower;
+            self.vote_for = None;
+            if let Err(e) =
+                self.storage.save_meta(self.current_term, self.vote_for.clone())
+            {
+                eprintln!(
+                    "[Critical] Failed to save metadata after term update in tx_vote: {}",
+                    e
+                );
+            }
+            return VoteResponse {
+                term: self.current_term,
+                vote_granted: false,
+                reason: format!(
+                    "term advance: adopted term {} but deferring vote to elected leader",
+                    req.term
+                ),
+            };
+        }
+
+        // 3. Log up-to-date check (mirrors RequestVote's
+        //    election-restriction semantics). A leader whose log
+        //    has fallen behind ours cannot safely collect votes.
+        let (my_last_log_index, my_last_log_term) = self.get_last_log_info();
+        let leader_log_up_to_date = (req.last_log_term > my_last_log_term)
+            || (req.last_log_term == my_last_log_term
+                && req.last_log_index >= my_last_log_index);
+        if !leader_log_up_to_date {
+            return VoteResponse {
+                term: self.current_term,
+                vote_granted: false,
+                reason: format!(
+                    "leader log stale: leader=({}, {}) local=({}, {})",
+                    req.last_log_index, req.last_log_term,
+                    my_last_log_index, my_last_log_term
+                ),
+            };
+        }
+
+        // 4. Tx must be in our pending set. A vote is only
+        //    meaningful after the `BeginTx` log entry has been
+        //    replicated and applied to `pending_txs` (the state
+        //    machine replays the log on startup, so a freshly
+        //    restarted node can vote once it has caught up).
+        {
+            let sm = self.state_machine.read().unwrap();
+            if sm.pending_tx(&req.tx_id).is_none() {
+                return VoteResponse {
+                    term: self.current_term,
+                    vote_granted: false,
+                    reason: format!("tx not pending: {}", req.tx_id),
+                };
+            }
+        }
+
+        // 5. Grant the vote. Record it on the state machine so
+        //    a future `DecideTx(Commit)` will be able to apply
+        //    the operations.
+        {
+            let mut sm = self.state_machine.write().unwrap();
+            let _ = sm.record_vote(&req.tx_id, self.node_id.clone(), Vote::Yes);
+        }
+
+        VoteResponse {
+            term: self.current_term,
+            vote_granted: true,
+            reason: String::new(),
         }
     }
 
@@ -1575,4 +1706,138 @@ mod tests {
     // path is covered by `replay_logs_applies_committed_tx` above, and
     // `record_vote` itself is covered by
     // `state_machine::tests::record_vote_updates_pending_tx_view`.
+
+    // ============================================================
+    //  handle_tx_vote_request (P6 PR #12, side-channel 2PC vote)
+    // ============================================================
+
+    /// Seed `node` with a `BeginTx` log entry + state machine pending
+    /// entry so `handle_tx_vote_request` has something to vote on.
+    /// Returns the `(tx_id, last_log_index, last_log_term)` snapshot
+    /// the test should mirror in its `VoteRequest`.
+    fn seed_pending_tx(
+        node: &mut RaftNode,
+        tx_id: &str,
+        ops: Vec<TxOp>,
+    ) -> (String, u64, u64) {
+        // State machine side: register the pending tx directly. The
+        // real coordinator path does this via Raft log replication +
+        // apply; tests skip that machinery and call the state
+        // machine API directly to focus on the vote handler.
+        {
+            let mut sm = node.state_machine.write().unwrap();
+            sm.begin_tx(tx_id.to_string(), ops).unwrap();
+        }
+        // Log side: append a BeginTx entry so the test can ask
+        // for vote with `last_log_index/term` matching the local
+        // log tip. We use term 1 / index 1 to keep the setup
+        // simple; handle_tx_vote_request only requires the
+        // leader's claimed log to be >= local log.
+        let entry = LogEntry {
+            term: 1,
+            index: 1,
+            command: Command::BeginTx {
+                tx_id: tx_id.to_string(),
+                ops: vec![TxOp::Put {
+                    key: "k".into(),
+                    value: "v".into(),
+                }],
+            },
+        };
+        let _ = node.storage.append_wal_log(&entry);
+        node.log.push(entry);
+        (tx_id.to_string(), 1, 1)
+    }
+
+    fn vote_req(term: u64, tx_id: &str, last_idx: u64, last_term: u64) -> VoteRequest {
+        VoteRequest {
+            term,
+            tx_id: tx_id.to_string(),
+            last_log_index: last_idx,
+            last_log_term: last_term,
+        }
+    }
+
+    #[test]
+    fn tx_vote_rejects_stale_term() {
+        let (_d, mut node) = make_node("n1", vec!["n2".into()]);
+        node.current_term = 5;
+        let (tx_id, idx, term) = seed_pending_tx(&mut node, "t1", vec![]);
+
+        let resp = node.handle_tx_vote_request(&vote_req(4, &tx_id, idx, term));
+
+        assert!(!resp.vote_granted);
+        assert_eq!(resp.term, 5); // echoes local term
+        assert!(resp.reason.contains("stale term"));
+        // Local state unchanged: did not step down, did not record a vote.
+        assert_eq!(node.current_term, 5);
+        let sm = node.state_machine.read().unwrap();
+        assert_eq!(sm.pending_tx_count(), 1);
+    }
+
+    #[test]
+    fn tx_vote_adopts_newer_term_and_steps_down() {
+        let (_d, mut node) = make_node("n1", vec!["n2".into()]);
+        node.current_term = 1;
+        node.state = NodeState::Leader;
+        let (tx_id, idx, term) = seed_pending_tx(&mut node, "t1", vec![]);
+
+        let resp = node.handle_tx_vote_request(&vote_req(3, &tx_id, idx, term));
+
+        // Even with a matching pending tx, a *newer* term is
+        // rejected in this turn so the new leader can re-broadcast
+        // under the correct term.
+        assert!(!resp.vote_granted);
+        assert_eq!(resp.term, 3);
+        assert!(resp.reason.contains("term advance"));
+        // Stepped down to Follower and persisted the new term.
+        assert_eq!(node.state, NodeState::Follower);
+        assert_eq!(node.current_term, 3);
+        assert!(node.vote_for.is_none());
+    }
+
+    #[test]
+    fn tx_vote_rejects_when_tx_not_pending() {
+        let (_d, mut node) = make_node("n1", vec!["n2".into()]);
+        node.current_term = 2;
+        // No pending tx seeded.
+
+        let resp = node.handle_tx_vote_request(&vote_req(2, "missing", 0, 0));
+
+        assert!(!resp.vote_granted);
+        assert_eq!(resp.term, 2);
+        assert!(resp.reason.contains("tx not pending"));
+    }
+
+    #[test]
+    fn tx_vote_rejects_when_leader_log_is_stale() {
+        let (_d, mut node) = make_node("n1", vec!["n2".into()]);
+        node.current_term = 1;
+        let (tx_id, _idx, _term) = seed_pending_tx(&mut node, "t1", vec![]);
+        // Local log tip is (index=1, term=1). A leader claiming
+        // (index=0, term=0) is behind us.
+        let resp = node.handle_tx_vote_request(&vote_req(1, &tx_id, 0, 0));
+
+        assert!(!resp.vote_granted);
+        assert!(resp.reason.contains("leader log stale"));
+    }
+
+    #[test]
+    fn tx_vote_grants_and_records_yes_on_pending_tx() {
+        let (_d, mut node) = make_node("n1", vec!["n2".into()]);
+        node.current_term = 1;
+        let (tx_id, idx, term) = seed_pending_tx(&mut node, "t-yes", vec![]);
+
+        let resp = node.handle_tx_vote_request(&vote_req(1, &tx_id, idx, term));
+
+        assert!(resp.vote_granted, "expected Yes vote, got No: {}", resp.reason);
+        assert_eq!(resp.term, 1);
+        assert!(resp.reason.is_empty());
+
+        // The vote should be recorded on the state machine.
+        let sm = node.state_machine.read().unwrap();
+        let view = sm.pending_tx(&tx_id).expect("tx still pending");
+        assert_eq!(view.yes_votes, 1);
+        assert_eq!(view.no_votes, 0);
+    }
 }
