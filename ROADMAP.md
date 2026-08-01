@@ -47,7 +47,7 @@ leader. Today:
 The README and CHANGELOG both note "RPC plumbing deferred" — this
 phase closes that gap.
 
-### Locked architecture decisions (Calvin confirmed 2026-08-02)
+### Locked architecture decisions (2026-08-02)
 
 | Decision | Choice | Rationale |
 |---|---|---|
