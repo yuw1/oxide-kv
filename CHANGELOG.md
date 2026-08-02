@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (P7 foundation: SimClock)
+- `crate::raft::clock::SimClock` — a virtual clock that returns
+  `epoch + virtual_offset` from `now()`, so future
+  deterministic-simulation tests can drive the consensus hot path
+  under `tokio::time::pause()` + controlled advance without
+  burning real wall-clock seconds.
+- `SimClock::with_epoch(Instant)` lets multiple clocks share a
+  common epoch so their `now()` sequences are directly
+  comparable; `SimClock::new()` is the default (captures
+  `Instant::now()` at construction).
+- `SimClock::virtual_offset()` exposes the cumulative virtual
+  duration for test assertions.
+- Dev-dependency: `tokio = { ..., features = ["full", "test-util"] }`
+  so tests can use `#[tokio::test(start_paused = true)]`. Prod
+  build is unaffected.
+- 3 new unit tests:
+    - `sim_clock_is_deterministic_under_same_seed`: two clocks with
+      a shared epoch see identical `now()` for the same advance
+      schedule.
+    - `sim_clock_advance_moves_virtual_time_without_wall_clock`:
+      under `start_paused`, real wall clock doesn't move but the
+      virtual offset does.
+    - `sim_clock_supports_elapsed_style_deadline_checks`: stamp +
+      advance + `duration_since` works (mirrors how
+      `last_quorum_heartbeat_at` will be tested in DST).
+
 ### Added (P7 foundation: transport abstraction)
 - New `crate::raft::net::Transport` trait + `TcpTransport` real impl
   (message-level, not byte-level).
