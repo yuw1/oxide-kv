@@ -268,6 +268,22 @@ impl SimCluster {
         new_index
     }
 
+    /// Submit an arbitrary `Command` on the leader's state
+    /// machine via `RaftNode::propose`. Returns the index the
+    /// command was appended at.
+    ///
+    /// This is the general form of [`Self::submit_set`] used by
+    /// DST scenarios that need to issue `BeginTx` / `DecideTx` /
+    /// `Delete` / `Compact` (anything other than a plain `Set`).
+    pub fn submit_command(&self, leader_idx: usize, command: crate::protocol::Command) -> u64 {
+        let leader = &self.nodes[leader_idx];
+        let mut n = leader.raft.write().unwrap();
+        let new_index = n.log.len() as u64 + 1;
+        let ok = n.propose(command);
+        assert!(ok, "propose returned false (not Leader?)");
+        new_index
+    }
+
     /// Poll until every **non-killed** node has applied at least
     /// `target_index` on its state machine, or panic after
     /// `timeout`. Replication is driven by the heartbeat loop's

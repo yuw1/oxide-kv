@@ -162,6 +162,11 @@ async fn dst_split_brain_old_leader_truncates_divergent_log() {
     assert_eq!(cluster.read(2, "a"), Some("1".to_string()));
     assert_eq!(cluster.read(2, "c"), Some("3".to_string()));
 
+    // P7 safety invariants: every teardown runs the
+    // four-invariants check so any latent safety bug
+    // surfaces here, not in a future test.
+    oxide_kv::raft::invariants::assert_invariants(&cluster)
+        .expect("safety invariants violated at teardown");
     cluster.shutdown().await;
 }
 
@@ -291,6 +296,11 @@ async fn dst_divergent_log_higher_term_wins() {
     assert_eq!(n1_len, 2);
     assert_eq!(n2_len, 2);
 
+    // P7 safety invariants: every teardown runs the
+    // four-invariants check so any latent safety bug
+    // surfaces here, not in a future test.
+    oxide_kv::raft::invariants::assert_invariants(&cluster)
+        .expect("safety invariants violated at teardown");
     cluster.shutdown().await;
 }
 
@@ -400,6 +410,11 @@ async fn dst_stale_leader_steps_down_and_does_not_apply_uncommitted() {
         "n0 must not have applied uncommitted 'c'"
     );
 
+    // P7 safety invariants: every teardown runs the
+    // four-invariants check so any latent safety bug
+    // surfaces here, not in a future test.
+    oxide_kv::raft::invariants::assert_invariants(&cluster)
+        .expect("safety invariants violated at teardown");
     cluster.shutdown().await;
 }
 
@@ -463,6 +478,11 @@ async fn dst_minority_isolated_node_catches_up_on_heal() {
         assert_eq!(cluster.read(i, "c"), Some("3".to_string()));
     }
 
+    // P7 safety invariants: every teardown runs the
+    // four-invariants check so any latent safety bug
+    // surfaces here, not in a future test.
+    oxide_kv::raft::invariants::assert_invariants(&cluster)
+        .expect("safety invariants violated at teardown");
     cluster.shutdown().await;
 }
 
@@ -492,5 +512,10 @@ async fn dst_no_partition_baseline_converges() {
     assert_eq!(idx2, 2);
     assert_eq!(idx3, 3);
 
+    // P7 safety invariants: every teardown runs the
+    // four-invariants check so any latent safety bug
+    // surfaces here, not in a future test.
+    oxide_kv::raft::invariants::assert_invariants(&cluster)
+        .expect("safety invariants violated at teardown");
     cluster.shutdown().await;
 }
