@@ -51,7 +51,7 @@ pub enum TxDecision {
 pub struct LogEntry {
     pub(crate) term: u64,
     pub index: usize,
-    pub(crate) command: Command,
+    pub command: Command,
 }
 
 /// A serialized state-machine snapshot at a known log position.

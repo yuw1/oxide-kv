@@ -231,6 +231,14 @@ impl SimCluster {
     /// Return the index of the node currently in Leader state,
     /// or `None` if no node is leader (e.g. the cluster is in
     /// the middle of an election).
+    ///
+    /// Note: during a partition, the old leader may still be in
+    /// Leader state (it doesn't know it's been deposed until the
+    /// new leader's AppendEntries reaches it). If two nodes are
+    /// momentarily in Leader state, this returns the first one
+    /// by index. For tests that care about the "real" leader
+    /// after a partition, prefer polling `current_term(idx)`
+    /// and waiting for the old leader to step down.
     pub fn leader_index(&self) -> Option<usize> {
         self.nodes.iter().position(|n| {
             n.raft.read().unwrap().state == NodeState::Leader
