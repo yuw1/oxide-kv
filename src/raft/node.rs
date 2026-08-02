@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::coordination::{VoteRequest, VoteResponse};
 use crate::protocol::{Command, LogEntry, ReadIndex, Snapshot, Vote};
+use crate::raft::clock::{system_clock, Clock};
 use crate::raft::rpc::{
     AppendEntriesArgs, AppendReplyArgs, InstallSnapshotArgs, InstallSnapshotReplyArgs,
     RequestVoteArgs, RpcClient, VoteResponseArgs,
@@ -45,6 +46,12 @@ pub struct RaftNode {
     /// within which a linearizable read is safe.
     pub last_quorum_heartbeat_at: Option<Instant>,
 
+    /// Clock abstraction for production wall-clock vs future simulation
+    /// virtual time (P7). Production nodes get a fresh `SystemClock`
+    /// from `new` / `new_with_storage`; tests inject a custom impl
+    /// via `new_with_clock`. See `src/raft/clock.rs`.
+    pub(crate) clock: Arc<dyn Clock>,
+
     // --- Volatile state on leaders ---
     pub next_index: HashMap<String, u64>,
     pub match_index: HashMap<String, u64>,
@@ -73,12 +80,34 @@ impl RaftNode {
         state_machine: Arc<RwLock<StateMachine>>,
         storage: RaftStorage,
     ) -> Self {
+        // Production default: SystemClock. Tests / future sim harness
+        // use `new_with_clock` to inject a custom impl.
+        Self::new_with_clock(raft_addr, peers, state_machine, storage, system_clock())
+    }
+
+    /// Construct a `RaftNode` with an explicit `RaftStorage` instance
+    /// and a custom `Clock`. The clock is used for all `last_heartbeat`
+    /// / `last_quorum_heartbeat_at` / `ReadIndex::issued_at` stamps and
+    /// for the heartbeat-loop / election-timer sleeps (via the
+    /// respective helper functions). Production code should keep using
+    /// `new` / `new_with_storage`, which default to `SystemClock`.
+    ///
+    /// Added in P7 as part of the deterministic simulation testing
+    /// (DST) foundation. See `src/raft/clock.rs` for rationale.
+    pub fn new_with_clock(
+        raft_addr: String,
+        peers: Vec<String>,
+        state_machine: Arc<RwLock<StateMachine>>,
+        storage: RaftStorage,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
         // Load persistent state from disk
         let (term, vote, logs) = storage.load_initial_state();
 
         Self {
             storage,
             state_machine,
+            clock: clock.clone(),
 
             // Populate from restored data
             current_term: term,
@@ -91,7 +120,7 @@ impl RaftNode {
             peers,
             commit_index: 0,
             last_applied: 0,
-            last_heartbeat: Instant::now(),
+            last_heartbeat: clock.now(),
             last_quorum_heartbeat_at: None,
             next_index: HashMap::new(),
             match_index: HashMap::new(),
@@ -198,7 +227,7 @@ impl RaftNode {
         if can_vote && is_log_up_to_date {
             self.vote_for = Some(args.candidate_id.clone());
             let _ = self.storage.save_meta(self.current_term.clone(), self.vote_for.clone());
-            self.last_heartbeat = Instant::now();
+            self.last_heartbeat = self.clock.now();
 
             VoteResponseArgs {
                 term: self.current_term,
@@ -478,7 +507,7 @@ impl RaftNode {
                             n.next_index.insert(peer_addr_clone.clone(), last_idx + 1);
                             // Refresh the leader's ReadIndex lease: at least one peer
                             // has acknowledged our leadership recently.
-                            n.last_quorum_heartbeat_at = Some(Instant::now());
+                            n.last_quorum_heartbeat_at = Some(n.clock.now());
                             n.maybe_commit();
                         } else if reply.term > n.current_term {
                             n.current_term = reply.term;
@@ -575,9 +604,18 @@ impl RaftNode {
     }
 
     pub async fn run_heartbeat_loop(node_arc: Arc<RwLock<RaftNode>>) {
-        let mut interval = tokio::time::interval(Duration::from_millis(Config::heartbeat_interval_ms()));
+        // Pull the clock out of the node once, before entering the
+        // loop, so the per-tick hot path doesn't re-lock for it.
+        // The clock is `Arc<dyn Clock>`, so cloning is cheap and the
+        // same instance serves every tick. The sleep cadence matches
+        // the previous `tokio::time::interval` (auto-tick on first
+        // await + periodic thereafter); drift catch-up is best-effort
+        // — heartbeat is not a strict periodic obligation, and the
+        // previous impl also drifted under scheduler pressure.
+        let clock = node_arc.read().unwrap().clock.clone();
+        let period = Duration::from_millis(Config::heartbeat_interval_ms());
         loop {
-            interval.tick().await;
+            clock.sleep(period).await;
             let is_leader = node_arc.read().unwrap().state == NodeState::Leader;
             if is_leader {
                 Self::sync_logs(node_arc.clone());
@@ -591,7 +629,7 @@ impl RaftNode {
         node.state = NodeState::Candidate;
         node.vote_for = Some(node.node_id.clone());
         let _ =  node.storage.save_meta(node.current_term.clone(), node.vote_for.clone());
-        node.last_heartbeat = Instant::now();
+        node.last_heartbeat = node.clock.now();
 
         println!("🗳️ Node {} candidate for Term {}", node.node_id, node.current_term);
         drop(node);
@@ -642,7 +680,7 @@ impl RaftNode {
         self.state = NodeState::Leader;
         let next_idx = self.log.len() as u64 + 1;
         self.next_index = self.peers.iter().map(|p| (p.clone(), next_idx)).collect();
-        self.last_heartbeat = Instant::now();
+        self.last_heartbeat = self.clock.now();
     }
 
     pub fn handle_append_entries(&mut self, args: &AppendEntriesArgs) -> AppendReplyArgs {
@@ -656,7 +694,7 @@ impl RaftNode {
             let _ = self.storage.save_meta(self.current_term.clone(), self.vote_for.clone());
         }
         self.state = NodeState::Follower;
-        self.last_heartbeat = Instant::now();
+        self.last_heartbeat = self.clock.now();
 
         // Consistent check
         if args.prev_log_index > 0 {
@@ -708,7 +746,7 @@ impl RaftNode {
             let _ = self.storage.save_meta(self.current_term.clone(), self.vote_for.clone());
         }
         self.state = NodeState::Follower;
-        self.last_heartbeat = Instant::now();
+        self.last_heartbeat = self.clock.now();
 
         // 2. Persist snapshot to disk (atomic via storage layer).
         let _ = self.storage.save_snapshot(&args.snapshot);
@@ -793,7 +831,7 @@ impl RaftNode {
             }
             ReadIndex {
                 index: node.commit_index,
-                issued_at: Instant::now(),
+                issued_at: node.clock.now(),
             }
         };
         // Force a heartbeat round so the leader's last_quorum_heartbeat_at
