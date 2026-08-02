@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (P7 fault coverage: delay / reorder / duplicate / restart)
+- Real `Delay(d)` outcome in `SimTransport::send_raft` and
+  `send_vote`: the transport now `tokio::time::sleep`s for `d`
+  before pushing the message, instead of collapsing `Delay` to
+  `Deliver`. If the sender's `rpc_timeout` fires first, the
+  message still arrives at the receiver later — modelling the
+  classic "slow link" scenario in Raft testing. (Virtual-clock
+  alignment of the delay is deferred; today the delay is
+  wall-clock so a Delay > rpc_timeout matches the documented
+  semantics.)
+- New `RandomDelay<R>` scheduler: each outbound message is
+  delayed by `delay` with probability `p_delay`, otherwise
+  delivered immediately. `R` is a `FnMut() -> f64` so tests
+  can use a seeded RNG for deterministic replay.
+- New `ScheduleOutcome::Duplicate(Duration)` outcome: transport
+  pushes the message body once immediately, then again after
+  the configured spacing (on a separate spawned task so the
+  sender's RPC isn't held open). Models packet duplication on
+  a lossy link.
+- New `DuplicateAll { delay }` scheduler: every message gets
+  `ScheduleOutcome::Duplicate(delay)`. Useful for verifying
+  that idempotent RPC handlers handle duplicates correctly
+  (Raft consensus is by construction idempotent for
+  AppendEntries / RequestVote; this is the test surface for
+  asserting that).
+- `InboundMessageBody` now derives `Clone` (needed for the
+  duplicate-path spawn).
+- `SimCluster::restart_node(node_idx)` (&mut self): re-spawns
+  the killed node's serve + heartbeat loops with a fresh
+  `StopSignal`. The RaftNode itself is reused (in-memory state
+  preserved) — this is a deliberate simplification of "real
+  restart" which would discard and reload from disk; the DST
+  doesn't need to verify the reload path (covered by
+  `tests/integration_2pc.rs`). Re-registers a fresh inbound
+  channel via `Network::re_register` so the sender side has a
+  live receiver after the old one was dropped.
+- `Network::re_register(node_id)` replaces the (possibly dead)
+  inbound sender with a fresh one and returns the matching
+  receiver. Used by `restart_node`.
+- `SimTransport::replace_inbound(receiver)` swaps in a fresh
+  receiver. Panics if a receiver is still installed (i.e. the
+  previous serve loop is still running). Callers must
+  `stop.stop()` + sleep before calling.
+- 6 new unit tests: `random_delay_with_p1_always_delays`,
+  `random_delay_with_p0_always_delivers`,
+  `random_delay_p_clamps_to_unit_interval`,
+  `duplicate_all_returns_duplicate_outcome`,
+  `duplicate_all_default_spacing_is_50ms`,
+  `sim_harness_kill_then_restart_node_catches_up`.
+
 ### Added (P7 invariant checker)
 - `src/raft/invariants.rs` (≈480 lines): four safety invariant
   checks that DST scenarios call at teardown to catch any
