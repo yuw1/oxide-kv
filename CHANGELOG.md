@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (P7 foundation: SimTransport)
+- `crate::raft::sim_transport::SimTransport` + `Network` — an
+  in-memory `Transport` impl that routes `RaftMessage`s through
+  `tokio::sync::mpsc` channels keyed by node id, replacing the
+  real TCP path. Future DST (deterministic simulation testing)
+  harnesses will drive consensus against this without needing
+  real sockets.
+- `Network::new()` / `with_rpc_timeout()` — cluster topology
+  registry. `Network::register(node_id)` allocates an inbound
+  channel; `SimTransport::send_raft` / `send_vote` look up the
+  target's inbound channel via the shared `Network`.
+- `InboundMessageBody` enum with three variants
+  (`Raft(RaftMessage)`, `Vote(VoteRequest)`, `VoteReply(VoteResponse)`).
+  This separates the 2PC vote dispatch path from the Raft
+  consensus path so a vote request correctly reaches
+  `RaftNode::handle_tx_vote_request` (not
+  `handle_request_vote`, which has superficially similar fields
+  but different semantics — election restriction vs
+  pending_txs membership).
+- `pub(crate) fn dispatch_raft_message(...)` — extracted
+  request -> reply dispatch for the three Raft RPC handlers
+  (RequestVote / AppendEntries / InstallSnapshot). Sync (the
+  underlying RaftNode handlers are sync). The future fault
+  scheduler hook will wrap this with delay / drop / partition.
+- 8 new unit tests:
+    - 2 error-classification tests (unknown peer => Unreachable,
+      inbound reply variant => Protocol).
+    - 3 dispatch-routing tests (RequestVote / AppendEntries /
+      InstallSnapshot each dispatch to the correct handler and
+      return the correct reply variant).
+    - 2 end-to-end round-trip tests (RequestVote / AppendEntries
+      via `send_raft` + `serve`).
+    - 1 end-to-end vote test (VoteRequest via `send_vote` +
+      `serve` returns VoteResponse from `handle_tx_vote_request`).
+
 ### Added (P7 foundation: SimClock)
 - `crate::raft::clock::SimClock` — a virtual clock that returns
   `epoch + virtual_offset` from `now()`, so future
