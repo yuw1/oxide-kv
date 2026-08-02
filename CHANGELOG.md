@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (P7 DST scenarios: leader failover + partition heal)
+- `tests/raft_dst.rs` (5 new integration tests):
+  - `dst_leader_failover_preserves_committed_log` (§5.2 +
+    §5.4.1): leader crashes, surviving follower wins election,
+    committed log entries survive in the new leader's log.
+  - `dst_leader_failover_then_new_leader_accepts_writes`:
+    after failover the new leader accepts fresh writes and
+    replicates to the surviving followers.
+  - `dst_election_restriction_stale_candidate_loses` (§5.4.1):
+    a candidate whose log is stale (last_log_index < peer's)
+    cannot win an election.
+  - `dst_partition_isolates_leader_minority_wins_then_heal`
+    (§5.3): asymmetric partition isolates the old leader,
+    the minority partition elects a new leader, after heal
+    the old leader catches up via AppendEntries.
+  - `dst_leader_failover_repeated_5x_no_state_leak`: 5
+    consecutive failover cycles in one process; passes iff
+    every iteration ends with the same cluster invariants
+    (catches state leaks between iterations).
+- All 5 scenarios pass 20 consecutive runs with timing
+  variance < 1% (5.36-5.44s wall-clock) — the in-process
+  SimTransport + SimClock combination is deterministic in
+  practice, not just in theory.
+
+### Added (P7 SimHarness helpers used by the DST tests)
+- `SimCluster::kill_node(idx)`: stop one node's serve loop
+  and heartbeat loop, force its state to Follower (simulates
+  "node crashed and the cluster noticed").
+- `SimCluster::current_term(idx)`: read a node's
+  `current_term` for assertions about term advancement.
+- `SimCluster::try_drive_election(idx, timeout)`: like
+  `drive_election` but returns `bool` instead of panicking
+  when the candidate loses — needed for
+  "candidate _should_ lose" tests.
+- `SimCluster::wait_for_replication_except(target, &excluded,
+  timeout)`: like `wait_for_replication` but skips a list of
+  node indices — needed for "killed node never advances
+  last_applied" scenarios.
+- `SimCluster::wait_for_replication` is now a thin shim over
+  `wait_for_replication_except(target, &[], timeout)`.
+
 ### Added (P7 foundation: SimHarness)
 - `crate::raft::sim_harness` module (~480 lines, 6 tests):
   - `SimCluster` — a 3-node (or N-node) in-process cluster wired
