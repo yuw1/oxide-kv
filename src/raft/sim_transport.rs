@@ -41,6 +41,7 @@
 //! as `TcpTransport`).
 
 use crate::coordination::{VoteRequest, VoteResponse};
+use crate::raft::fault_scheduler::{FaultScheduler, LinkId, ScheduleOutcome};
 use crate::raft::node::RaftNode;
 use crate::raft::rpc::{RaftMessage, VoteResponseArgs};
 use std::collections::HashMap;
@@ -126,10 +127,16 @@ struct NetworkInner {
     /// counts as dropped; for now it's the upper bound on how long
     /// `send_raft` will wait for a reply.
     rpc_timeout: Duration,
+    /// The shared fault scheduler. Every outbound message
+    /// consults this before being pushed into the receiver's
+    /// inbound channel. Defaults to [`AlwaysDeliver`] for
+    /// zero-config tests.
+    scheduler: Arc<dyn FaultScheduler>,
 }
 
 impl Network {
-    /// Create a fresh empty network.
+    /// Create a fresh empty network with [`AlwaysDeliver`]
+    /// scheduling and a 2-second per-RPC timeout.
     pub fn new() -> Self {
         Self::with_rpc_timeout(Duration::from_secs(2))
     }
@@ -138,10 +145,29 @@ impl Network {
     /// driving virtual time can shrink this to milliseconds so a
     /// slow peer returns `TransportError::Timeout` quickly.
     pub fn with_rpc_timeout(rpc_timeout: Duration) -> Self {
+        use crate::raft::fault_scheduler::AlwaysDeliver;
         Self {
             inner: Arc::new(NetworkInner {
                 peers: Mutex::new(HashMap::new()),
                 rpc_timeout,
+                scheduler: Arc::new(AlwaysDeliver),
+            }),
+        }
+    }
+
+    /// Build a network with a custom fault scheduler. The
+    /// scheduler is shared by every `SimTransport` registered on
+    /// this network, so a single `partition(...)` call from the
+    /// harness affects every node's outbound path.
+    pub fn with_scheduler(
+        rpc_timeout: Duration,
+        scheduler: Arc<dyn FaultScheduler>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(NetworkInner {
+                peers: Mutex::new(HashMap::new()),
+                rpc_timeout,
+                scheduler,
             }),
         }
     }
@@ -164,6 +190,16 @@ impl Network {
     /// refused).
     fn lookup(&self, to: &str) -> Option<mpsc::Sender<InboundMessage>> {
         self.inner.peers.lock().unwrap().get(to).cloned()
+    }
+
+    /// Consult the shared fault scheduler on an outbound message.
+    /// Returns the outcome the caller should apply.
+    async fn consult_scheduler(
+        &self,
+        link: &LinkId,
+        body: &InboundMessageBody,
+    ) -> ScheduleOutcome {
+        self.inner.scheduler.before_send(link, body).await
     }
 
     /// The per-RPC timeout for this network.
@@ -280,7 +316,27 @@ impl Transport for SimTransport {
             let sender = network
                 .lookup(&to_owned)
                 .ok_or_else(|| TransportError::Unreachable(format!("peer {} not registered", to_owned)))?;
-            let push_fut = push_with_reply(&sender, self_id, InboundMessageBody::Raft(msg));
+            // Consult the fault scheduler on the link from
+            // `self_id` to `to_owned`. A `Drop` outcome makes
+            // the sender see a Timeout (no reply ever arrives);
+            // a `Delay` is treated as a delivery in this PR —
+            // proper Delay handling is the next PR's job.
+            let link = LinkId::new(self_id.clone(), to_owned.clone());
+            let body = InboundMessageBody::Raft(msg);
+            match network.consult_scheduler(&link, &body).await {
+                ScheduleOutcome::Drop => {
+                    // Sender waits the full rpc_timeout then
+                    // surfaces Timeout. We sleep here so the
+                    // semantics match the wall-clock case.
+                    tokio::time::sleep(rpc_timeout).await;
+                    return Err(TransportError::Timeout(rpc_timeout));
+                }
+                ScheduleOutcome::Delay(_) | ScheduleOutcome::Deliver => {
+                    // First cut: Delay collapses to Deliver.
+                    // See fault_scheduler.rs module docs.
+                }
+            }
+            let push_fut = push_with_reply(&sender, self_id, body);
             let body = match tokio::time::timeout(rpc_timeout, push_fut).await {
                 Ok(result) => result,
                 Err(_) => return Err(TransportError::Timeout(rpc_timeout)),
@@ -311,15 +367,16 @@ impl Transport for SimTransport {
             let sender = network
                 .lookup(&to_owned)
                 .ok_or_else(|| TransportError::Unreachable(format!("peer {} not registered", to_owned)))?;
-            // Use the dedicated Vote variant so the receiver's
-            // `serve` dispatches to `handle_tx_vote_request`
-            // (the 2PC coordinator path), not
-            // `handle_request_vote` (the Raft election path).
-            // These look superficially similar but have different
-            // semantics — a vote must come from a participant that
-            // has the tx in its `pending_txs` set, not just an
-            // up-to-date leader.
-            let push_fut = push_with_reply(&sender, self_id, InboundMessageBody::Vote(req));
+            let link = LinkId::new(self_id.clone(), to_owned.clone());
+            let body = InboundMessageBody::Vote(req);
+            match network.consult_scheduler(&link, &body).await {
+                ScheduleOutcome::Drop => {
+                    tokio::time::sleep(rpc_timeout).await;
+                    return Err(TransportError::Timeout(rpc_timeout));
+                }
+                ScheduleOutcome::Delay(_) | ScheduleOutcome::Deliver => {}
+            }
+            let push_fut = push_with_reply(&sender, self_id, body);
             let body = match tokio::time::timeout(rpc_timeout, push_fut).await {
                 Ok(result) => result,
                 Err(_) => return Err(TransportError::Timeout(rpc_timeout)),

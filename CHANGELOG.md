@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (P7 foundation: FaultScheduler)
+- `crate::raft::fault_scheduler` module (~530 lines, including
+  7 new tests):
+  - `FaultScheduler` trait (object-safe, `Send + Sync + 'static`)
+    with a `before_send(link, body) -> ScheduleOutcome` async
+    hook. Consulted by `SimTransport::send_raft` /
+    `send_vote` on every outbound message.
+  - `ScheduleOutcome::{Deliver, Drop, Delay(Duration)}` —
+    collapse-able to a single async future via
+    `Pin<Box<dyn Future + Send>>`. `Delay` is accepted by the
+    trait but the current `SimTransport` collapses it to
+    `Deliver` (proper delay handling is the next PR's job —
+    integrating it requires replacing `tokio::time::timeout`
+    on the sender side with `Clock::sleep`).
+  - `LinkId { from, to }` — a directed link identifier.
+    Symmetric failures (n1->n2 dropped, n2->n1 delivered) are
+    a first-class concept because real network partitions are
+    asymmetric.
+  - `AlwaysDeliver` — passthrough (zero-config default).
+  - `DropLink { from, to }` — drop a single directed link.
+  - `RandomDrop<R: FnMut() -> f64>` — drop a fraction of
+    messages per a seeded RNG closure. Deterministic given a
+    seeded RNG. The harness chooses the threshold by biasing
+    the RNG's output.
+  - `PartitionedNetwork` — a set of partitioned directed
+    links, mutable via `partition(...)` / `heal()`. The
+    classic "minority can't elect" Raft correctness test
+    pattern: `partition(n1->n2)` + `partition(n1->n3)` leaves
+    n1 isolated, so n1's election can't reach quorum.
+  - `DropUnless<F: Fn(&LinkId, &InboundMessageBody) -> bool>` —
+    drop messages matching a predicate. Useful for "drop all
+    heartbeats, deliver everything else".
+  - `Network::with_scheduler(rpc_timeout, scheduler)` — build
+    a network that consults a custom scheduler on every
+    outbound message. The default `Network::new()` /
+    `with_rpc_timeout` still use `AlwaysDeliver`.
+
+### Test count
+- 166 -> 173 passing (7 new fault_scheduler tests). Zero
+  regressions.
+- `cargo clippy --release -- -D warnings`: 25 errors before,
+  25 errors after. All in pre-existing master files. Zero new
+  lint debt.
+- 8 sim_transport tests (PR #20) and 3 clock tests (PR #19)
+  continue to pass unchanged.
+
+### Out of scope (next PR)
+- `ScheduleOutcome::Delay(d)` is currently collapsed to
+  `Deliver` by `SimTransport`. Proper delay handling requires
+  integrating `Clock::sleep` into the sender-side wait so the
+  delay runs on virtual time under `start_paused`. The public
+  surface (the trait, the enum variant) is already in place;
+  the next PR just plumbs the wait.
+
 ### Added (P7 foundation: SimTransport)
 - `crate::raft::sim_transport::SimTransport` + `Network` — an
   in-memory `Transport` impl that routes `RaftMessage`s through
