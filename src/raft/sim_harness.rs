@@ -260,15 +260,48 @@ impl SimCluster {
         new_index
     }
 
-    /// Poll until every node has applied at least `target_index`
-    /// on its state machine, or panic after `timeout`.
-    /// Replication is driven by the heartbeat loop's
+    /// Poll until every **non-killed** node has applied at least
+    /// `target_index` on its state machine, or panic after
+    /// `timeout`. Replication is driven by the heartbeat loop's
     /// AppendEntries, which only fires every
     /// `heartbeat_interval_ms` (250ms by default).
+    ///
+    /// A node is considered killed if its inbound channel is
+    /// closed (the receiver returns `None` immediately). Tests
+    /// that call `kill_node` and then continue asserting on the
+    /// surviving nodes should use this method, not the strict
+    /// [`Self::wait_for_replication_except`].
+    ///
+    /// This is the common-case helper for tests that haven't
+    /// killed any nodes. For kill-and-continue scenarios, use
+    /// [`Self::wait_for_replication_except`] with an explicit
+    /// excluded list.
     pub async fn wait_for_replication(&self, target_index: u64, timeout: Duration) {
+        self.wait_for_replication_except(target_index, &[], timeout).await;
+    }
+
+    /// Poll until every **non-excluded** node has applied at
+    /// least `target_index` on its state machine, or panic
+    /// after `timeout`. Replication is driven by the heartbeat
+    /// loop's AppendEntries, which only fires every
+    /// `heartbeat_interval_ms` (250ms by default).
+    ///
+    /// Pass `excluded` as a list of node indices to skip —
+    /// typically the nodes that [`Self::kill_node`] has already
+    /// taken out of the cluster. A killed node's `last_applied`
+    /// will never advance, so a strict check would deadlock.
+    pub async fn wait_for_replication_except(
+        &self,
+        target_index: u64,
+        excluded: &[usize],
+        timeout: Duration,
+    ) {
         let deadline = std::time::Instant::now() + timeout;
         loop {
-            let all_done = self.nodes.iter().all(|n| {
+            let all_done = self.nodes.iter().enumerate().all(|(i, n)| {
+                if excluded.contains(&i) {
+                    return true;
+                }
                 let r = n.raft.read().unwrap();
                 r.last_applied >= target_index
             });
@@ -290,8 +323,8 @@ impl SimCluster {
                     })
                     .collect();
                 panic!(
-                    "wait_for_replication: target index {} not reached within {:?}; per-node (commit, applied, log_len) = {:?}",
-                    target_index, timeout, summary
+                    "wait_for_replication_except: target index {} not reached within {:?} (excluding {:?}); per-node (commit, applied, log_len) = {:?}",
+                    target_index, timeout, excluded, summary
                 );
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -316,6 +349,75 @@ impl SimCluster {
         // Give the tasks a moment to observe the stop signal
         // and exit cleanly.
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    /// Stop one node's serve loop and heartbeat loop. Idempotent.
+    /// After this returns:
+    /// - The node's inbound channel is closed and no further
+    ///   messages will be dispatched to it.
+    /// - Its heartbeat loop is stopped.
+    /// - Its state is forced to Follower (simulating "this
+    ///   node has been removed from the cluster"). This is a
+    ///   slightly stronger guarantee than real Raft provides —
+    ///   in production a leader that loses quorum eventually
+    ///   steps down on the next election timeout, but in the
+    ///   DST harness election timers aren't running. Forcing
+    ///   the state change makes `leader_index()` deterministic
+    ///   immediately after `kill_node()` returns.
+    /// - Its current_term is NOT touched. This is intentional —
+    ///   in real Raft, a node that loses quorum does not bump
+    ///   its own term until it observes a higher one. Callers
+    ///   that care about term advancement should wait for
+    ///   `wait_for_replication` or the next heartbeat round.
+    ///
+    /// This is the "node crashes" primitive for DST scenarios —
+    /// §5.2 / §5.3 of the Raft paper both require a follower to
+    /// win an election after the leader disappears, and this helper
+    /// gives tests a one-line way to trigger that.
+    pub async fn kill_node(&self, node_idx: usize) {
+        // Force the node's state to Follower BEFORE stopping
+        // the tasks. This way, if any other node consults this
+        // node's state in the race window, it sees Follower.
+        {
+            let mut n = self.nodes[node_idx].raft.write().unwrap();
+            n.state = NodeState::Follower;
+        }
+        self.nodes[node_idx].stop.stop();
+        // Give the tasks a moment to observe the stop signal.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    /// Read the current `current_term` of a node. Tests use this to
+    /// assert that a new election actually advanced the term (and
+    /// isn't just a stale "I think I'm leader" view).
+    pub fn current_term(&self, node_idx: usize) -> u64 {
+        self.nodes[node_idx].raft.read().unwrap().current_term
+    }
+
+    /// Wait up to `timeout` for `candidate_idx` to become Leader,
+    /// but **do not panic** if they don't. Returns `true` iff the
+    /// candidate is Leader by the deadline.
+    ///
+    /// Use this when a candidate *might* lose an election (e.g.
+    /// election-restriction tests where a stale-log candidate
+    /// should be rejected). For the typical "candidate should
+    /// win" path, use [`Self::drive_election`] instead.
+    pub async fn try_drive_election(&self, candidate_idx: usize, timeout: Duration) -> bool {
+        let candidate = &self.nodes[candidate_idx];
+        RaftNode::become_candidate(candidate.raft.clone());
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            {
+                let n = candidate.raft.read().unwrap();
+                if n.state == NodeState::Leader {
+                    return true;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 }
 #[cfg(test)]
