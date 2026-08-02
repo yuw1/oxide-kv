@@ -1,16 +1,27 @@
-# Oxide-KV
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+    <img src="assets/logo-light.svg" alt="Oxide-KV logo" width="200">
+  </picture>
+</p>
 
-A distributed key-value store in Rust implementing the **Raft Consensus
-Algorithm**, with a Log-Structured Merge-Tree storage engine, Protobuf
-inter-node RPC, and a Two-Phase Commit lifecycle for atomic multi-key
-writes.
+<h1 align="center">Oxide-KV</h1>
 
-> Lightweight by design — every line is meant to be read.
+<p align="center">
+  A distributed key-value store in Rust implementing the <b>Raft Consensus<br>
+  Algorithm</b>, with a Log-Structured Merge-Tree storage engine, Protobuf<br>
+  inter-node RPC, and a Two-Phase Commit lifecycle for atomic multi-key<br>
+  writes.
+</p>
 
-[![CI](https://github.com/yuw1/oxide-kv/actions/workflows/rust.yml/badge.svg)](https://github.com/yuw1/oxide-kv/actions)
-[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](./LICENSE)
-[![Rust](https://img.shields.io/badge/rust-edition_2024-orange.svg)](https://www.rust-lang.org)
-[![Tests](https://img.shields.io/badge/tests-105_passing-brightgreen.svg)](#development)
+<p align="center"><i>Lightweight by design — every line is meant to be read.</i></p>
+
+<p align="center">
+  <a href="https://github.com/yuw1/oxide-kv/actions"><img src="https://github.com/yuw1/oxide-kv/actions/workflows/rust.yml/badge.svg" alt="CI"></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License: Apache-2.0"></a>
+  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/rust-edition_2024-orange.svg" alt="Rust"></a>
+  <a href="#development"><img src="https://img.shields.io/badge/tests-105_passing-brightgreen.svg" alt="Tests"></a>
+</p>
 
 ---
 
