@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (P7 DST scenarios: log conflict / divergent log)
+- `tests/raft_dst_log_conflict.rs` (5 new integration tests):
+  - `dst_split_brain_old_leader_truncates_divergent_log`
+    (§5.3 + §5.4): old leader appends uncommitted entries
+    during a partition, the other partition elects a new
+    leader, after heal the old leader truncates its
+    divergent log.
+  - `dst_divergent_log_higher_term_wins` (§5.4): two
+    partitions each elect a leader; the higher-term leader's
+    log survives the heal.
+  - `dst_stale_leader_steps_down_and_does_not_apply_uncommitted`
+    (§5.2): the old leader steps down on the new leader's
+    heartbeat and never applies its uncommitted log entries
+    (Raft's commit barrier, not log truncation, is the safety
+    mechanism).
+  - `dst_minority_isolated_node_catches_up_on_heal` (§5.3):
+    a single isolated node cannot make progress; on heal it
+    catches up to the majority's committed entries.
+  - `dst_no_partition_baseline_converges`: control test —
+    no-fault cluster always converges.
+- All 5 scenarios pass 20 consecutive runs with timing
+  variance < 2% (1.35-1.37s wall-clock).
+
+### Changed
+- `protocol::LogEntry::command` changed from `pub(crate)` to
+  `pub` so integration tests can assert on log contents
+  (e.g. "no node has 'b' after heal"). No internal code
+  change — the field was already accessed from many
+  in-crate modules; this just relaxes the visibility.
+
 ### Added (P7 DST scenarios: leader failover + partition heal)
 - `tests/raft_dst.rs` (5 new integration tests):
   - `dst_leader_failover_preserves_committed_log` (§5.2 +
