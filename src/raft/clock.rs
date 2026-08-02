@@ -114,6 +114,107 @@ pub fn system_clock() -> Arc<dyn Clock> {
     Arc::new(SystemClock)
 }
 
+/// Virtual clock for deterministic simulation testing (P7 DST).
+///
+/// Holds an `epoch` (a real `Instant` captured at construction) and
+/// a `virtual_offset` (the cumulative amount of virtual time that
+/// has been consumed via `sleep`). `now()` returns `epoch +
+/// virtual_offset`, which means:
+///
+///   - The returned `Instant` is always >= `epoch`, so existing
+///     monotonic-clock comparisons (`b >= a`, `duration_since`,
+///     `elapsed`) still work as long as they compare within a
+///     single `SimClock`'s timeline.
+///   - Virtual time is **deterministic** given a fixed `sleep`
+///     schedule. Two `SimClock`s consumed by the same virtual
+///     advance schedule produce identical `now()` sequences — this
+///     is the property that makes a future fault-injection harness
+///     replayable.
+///
+/// The `sleep` future is `tokio::time::Sleep` under the hood, so it
+/// cooperates with `tokio::time::pause()` + `tokio::time::advance`.
+/// Test authors should use `#[tokio::test(start_paused = true)]` so
+/// that advancing the runtime's virtual clock triggers `sleep`
+/// wakeups without burning real wall-clock seconds.
+///
+/// The inner state is `Arc<Mutex<...>>` so the `sleep` future can
+/// bump the offset from inside its `poll` future without holding
+/// a borrow back to `SimClock` itself.
+pub struct SimClock {
+    inner: Arc<Mutex<SimClockInner>>,
+}
+
+struct SimClockInner {
+    epoch: Instant,
+    offset: Duration,
+}
+
+impl SimClock {
+    /// Construct a fresh `SimClock`. Captures `Instant::now()` as
+    /// the epoch and starts the virtual offset at zero. Cheap;
+    /// safe to call many times per test.
+    ///
+    /// **Determinism caveat**: two clocks built with `new()` will
+    /// have *different* epochs (real wall-clock instants captured
+    /// at each construction). For deterministic comparison in a
+    /// test ("both clocks see the same `now()` for the same
+    /// advance schedule"), share an epoch via `with_epoch` or
+    /// pass the same `epoch` argument to both constructors.
+    pub fn new() -> Self {
+        Self::with_epoch(Instant::now())
+    }
+
+    /// Construct a `SimClock` whose epoch is the given `Instant`.
+    /// Useful for tests that want multiple clocks to agree on a
+    /// common starting point (so `now()` sequences can be
+    /// compared directly).
+    pub fn with_epoch(epoch: Instant) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(SimClockInner {
+                epoch,
+                offset: Duration::ZERO,
+            })),
+        }
+    }
+
+    /// Read the current virtual offset (sum of consumed virtual
+    /// time). Useful for assertions in tests ("the harness spent
+    /// 30s of virtual time before deciding to crash peer B").
+    pub fn virtual_offset(&self) -> Duration {
+        self.inner.lock().unwrap().offset
+    }
+}
+
+impl Default for SimClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clock for SimClock {
+    fn now(&self) -> Instant {
+        let inner = self.inner.lock().unwrap();
+        inner.epoch + inner.offset
+    }
+
+    fn sleep(&self, duration: Duration) -> futures::Sleep {
+        // Box the future so we don't have to worry about
+        // `tokio::time::Sleep` being `!Unpin` — the box becomes the
+        // `Pin<Box<dyn Future + Send>>` payload that
+        // `futures::into_sleep` expects. The wrapper future's only
+        // job is to bump the virtual offset exactly once on first
+        // `Poll::Ready`.
+        let inner = self.inner.clone();
+        futures::into_sleep(async move {
+            tokio::time::sleep(duration).await;
+            let mut guard = inner.lock().unwrap();
+            guard.offset += duration;
+            // lock auto-drops at end of scope
+            drop(guard);
+        })
+    }
+}
+
 // `Arc<dyn Clock>` clone is cheap, but trait objects of `dyn Clock`
 // don't auto-derive `Clone`. We don't need it to be `Clone` — `Arc`
 // clone is the correct way to share. The `Mutex` here is reserved
@@ -153,6 +254,101 @@ mod tests {
         assert!(
             elapsed >= Duration::from_millis(15),
             "expected at least ~20ms of sleep, got {:?}",
+            elapsed
+        );
+    }
+
+    /// Determinism check: two `SimClock`s seeded identically must
+    /// produce identical `now()` sequences for the same `advance`
+    /// schedule. This is the entire point of the abstraction — if
+    /// it ever stops holding, the DST harness can't replay.
+    #[tokio::test(start_paused = true)]
+    async fn sim_clock_is_deterministic_under_same_seed() {
+        // Share an explicit epoch so the two clocks start at the
+        // same `Instant`. (Without this, each `new()` captures a
+        // different wall-clock instant, so `now()` differs even
+        // when virtual offsets agree.)
+        let epoch = Instant::now();
+        let c1 = SimClock::with_epoch(epoch);
+        let c2 = SimClock::with_epoch(epoch);
+
+        let schedule = vec![
+            Duration::from_millis(0),     // tick immediately
+            Duration::from_millis(250),   // election timeout region
+            Duration::from_millis(500),
+            Duration::from_millis(1000),
+            Duration::from_millis(2_500),
+            Duration::from_millis(4_500),
+        ];
+
+        let mut times1 = Vec::new();
+        let mut times2 = Vec::new();
+        for d in &schedule {
+            // sleep first so the future resolves via virtual advance
+            let cf1 = c1.sleep(*d);
+            let cf2 = c2.sleep(*d);
+            tokio::join!(cf1, cf2);
+            times1.push(c1.now());
+            times2.push(c2.now());
+        }
+
+        assert_eq!(
+            times1, times2,
+            "two SimClocks with the same advance schedule must agree on every Instant"
+        );
+    }
+
+    /// Virtual-time semantics: under `start_paused`, real wall
+    /// clock does NOT advance, but SimClock `now()` reflects the
+    /// virtual advance that consumed the sleep futures.
+    #[tokio::test(start_paused = true)]
+    async fn sim_clock_advance_moves_virtual_time_without_wall_clock() {
+        let clock = SimClock::new();
+        let real_before = Instant::now();
+        // Capture the SimClock's view of `now()` *before* any sleep.
+        let sim_before = clock.now();
+        clock.sleep(Duration::from_secs(5)).await;
+        clock.sleep(Duration::from_secs(3)).await;
+        let real_after = Instant::now();
+        // Wall clock is paused (this tokio::test start_paused). The
+        // two sleeps consumed 8 seconds of *virtual* time but real
+        // elapsed must be near-zero. (We allow a tiny epsilon for
+        // scheduling jitter on the host OS.)
+        let real_elapsed = real_after.duration_since(real_before);
+        assert!(
+            real_elapsed < Duration::from_millis(50),
+            "start_paused should not advance real wall clock, got {:?}",
+            real_elapsed
+        );
+        // SimClock's `now()` should reflect the 8 virtual seconds
+        // since `sim_before`. (Use `virtual_offset` rather than
+        // `elapsed()` because the latter subtracts real wall
+        // instants, which doesn't move under `start_paused`.)
+        let offset_after = clock.virtual_offset();
+        assert!(
+            offset_after >= Duration::from_secs(8) - Duration::from_millis(50),
+            "SimClock should reflect virtual advance, got offset {:?}",
+            offset_after
+        );
+        let _ = sim_before; // keep variable used for documentation
+    }
+
+    /// `last_quorum_heartbeat_at` style usage: stamp now, advance
+    /// past a deadline, check `now() - stamp >= deadline`. This
+    /// mirrors how the leader's ReadIndex lease will use SimClock
+    /// in the future DST harness.
+    #[tokio::test(start_paused = true)]
+    async fn sim_clock_supports_elapsed_style_deadline_checks() {
+        let clock = SimClock::new();
+        let stamp = clock.now();
+        clock.sleep(Duration::from_secs(30)).await;
+        // Use `virtual_offset` (not `stamp.elapsed()`, which is
+        // real wall-clock) to measure how far virtual time has
+        // moved past the stamp.
+        let elapsed = clock.now().duration_since(stamp);
+        assert!(
+            elapsed >= Duration::from_secs(30),
+            "SimClock::now() should advance after sleep, got elapsed {:?}",
             elapsed
         );
     }
