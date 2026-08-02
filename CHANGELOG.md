@@ -319,6 +319,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Net +16 tests vs. PR #11 baseline (124 → 140). All previous
   124 tests still pass; no regressions.
 
+
+## Unreleased — PR #13 (2PC coordinator orchestration)
+
+### Added (P6 — PR #13)
+- **Leader-side 2PC coordinator** (`src/raft/coordinator.rs`,
+  `pub(crate) mod coordinator` registered in `src/raft.rs`):
+  - `coordinate_tx(node_arc, tx_id, ops) -> TxOutcome` is the single
+    entry point called by `client.rs::begin_tx`. Detects single-node
+    vs multi-node membership and drives the appropriate path.
+  - `TxOutcome` enum: `Committed { begin_index, decide_index, tx_id }`
+    / `Aborted { tx_id, reason }` / `NotLeader { tx_id }`.
+  - **Single-node fast path**: propose `BeginTx` + `DecideTx(Commit)`
+    as one contiguous batch via the existing `propose_batch`.
+  - **Multi-node path** (textbook 2PC, all-yes quorum):
+    1. Propose `BeginTx` only, wait until `last_applied >= begin_index`
+       on the leader.
+    2. Snapshot the leader's `(current_term, peers, node_id,
+       begin_log_term)`.
+    3. Record the leader's implicit Yes on `pending_txs[tx_id].votes`.
+    4. Fan-out `VoteRequest` to every peer concurrently via
+       `tokio::spawn` + `RpcClient::send_tx_vote_rpc` with a per-peer
+       timeout (2s).
+    5. Tally votes — any No / timeout / error / higher-term reply
+       flips the decision to `Abort` and may step the leader down to
+       Follower if a peer returned a higher term.
+    6. Propose `DecideTx(Commit | Abort)`, wait for commit + apply.
+  - Wall-clock bound: a single round is capped at 10s. A round that
+    exceeds the bound returns `Aborted` with a clear reason.
+- **Read-only accessors on `RaftNode`** so the coordinator can read
+  membership and identity without taking a mutable lock:
+  `node_id()`, `peers()`, `current_term()`, `get_log_entry(index)`.
+
+### Fixed (P6 — PR #13)
+- **`apply_logs` now handles `BeginTx` / `DecideTx` / `Get` /
+  `Compact`.** Pre-PR-#13, `apply_logs` only matched `Set` and
+  `Delete`, so any `BeginTx` / `DecideTx` entry committed in the
+  steady state (not via `replay_logs` at startup) was a no-op for
+  the state machine. This meant `pending_txs` was never populated
+  on a running leader, which would have made the multi-node
+  coordinator hang on the first vote (peers reply `tx not pending`).
+  The PR also adds explicit apply-side logs for each variant so
+  debugging is easier.
+
+### Changed (P6 — PR #13)
+- **`client.rs::begin_tx` is now a thin wrapper** that delegates to
+  `coordinator::coordinate_tx` and translates `TxOutcome` into JSON.
+  The pre-PR-#13 single-node `propose_batch([BeginTx, DecideTx])`
+  inline logic moves into the coordinator's `single_node_fast_path`,
+  preserving behavior. The JSON response gains `decision`,
+  `begin_index`, and `decide_index` fields on commit, and
+  `reason` on abort — wire-compatible with clients that already
+  parse `status: ok` (new fields are additive).
+
+### Out of scope (deferred)
+- 3-node integration test (PR #14).
+- Participant-side recovery on coordinator crash.
+- Auto-elevation of no-peers node to Leader is unchanged.
+
+### Test suite (144 tests, all passing)
+- 4 new tests in `raft::coordinator::tests`:
+  - `coordinate_tx_single_node_commits_atomically` — end-to-end
+    single-node path through the new coordinator.
+  - `apply_logs_applies_begin_tx_and_decide_tx_in_steady_state` —
+    regression test for the apply_logs fix.
+  - `apply_logs_abort_decision_does_not_apply_ops` — counterpart
+    test for the Abort path through `apply_logs`.
+  - `tx_outcome_equality_and_debug_smoke` — public enum sanity.
+- Net +4 tests vs. PR #12 baseline (140 → 144). All previous
+  140 tests still pass; no regressions.
+
+### Pre-existing clippy debt
+- `cargo clippy --release -- -D warnings` reports 25 errors, all
+  pre-existing on `master`. The PR introduces 0 new clippy warnings
+  in any file it modifies (`src/raft/coordinator.rs`,
+  `src/raft/node.rs`, `src/raft.rs`, `src/client.rs`).
+
 ## [0.1.0] - 2026-02-24
 
 ### Added

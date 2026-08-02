@@ -105,6 +105,25 @@ impl RaftNode {
         self.peers.is_empty()
     }
 
+    /// Public read-only accessors for the leader-side coordinator.
+    /// Added in P6 PR #13 so `coordinator::coordinate_tx` can read
+    /// membership + identity without taking a mutable lock on the node.
+    pub fn node_id(&self) -> &str {
+        &self.node_id
+    }
+
+    pub fn peers(&self) -> &[String] {
+        &self.peers
+    }
+
+    pub fn current_term(&self) -> u64 {
+        self.current_term
+    }
+
+    pub fn get_log_entry(&self, index: u64) -> Option<crate::protocol::LogEntry> {
+        self.log.get(index as usize).cloned()
+    }
+
     /// Helper to get the last log's index and term
     fn get_last_log_info(&self) -> (u64, u64) {
         self.log.last().map_or((0, 0), |entry| (entry.index as u64, entry.term))
@@ -455,7 +474,16 @@ impl RaftNode {
                         let _ = state_machine.delete(&key);
                         println!("✅ [Apply] Index {}: DELETE {}", entry.index, key);
                     }
-                    _ => println!("🔍 [Apply] Index {}: No-op", entry.index),
+                    Command::BeginTx { tx_id, ops } => {
+                        let _ = state_machine.begin_tx(tx_id.clone(), ops.clone());
+                        println!("✅ [Apply] Index {}: BEGIN_TX {} ({} ops)", entry.index, tx_id, ops.len());
+                    }
+                    Command::DecideTx { tx_id, decision } => {
+                        let _ = state_machine.decide_tx(tx_id, decision.clone());
+                        println!("✅ [Apply] Index {}: DECIDE_TX {} = {:?}", entry.index, tx_id, decision);
+                    }
+                    Command::Get { .. } => println!("🔍 [Apply] Index {}: GET (no-op)", entry.index),
+                    Command::Compact => println!("🔍 [Apply] Index {}: Compact marker (no-op)", entry.index),
                 }
                 self.last_applied += 1;
             } else {
