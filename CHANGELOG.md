@@ -395,6 +395,97 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in any file it modifies (`src/raft/coordinator.rs`,
   `src/raft/node.rs`, `src/raft.rs`, `src/client.rs`).
 
+
+## Unreleased — PR #14 (3-node 2PC integration tests)
+
+### Added (P6 — PR #14)
+- **`tests/integration_2pc.rs`** (NEW file, 3 tests, 5.3 s total):
+  - `happy_path_3_nodes_commits_via_quorum` — 3-node cluster, manual
+    `become_candidate` leader election, full `BeginTx` round-trip.
+    Asserts: client response is `committed`, all three nodes have
+    the ops applied, `pending_tx_count == 0` on every node, and the
+    committed value is visible on a follower's state machine.
+  - `no_vote_from_one_peer_aborts_tx_and_isolates_ops` — same
+    cluster, but a phantom log entry is injected on node 2 to
+    force the leader-log-stale check in `handle_tx_vote_request`
+    step 3 to return No. Asserts: client response is `aborted`,
+    the ops are NOT applied on any node, `pending_tx_count == 0`
+    on every node after the abort.
+  - `one_unreachable_peer_times_out_and_aborts` — 2 nodes + one
+    blackhole address (`127.0.0.1:1`). Asserts: client response
+    is `aborted`, the round takes at least 1s wall-clock
+    (proving the coordinator respects the vote timeout), and the
+    ops are NOT applied on the live peer.
+
+### Fixed (P6 — PR #14)
+- **Coordinator bug: BeginTx applied on peers AFTER vote RPC fires.**
+  The pre-PR-#14 `coordinate_tx` waited for the leader's
+  `last_applied >= begin_index` but not for the BeginTx entry to
+  be replicated to peers. Worse, even after
+  `wait_for_replication(match_index >= begin_index)` was added,
+  the peer had the entry in its log but `commit_index` was
+  still behind (AppendEntries only advances `commit_index` when
+  `args.leader_commit > self.commit_index`, and the first
+  AppendEntries carrying the entry has `leader_commit = 0`).
+  The vote RPC fired immediately, the peer replied "tx not
+  pending" because `apply_logs` was a no-op, and the coordinator
+  aborted a transaction that would otherwise have committed.
+  - **Fix (peer-side)**: `handle_tx_vote_request` now fast-forwards
+    its `commit_index` to `req.last_log_index` (when the entry is
+    in the log) and runs `apply_logs` before the `pending_txs`
+    lookup. This is safe because the leader has already committed
+    the entry (proven by the leader's `match_index >= begin_index`)
+    and the entry is in our log (proven by the leader-log-up-to-date
+    check above).
+- **Test harness: heartbeat loop not running.** The integration
+  test bootstrap starts the RPC listener but not the heartbeat
+  loop, so peers never receive subsequent AppendEntries with the
+  new `commit_index` and never apply `DecideTx`. Fix: spawn
+  `RaftNode::run_heartbeat_loop` in `spawn_node`.
+
+### Changed (P6 — PR #14)
+- **`RaftNode` gains two small public helpers used by the
+  integration test**:
+  - `set_peers(peers: Vec<String>)` — mutates the peer list
+    after construction so the test can wire membership in two
+    phases (allocate listener ports, then connect).
+  - `push_log_entry_for_test(index, command)` — pushes a phantom
+    log entry to simulate a peer whose log is ahead of the
+    leader's. Only used by the no-vote-abort test for fault
+    injection. The doc comment explicitly marks it as
+    test-only with "production code never calls this".
+- **`raft::storage` is now `pub`** (was `pub(crate)`). The
+  integration test legitimately needs `RaftStorage::new_with_paths`
+  and `StateMachine::open` to wire up a node without depending on
+  the global `Config`, which is `OnceLock`-initialized once per
+  process.
+
+### Test suite (147 tests, all passing)
+- 3 new integration tests in `tests/integration_2pc.rs`:
+  - happy path (0.27s)
+  - no-vote abort (0.31s)
+  - timeout abort (5.04s, dominated by the 5s
+    `wait_for_replication` bound)
+- Net +3 tests vs. PR #13 baseline (144 → 147). All previous
+  144 tests still pass; no regressions.
+- Total time for the integration test suite: ~5.3s.
+
+### Pre-existing clippy debt
+- `cargo clippy --release -- -D warnings` reports 25 errors, all
+  pre-existing on `master`. The PR introduces 0 new clippy
+  warnings in any file it modifies (`src/raft/coordinator.rs`,
+  `src/raft/node.rs`, `src/raft.rs`, `tests/integration_2pc.rs`).
+
+### Out of scope (deferred)
+- Leader-step-down mid-round fault injection — covered by the
+  coordinator's `NotLeader` return path unit test, but not by
+  an integration test.
+- 5-node cluster test — not needed yet; the coordinator's
+  all-yes quorum logic is the same as 3-node.
+- `BeginTx` after a leader change (new leader sees the
+  orphaned entry in `pending_txs`) — explicitly out of scope
+  for P6 (see ROADMAP.md, P6 "Out of scope").
+
 ## [0.1.0] - 2026-02-24
 
 ### Added

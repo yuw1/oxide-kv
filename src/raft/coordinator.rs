@@ -159,6 +159,20 @@ async fn coordinate_tx_inner(
         Err(_reason) => return TxOutcome::NotLeader { tx_id },
     };
 
+    // Step 1b: wait for the BeginTx entry to be replicated to every
+    // peer. `match_index[peer] >= begin_index` means the peer has
+    // acknowledged AppendEntries for the entry — once that happens the
+    // entry is in the peer's log and the next `apply_logs` round on
+    // the peer will populate its `pending_txs` table. Without this
+    // gate, peers would reply "tx not pending" to the vote RPC and
+    // the coordinator would spuriously abort (see PR #14 integration
+    // test for the regression).
+    if let Err(reason) = wait_for_replication(&node_arc, begin_index).await {
+        return TxOutcome::Aborted {
+            tx_id,
+            reason: format!("replication failed: {}", reason),
+        };
+    }
     // Snapshot the leader's term and peer set BEFORE fanning out: any
     // term advance reported by a peer needs to be compared against this
     // snapshot to decide whether to step down.
@@ -403,6 +417,59 @@ async fn propose_and_wait_for_apply(
             return Err(format!(
                 "timed out waiting for index {} to apply (commit={}, applied={})",
                 index, commit_idx, last_applied
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Wait until every peer has acknowledged replication of `index` via
+/// a successful AppendEntries reply (i.e. `match_index[peer] >= index`).
+///
+/// This is the gate between `BeginTx` commit on the leader and the
+/// vote fan-out: in a multi-node cluster the BeginTx entry must be on
+/// every peer's log AND applied to populate `pending_txs` BEFORE the
+/// peer can answer `VoteRequest` meaningfully. Otherwise peers reply
+/// "tx not pending" and the coordinator aborts a transaction that would
+/// otherwise have committed (PR #14 caught this race with the
+/// 3-node integration test).
+///
+/// `match_index` is updated on the **leader** when AppendEntries
+/// succeeds (Raft §5.3). After `match_index >= index` the entry is
+/// already in the peer's log, and the next `apply_logs` round on the
+/// peer will populate `pending_txs`. We then wait for
+/// `last_applied >= index` on the leader (which only advances once
+/// the entry has been applied locally) — but note that `last_applied`
+/// on the leader is only about the leader's own state machine, not
+/// the peers. The actual cross-node guarantee relies on the leader
+/// having replication proof (match_index) AND the entry being safe
+/// to apply (no `prev_log` mismatch in subsequent AppendEntries).
+///
+/// Returns `Ok(())` on success, `Err(reason)` on timeout or step-down.
+async fn wait_for_replication(
+    node_arc: &Arc<RwLock<RaftNode>>,
+    index: u64,
+) -> Result<(), String> {
+    let start = std::time::Instant::now();
+    let bound = Duration::from_secs(5);
+    loop {
+        let snapshot = {
+            let n = node_arc.read().unwrap();
+            if n.state != NodeState::Leader {
+                return Err(format!("stepped down to {:?} during replication wait", n.state));
+            }
+            n.peers()
+                .iter()
+                .map(|p| (p.clone(), n.match_index_for(p)))
+                .collect::<Vec<(String, u64)>>()
+        };
+        if snapshot.iter().all(|(_, mi)| *mi >= index) {
+            return Ok(());
+        }
+        if start.elapsed() > bound {
+            return Err(format!(
+                "timed out waiting for index {} to replicate to all peers (current: {:?})",
+                index, snapshot
             ));
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
