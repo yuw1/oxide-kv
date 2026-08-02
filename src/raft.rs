@@ -6,3 +6,4 @@ pub mod proto;
 pub(crate) mod transport;
 pub(crate) mod coordinator;
 pub mod clock;
+pub mod net;

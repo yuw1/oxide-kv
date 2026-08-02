@@ -5,7 +5,7 @@ use oxide_kv::client::ClientHandler;
 use oxide_kv::config::Config;
 use oxide_kv::state_machine::{StateMachine, StateMachineConfig};
 use oxide_kv::raft::node::{NodeState, RaftNode};
-use oxide_kv::raft::rpc::RpcServer;
+use oxide_kv::raft::net::{StopSignal, TcpTransport, Transport};
 use oxide_kv::raft::timer::run_election_timer;
 
 #[derive(Parser, Debug)]
@@ -61,19 +61,25 @@ async fn main() -> anyhow::Result<()> {
         node.replay_logs();
     }
 
-    // 6. Start Raft RPC listener (Handles internal voting and heartbeats)
+    // 6. Start Raft RPC listener (Handles internal voting and heartbeats).
+    //    Route through the abstracted `Transport` trait so the future
+    //    P7 simulation harness can replace this with an in-memory
+    //    listener. The `StopSignal` is wired to `ctrl_c` below so a
+    //    graceful shutdown can drain the accept loop.
     let r_node = raft_node.clone();
     let raft_listener = TcpListener::bind(&Config::global().listen_addr).await?;
     println!("📡 Raft RPC Service started at: {}", Config::global().listen_addr);
-
-    tokio::spawn(async move {
-        while let Ok((stream, _)) = raft_listener.accept().await {
-            let n = r_node.clone();
-            tokio::spawn(async move {
-                RpcServer::handle_raft_rpc(stream, n).await;
-            });
-        }
-    });
+    let raft_transport: Arc<dyn Transport> = Arc::new(TcpTransport::with_listener(raft_listener));
+    let raft_stop = StopSignal::new();
+    {
+        let r_node = r_node.clone();
+        let raft_stop = raft_stop.clone();
+        tokio::spawn(async move {
+            if let Err(e) = raft_transport.serve(r_node, raft_stop).await {
+                eprintln!("[raft] transport serve stopped: {}", e);
+            }
+        });
+    }
 
     // 7. Start Election Timer
     // Triggers election if no heartbeat is received within the randomized timeout
@@ -92,10 +98,14 @@ async fn main() -> anyhow::Result<()> {
     // 9. Graceful shutdown handling
     // TODO: Persist final state and cleanly drain in-flight RPCs before exit.
     let _shutdown_node = raft_node.clone();
+    let raft_stop_for_ctrl_c = raft_stop.clone();
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.ok();
         println!("\n🛑 Shutdown signal received. Saving state...");
-        // Persistence/cleanup will land in a later PR (see CHANGELOG).
+        // Tell the Raft listener to stop accepting new connections;
+        // in-flight RPCs drain naturally. Persistence/cleanup will
+        // land in a later PR (see CHANGELOG).
+        raft_stop_for_ctrl_c.stop();
         std::process::exit(0);
     });
 

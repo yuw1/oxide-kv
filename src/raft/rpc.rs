@@ -84,7 +84,11 @@ impl RpcClient {
     /// payload. The discriminator selects between Raft consensus RPCs
     /// (`0x01`) and the 2PC coordinator vote RPC (`0x02`); both share
     /// the same TCP listener bound to `Config::listen_addr`.
-    async fn call(addr: &str, msg: RaftMessage, timeout_duration: Duration) -> anyhow::Result<RaftMessage> {
+    ///
+    /// `pub(crate)` so `crate::raft::net::TcpTransport` (the P7
+    /// Transport-trait real impl) can route every Raft variant through
+    /// one helper instead of needing per-variant dispatcher code.
+    pub(crate) async fn call(addr: &str, msg: RaftMessage, timeout_duration: Duration) -> anyhow::Result<RaftMessage> {
         let stream = timeout(timeout_duration, TcpStream::connect(addr)).await??;
         let (mut reader, mut writer) = stream.into_split();
 
@@ -96,22 +100,6 @@ impl RpcClient {
         };
         let resp_pb = crate::raft::proto::pb::RaftMessage::decode(&resp_buf[..])?;
         Ok(crate::raft::proto::decode_domain(resp_pb))
-    }
-
-    /// Send RequestVote RPC to a peer
-    pub(crate) async fn send_request_vote_rpc(addr: &str, args: RequestVoteArgs) -> anyhow::Result<VoteResponseArgs> {
-        match Self::call(addr, RaftMessage::RequestVote(args), Duration::from_secs(Config::rpc_request_vote_timeout_ms())).await? {
-            RaftMessage::VoteResponse(reply) => Ok(reply),
-            _ => Err(anyhow::anyhow!("Unexpected RPC response for RequestVote")),
-        }
-    }
-
-    /// Send AppendEntries RPC to a peer
-    pub(crate) async fn send_append_entries_rpc(addr: String, args: AppendEntriesArgs) -> anyhow::Result<AppendReplyArgs> {
-        match Self::call(&addr, RaftMessage::AppendEntries(args), Duration::from_secs(Config::rpc_append_entries_timeout_ms())).await? {
-            RaftMessage::AppendReply(reply) => Ok(reply),
-            _ => Err(anyhow::anyhow!("Unexpected RPC response type for AppendEntries")),
-        }
     }
 
     /// Send InstallSnapshot RPC to a peer
