@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (roadmap)
+- P6 (multi-node 2PC coordinator RPC) marked complete (PR #11–#14 merged).
+- P7 pinned as the active phase: **Deterministic simulation testing (DST)**
+  — a reproducible fault-injection harness that proves election safety,
+  state-machine safety, committed-entry durability, and 2PC atomicity,
+  rather than relying on happy-path tests alone. Docs-only this PR.
+
 ### Added (project branding)
 - Project logo under `assets/` (`logo-light.svg` for light themes,
   `logo-dark.svg` for dark themes)

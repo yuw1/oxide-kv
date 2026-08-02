@@ -23,7 +23,8 @@ wins.
 | P5 | Two-phase commit lifecycle (BeginTx / Vote / DecideTx) | ✅ Merged | [#6](https://github.com/yuw1/oxide-kv/pull/6) | State machine + wire schema; single-node fast path |
 | Bug | Election timer brain-split + heartbeat:election ratio | ✅ Merged | [#8](https://github.com/yuw1/oxide-kv/pull/8) | Timer/logic fix |
 | Bug | Single-node read fallback + commit advancement | ✅ Merged | [#9](https://github.com/yuw1/oxide-kv/pull/9) | Read fast path + sync_logs |
-| **P6** | **Multi-node 2PC coordinator RPC** | **🔄 In progress** | [#11](https://github.com/yuw1/oxide-kv/pull/11)+ | **Active** |
+| P6 | Multi-node 2PC coordinator RPC | ✅ Merged | [#11](https://github.com/yuw1/oxide-kv/pull/11)–[#14](https://github.com/yuw1/oxide-kv/pull/14) | Leader-as-coordinator, all-yes quorum, side-channel vote RPC |
+| **P7** | **Deterministic simulation testing (DST)** | **🔄 Active** | — | **Correctness harness: fault injection + invariant checks** |
 
 ---
 
@@ -139,6 +140,143 @@ Estimated test growth: +20-25 tests across PRs #11-#14. After PR #14 the count i
 - Cross-Raft-group transactions.
 - Read-your-writes within a tx before commit (not a stated goal; can be layered later).
 - Participant-side autonomous abort (priority B from the decision table). Will be a separate phase if/when priority A turns out to leave real recovery holes.
+
+---
+
+## P7 — Deterministic simulation testing (DST)
+
+### Problem statement
+
+P0–P6 delivered a working Raft + 2PC + LSM stack with 147 passing
+tests. But those tests are overwhelmingly **happy-path and single-point
+race** coverage. There is currently **no test that proves the system
+stays safe under partition, crash, and recovery combinations.**
+
+Concretely, we *believe* the following hold but cannot *demonstrate* any
+of them:
+
+- A committed entry is never lost, even if the leader crashes right
+  after commit and a follower with a stale log wins the next election.
+- There is never more than one leader in the same term, across
+  arbitrary message loss / reorder / duplication.
+- The 2PC all-yes quorum never produces a partial commit when the
+  coordinator crashes mid-round, when a partition isolates a peer, or
+  when a participant restarts with a pending tx in its log.
+- ReadIndex never serves a value that a linearizable client could
+  observe as stale.
+
+This is the gap between "wrote a Raft" and "can take responsibility for
+its correctness." P7 closes it.
+
+### Goal
+
+A **deterministic, reproducible simulation harness** that runs the real
+Raft + 2PC code (not a model) against a controlled, adversarial network
+and fault scheduler, then asserts safety invariants over thousands of
+randomized scenarios.
+
+Determinism is the core requirement: given a seed, a failing scenario
+must replay identically, so a bug found at 3am is debuggable at 9am.
+
+### Approach
+
+1. **Virtual clock + virtual network.** Replace wall-clock timers and
+   real TCP with a simulated clock and an in-memory network that the
+   scheduler controls. The Raft code under test must not be able to
+   tell the difference. This likely means abstracting the transport
+   (`src/raft/transport.rs`) and the clock behind traits, with a
+   `real` impl (production) and a `sim` impl (tests).
+2. **Fault injection.** The scheduler can, at any tick: drop / delay /
+   reorder / duplicate a message; crash a node (stop its tasks, keep
+   its disk); restart a node (reload from disk); partition the network
+   into arbitrary groups; heal a partition.
+3. **Invariant checker.** After every scenario (and, where cheap,
+   periodically mid-scenario) assert the safety properties:
+   - **Election safety:** at most one leader per term.
+   - **Leader append-only / state-machine safety:** if two nodes apply
+     a log entry at the same index, the entries are identical.
+   - **Committed-entry durability:** once the leader reports commit,
+     that entry survives any subsequent legal fault sequence.
+   - **2PC atomicity:** for each tx, either all nodes apply it or none
+     do; never a partial commit.
+   - **Linearizability:** every read returns a value consistent with
+     some linearization of the committed writes (checked against a
+     reference model).
+4. **Reference model.** A simple sequential spec (a HashMap with
+   atomic multi-key tx) that the simulation compares real behavior
+   against. This is what turns "no crash" into "correct."
+5. **Seed-driven fuzzing.** A driver that runs N scenarios with random
+   seeds, shrinking a failing seed toward a minimal reproduction.
+
+### Non-goals (for P7)
+
+- Liveness proofs / guarantees under sustained partition (we assert
+  *safety*; liveness under adversarial scheduling is out of scope).
+- Performance benchmarking (that is a separate "benchmark suite" item).
+- Jepsen-style black-box testing over a real network (DST is white-box,
+  in-process, deterministic; a real-network Jepsen harness may come
+  later but is not P7).
+- Rewriting Raft / 2PC logic. P7 *tests* the existing code; if it finds
+  bugs, those are fixed in follow-up fix PRs, not inside the harness PR.
+
+### Acceptance criteria
+
+P7 ships when **all** of these hold on `master`:
+
+1. **Harness exists and is deterministic.** A simulation runs the real
+   node code over a virtual clock + network. Running the same seed
+   twice produces the identical event trace.
+2. **Fault coverage.** The scheduler can inject at least: message drop,
+   delay, reorder, node crash, node restart-from-disk, 2-way and 3-way
+   partition, partition heal.
+3. **Invariants enforced.** Election safety, state-machine safety,
+   committed-entry durability, and 2PC atomicity are all checked and
+   will fail the test on violation.
+4. **Scale.** The suite runs ≥1000 randomized scenarios (across seeds)
+   in CI-bounded time, plus a smaller default `cargo test` set.
+5. **Reference model.** Linearizable reads and tx outcomes are checked
+   against a sequential spec, not just "did it crash."
+6. **No regressions.** Existing 147 tests still pass; P7 adds the
+   harness + a seed-driven test entry point.
+7. **Documented.** README + CHANGELOG explain how to run the simulation
+   and how to reproduce a failing seed.
+
+### Planned work (not tied to specific PR numbers)
+
+The work below is what P7 needs; how it splits into PRs is decided as
+the work actually lands (GitHub assigns numbers at creation time, so
+pinning them here would be false precision).
+
+- **Abstract transport + clock behind traits.** Introduce `Transport`
+  and `Clock` traits; `real` impls wrap the current TCP + `tokio::time`
+  with no behavior change and existing tests green. This is the
+  foundation the simulation builds on.
+- **Deterministic virtual clock + network + fault scheduler.** `sim`
+  impls: a virtual clock, an in-memory network supporting
+  drop/delay/reorder/duplicate, a fault scheduler, and a seed-driven
+  driver. The harness runs a trivial scenario deterministically.
+- **Safety invariants + reference model.** An invariant checker
+  (election / state-machine / committed-entry durability / 2PC
+  atomicity) plus a sequential reference model, wired into scenario
+  teardown.
+- **Fault scenarios + seed fuzzing + shrinker.** Crash / restart /
+  partition / heal scenarios; an N-seed fuzzer; minimal-repro shrinking;
+  CI integration; docs.
+
+If the harness surfaces real bugs (expected), each gets its own
+`fix/...` PR with a regression scenario added to the suite.
+
+### Open questions (to resolve as work starts)
+
+- How invasive is abstracting the clock? `tokio::time` is used in
+  several places (election timer, heartbeat loop, RPC timeouts). May
+  need a `Clock` trait threaded through, or `tokio::time::pause()` +
+  controlled advance. Resolve in an initial spike.
+- Do we simulate at the TCP byte level or at the RPC-message level?
+  Message-level is far cheaper to build and sufficient for safety;
+  byte-level catches framing bugs but is heavier. Lean message-level.
+- CI time budget: how many seeds in the default gate vs a nightly
+  large-N run.
 
 ---
 

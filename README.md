@@ -269,8 +269,8 @@ proto/
 
 The active roadmap lives in [ROADMAP.md](./ROADMAP.md). That file is
 the single source of truth for phase status, in-progress work, and
-acceptance criteria. The current phase is **P6 — Multi-node 2PC
-coordinator RPC**.
+acceptance criteria. The current phase is **P7 — Deterministic
+simulation testing (DST)**.
 
 ### Phase summary
 
@@ -284,10 +284,12 @@ coordinator RPC**.
 | P5 | 2PC lifecycle (BeginTx / Vote / DecideTx) | ✅ | [#6](https://github.com/yuw1/oxide-kv/pull/6) |
 | Bug | Election timer brain-split + heartbeat:election ratio | ✅ | [#8](https://github.com/yuw1/oxide-kv/pull/8) |
 | Bug | Single-node read fallback + commit advancement | ✅ | [#9](https://github.com/yuw1/oxide-kv/pull/9) |
-| **P6** | **Multi-node 2PC coordinator RPC** | **🔄 In progress** | [ROADMAP.md](./ROADMAP.md) |
+| P6 | Multi-node 2PC coordinator RPC | ✅ | [#11](https://github.com/yuw1/oxide-kv/pull/11)–[#14](https://github.com/yuw1/oxide-kv/pull/14) |
+| **P7** | **Deterministic simulation testing (DST)** | **🔄 In progress** | [ROADMAP.md](./ROADMAP.md) |
 
 ### Candidate future directions (see ROADMAP.md for full list)
 
+- Deterministic simulation testing (P7, active) — fault injection + invariant proofs
 - Sharded multi-Raft
 - Joint consensus for membership change (Raft §6)
 - Tx timeout + admin-driven abort
