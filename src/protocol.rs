@@ -49,7 +49,7 @@ pub enum TxDecision {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct LogEntry {
-    pub(crate) term: u64,
+    pub term: u64,
     pub index: usize,
     pub command: Command,
 }

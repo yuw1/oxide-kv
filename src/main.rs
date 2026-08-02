@@ -91,8 +91,9 @@ async fn main() -> anyhow::Result<()> {
     // 8. Start Leader Heartbeat Loop
     // Periodically sends heartbeats only if state == Leader
     let heartbeat_node = raft_node.clone();
+    let heartbeat_stop = raft_stop.clone();
     tokio::spawn(async move {
-        RaftNode::run_heartbeat_loop(heartbeat_node).await;
+        RaftNode::run_heartbeat_loop(heartbeat_node, heartbeat_stop).await;
     });
 
     // 9. Graceful shutdown handling

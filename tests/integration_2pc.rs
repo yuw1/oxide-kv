@@ -81,6 +81,7 @@ use oxide_kv::client::ClientHandler;
 use oxide_kv::protocol::Command;
 // TxOp constructed inline in JSON payloads — no `use` needed.
 use oxide_kv::raft::node::{NodeState, RaftNode};
+use oxide_kv::raft::net::StopSignal;
 use oxide_kv::raft::rpc::RpcServer;
 use oxide_kv::raft::storage::RaftStorage;
 use oxide_kv::state_machine::{StateMachine, StateMachineConfig};
@@ -175,8 +176,16 @@ async fn spawn_node(peers: Vec<String>) -> TestNode {
     //    `become_candidate` manually in `elect_leader` to skip the
     //    5-10s randomized timer).
     let h = raft.clone();
+    let hb_stop = StopSignal::new();
+    // Hold the StopSignal in a TestNode-level field so the
+    // heartbeat can be torn down at end-of-test. For now
+    // (3-node in-process cluster), the test exits cleanly
+    // and the loop is killed by process exit. We keep a
+    // clone here so future teardown code can call
+    // `hb_stop.stop()`.
+    let _hb_stop_clone = hb_stop.clone();
     tokio::spawn(async move {
-        RaftNode::run_heartbeat_loop(h).await;
+        RaftNode::run_heartbeat_loop(h, hb_stop).await;
     });
 
     TestNode {

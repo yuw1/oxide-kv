@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (P7 fuzz harness)
+- New `tests/raft_fuzz.rs` (1 integration test file, 5 test
+  functions, ~750 lines): seeded-RNG scenario fuzz with three
+  cross-check oracles (invariants + reference model + per-node
+  log consistency). Action vocabulary: `SubmitSet`,
+  `SubmitDelete`, `DriveElection`, `KillNode`, `RestartNode`,
+  `PartitionLink`, `HealPartitions`, `Yield`. Distribution:
+  40% ops, 20% kill/restart, 20% partition, 10% election,
+  10% yield.
+- 5 fuzz tests:
+  - `fuzz_default_seeds_0_to_200` — 200 scenarios × 25
+    actions, seeds 0..200.
+  - `fuzz_default_seeds_1000_to_1200` — 200 scenarios ×
+    25 actions, seeds 1000..1200.
+  - `fuzz_long_seeds_2000_to_2100` — 100 scenarios ×
+    50 actions, seeds 2000..2100.
+  - `fuzz_short_seeds_3000_to_3100` — 100 scenarios ×
+    5 actions, seeds 3000..3100.
+  - `fuzz_smoke_single_seed` — seed 42 with 0 actions
+    (sanity check).
+- Each scenario has a 15s wall-clock deadline; each scenario
+  gets a fresh `SimCluster` so failures are isolated.
+
+### Fixed (P7 fuzz harness)
+- `RaftNode::run_heartbeat_loop` was running forever even
+  after `kill_node`. Each killed node kept its heartbeat
+  loop alive and continued to spam `rpc timeout after 2s`
+  errors against unreachable peers, slowing the fuzz
+  harness by 100×+ (a single scenario could take 30s
+  instead of 1s). The heartbeat loop now observes a
+  `StopSignal` and exits cleanly when the node is
+  killed. All four call sites updated
+  (`src/main.rs`, `tests/integration_2pc.rs`, two in
+  `src/raft/sim_harness.rs`).
+
+### Changed (P7 fuzz harness)
+- `protocol::LogEntry::term` is now `pub` (was `pub(crate)`).
+  Required by the fuzz harness's log-equality cross-check
+  which needs to compare `(index, term)` of follower entries
+  against the leader's log.
+- Reference model cross-check now (a) replays the
+  reference model up to the leader's `commit_index` for
+  the leader's linearizability oracle, and (b) verifies
+  each follower's `applied` prefix is `(index, term)`
+  consistent with the leader's log. The previous
+  `last_applied <= leader_commit` check was a false
+  positive — after a leader change, a follower's
+  `last_applied` can transiently exceed the new leader's
+  `commit_index` (Raft §5.4.2: a new leader can't commit
+  entries from previous terms until it commits at least
+  one entry from its own term). What's actually unsafe
+  is divergence: a follower applying an entry the leader
+  has truncated. The new check catches that without
+  flagging transient post-election state.
+
 ### Added (P7 reference model + cross-check)
 - New `src/raft/reference_model.rs` (170 lines): a sequential
   single-threaded HashMap that applies committed `Set` /
