@@ -681,7 +681,10 @@ impl RaftNode {
         println!("✅ [Replay] Successfully replayed {} logs to state machine", self.log.len());
     }
 
-    pub async fn run_heartbeat_loop(node_arc: Arc<RwLock<RaftNode>>) {
+    pub async fn run_heartbeat_loop(
+        node_arc: Arc<RwLock<RaftNode>>,
+        stop: super::net::StopSignal,
+    ) {
         // Pull the clock out of the node once, before entering the
         // loop, so the per-tick hot path doesn't re-lock for it.
         // The clock is `Arc<dyn Clock>`, so cloning is cheap and the
@@ -690,10 +693,19 @@ impl RaftNode {
         // await + periodic thereafter); drift catch-up is best-effort
         // — heartbeat is not a strict periodic obligation, and the
         // previous impl also drifted under scheduler pressure.
+        //
+        // The loop observes `stop` between ticks so that
+        // `SimCluster::kill_node` can shut the heartbeat down
+        // without spawning a parallel task that keeps logging
+        // "peer unreachable" RPC errors forever.
         let clock = node_arc.read().unwrap().clock.clone();
         let period = Duration::from_millis(Config::heartbeat_interval_ms());
         loop {
-            clock.sleep(period).await;
+            tokio::select! {
+                biased;
+                _ = stop.0.notified() => return,
+                _ = clock.sleep(period) => {}
+            }
             let is_leader = node_arc.read().unwrap().state == NodeState::Leader;
             if is_leader {
                 Self::sync_logs(node_arc.clone());

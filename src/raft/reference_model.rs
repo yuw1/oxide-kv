@@ -176,6 +176,74 @@ impl ReferenceModel {
     pub fn applied_index(&self) -> u64 {
         self.next_index.saturating_sub(1)
     }
+
+    /// Reset the reference model to a fresh state. Used
+    /// to recompute the model from a fresh leader's log
+    /// at cross-check time — guards against the
+    /// intermediate-drain race where the cluster's
+    /// leader changes mid-scenario and the reference
+    /// model accumulates ops that the new leader's log
+    /// no longer reflects.
+    pub fn reset(&mut self) {
+        self.state.clear();
+        self.next_index = 1;
+    }
+
+    /// Replay the leader's log from index 1 up to
+    /// `commit_index`, applying each entry in order.
+    /// This recomputes the reference model from scratch
+    /// (after a `reset()`) — useful at the end of a
+    /// fuzz scenario to ensure the reference model is
+    /// in sync with whatever the current leader
+    /// considers committed, regardless of any
+    /// intermediate drains that may have used a
+    /// previous leader's log.
+    pub fn replay_from_leader(
+        &mut self,
+        cluster: &SimCluster,
+        commit_index: u64,
+    ) -> usize {
+        let leader_idx = match cluster.leader_index() {
+            Some(idx) => idx,
+            None => {
+                self.reset();
+                return 0;
+            }
+        };
+        self.replay_from_node(cluster, leader_idx, commit_index)
+    }
+
+    /// Replay `cluster.nodes[leader_idx].log` from index 1
+    /// up to `commit_index`, applying each entry. Caller
+    /// picks the leader explicitly — useful when the
+    /// caller wants to skip a killed node that still has
+    /// state=Leader (its serve loop is stopped, so it
+    /// can't actually replicate, but `cluster.leader_index`
+    /// might still return it).
+    pub fn replay_from_node(
+        &mut self,
+        cluster: &SimCluster,
+        leader_idx: usize,
+        commit_index: u64,
+    ) -> usize {
+        self.reset();
+        let mut applied = 0;
+        while self.next_index <= commit_index {
+            let entry = {
+                let node = cluster.nodes[leader_idx].raft.read().unwrap();
+                match node.get_log_entry(self.next_index) {
+                    Some(e) => e,
+                    None => return applied,
+                }
+            };
+            if self.apply(self.next_index, &entry.command) {
+                applied += 1;
+            } else {
+                break;
+            }
+        }
+        applied
+    }
 }
 
 #[cfg(test)]

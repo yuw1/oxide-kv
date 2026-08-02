@@ -166,8 +166,9 @@ impl SimCluster {
             // drives elections explicitly via
             // `become_candidate`.)
             let hb_node = raft.clone();
+            let hb_stop = stop.clone();
             tokio::spawn(async move {
-                RaftNode::run_heartbeat_loop(hb_node).await;
+                RaftNode::run_heartbeat_loop(hb_node, hb_stop).await;
             });
 
             nodes.push(SimNode {
@@ -469,8 +470,9 @@ impl SimCluster {
         });
 
         let hb_node = raft.clone();
+        let hb_stop = new_stop.clone();
         tokio::spawn(async move {
-            RaftNode::run_heartbeat_loop(hb_node).await;
+            RaftNode::run_heartbeat_loop(hb_node, hb_stop).await;
         });
     }
 

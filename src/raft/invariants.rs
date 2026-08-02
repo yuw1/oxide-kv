@@ -81,6 +81,8 @@ pub enum InvariantViolation {
         node_b: String,
         a_term: u64,
         b_term: u64,
+        a_command: String,
+        b_command: String,
     },
     /// A committed entry was lost or overwritten. After heal, every
     /// node that has applied through index `i` should have the same
@@ -132,10 +134,13 @@ impl fmt::Display for InvariantViolation {
                 node_b,
                 a_term,
                 b_term,
+                a_command,
+                b_command,
             } => write!(
                 f,
-                "LogMatchingProperty violated at index {}: {} term={}, {} term={}",
-                index, node_a, a_term, node_b, b_term
+                "LogMatchingProperty violated at index {}: \
+                 {} (term={}, cmd={}) vs {} (term={}, cmd={})",
+                index, node_a, a_term, a_command, node_b, b_term, b_command
             ),
             InvariantViolation::CommittedEntryDurability {
                 index,
@@ -222,22 +227,49 @@ pub fn check_election_safety(cluster: &SimCluster) -> InvariantResult<()> {
 /// is what the AppendEntries consistency check guarantees entry by
 /// entry.
 pub fn check_log_matching_property(cluster: &SimCluster) -> InvariantResult<()> {
+    // The Log Matching Property (§5.3) says: if two logs
+    // have entries at the same (index, term), they have the
+    // same command. Per §5.4.2 (State Machine Safety), this
+    // only needs to hold for **committed** entries — a
+    // leader is free to overwrite uncommitted entries at an
+    // index with its own term, as long as it wins an
+    // election (which the §5.4.1 election restriction
+    // ensures contains all committed entries).
+    //
+    // We walk every pair of nodes and check entries up to
+    // `min(commit_index_a, commit_index_b)`. Beyond that,
+    // divergent terms are allowed (the new leader may be
+    // mid-overwrite). Without this scoping, the DST false-
+    // positives on early-election races (a follower starts
+    // an election before the previous leader's replication
+    // reaches it; the new leader then legitimately
+    // overwrites the uncommitted entries).
+    //
+    // Note: this is the *minimum* commitment floor across
+    // both nodes — anything less than the lesser of the two
+    // commits is provably committed (Raft's commitment rule
+    // requires majority replication; if both nodes consider
+    // index k committed, then a majority has replicated it
+    // and any future leader must include it in its log).
     for i in 0..cluster.nodes.len() {
         for j in (i + 1)..cluster.nodes.len() {
             let (a, b) = (&cluster.nodes[i], &cluster.nodes[j]);
             let ra = a.raft.read().unwrap();
             let rb = b.raft.read().unwrap();
-            let shared = std::cmp::min(ra.log.len(), rb.log.len());
-            for k in 0..shared {
+            let min_commit =
+                std::cmp::min(ra.commit_index, rb.commit_index) as usize;
+            for k in 0..min_commit {
                 let ea = &ra.log[k];
                 let eb = &rb.log[k];
-                if ea.term != eb.term {
+                if ea.term != eb.term || ea.command != eb.command {
                     return Err(InvariantViolation::LogMatchingProperty {
                         index: (k + 1) as u64,
                         node_a: a.id.clone(),
                         node_b: b.id.clone(),
                         a_term: ea.term,
                         b_term: eb.term,
+                        a_command: fmt_command(&ea.command),
+                        b_command: fmt_command(&eb.command),
                     });
                 }
             }
@@ -660,6 +692,14 @@ mod tests {
                 },
             },
         );
+        // Set commit_index so the invariant (which only
+        // walks the committed range) actually fires on
+        // this case. Without commit_index, divergent
+        // uncommitted entries are legitimately allowed
+        // (a new leader can overwrite an uncommitted
+        // entry from a previous term).
+        cluster.nodes[0].raft.write().unwrap().commit_index = 1;
+        cluster.nodes[1].raft.write().unwrap().commit_index = 1;
 
         let result = check_log_matching_property(&cluster);
         assert!(matches!(
