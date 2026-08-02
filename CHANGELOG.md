@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (P7 invariant checker)
+- `src/raft/invariants.rs` (≈480 lines): four safety invariant
+  checks that DST scenarios call at teardown to catch any
+  latent safety bug, not just the specific behavior under
+  test:
+  - `check_election_safety` — at most one Leader per term
+    (Raft §5.2).
+  - `check_log_matching_property` — entries at the same log
+    index have the same term across nodes (Raft §5.3).
+  - `check_state_machine_safety` — applied entries at the
+    same index have the same command across nodes (Raft
+    §5.4.2).
+  - `check_committed_entry_durability` — at every committed
+    index, every node that has applied up through that index
+    has the same command (catches log truncation, snapshot
+    mis-application).
+  - `check_2pc_atomicity` — every DecideTx tx has the same
+    decision (all-Commit or all-Abort) across all nodes that
+    have it in their log.
+- `SimCluster::submit_command(leader_idx, command)` —
+  generalization of `submit_set` for `BeginTx` / `DecideTx` /
+  `Delete` / `Compact` (DST scenarios need this for tx tests
+  without going through the coordinator fast-path).
+- All existing DST scenarios (raft_dst + raft_dst_log_conflict)
+  now call `assert_invariants(&cluster).expect(...)` at
+  teardown. A safety violation surfaces with a precise
+  location (which invariant, which node pair, which index or
+  tx), not a generic "test X failed somewhere."
+
+### Changed (P7 invariant checker)
+- `protocol::LogEntry::command` was `pub(crate)` — invariant
+  checker reads `node.log[k].command` directly, so visibility
+  is unchanged (still pub(crate) — checker is in-crate).
+
 ### Added (P7 DST scenarios: log conflict / divergent log)
 - `tests/raft_dst_log_conflict.rs` (5 new integration tests):
   - `dst_split_brain_old_leader_truncates_divergent_log`

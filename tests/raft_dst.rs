@@ -87,6 +87,11 @@ async fn dst_leader_failover_preserves_committed_log() {
         n1_last_idx
     );
 
+    // P7 safety invariants: every teardown runs the
+    // four-invariants check so any latent safety bug
+    // surfaces here, not in a future test.
+    oxide_kv::raft::invariants::assert_invariants(&cluster)
+        .expect("safety invariants violated at teardown");
     cluster.shutdown().await;
 }
 
@@ -136,6 +141,11 @@ async fn dst_leader_failover_then_new_leader_accepts_writes() {
         Some("v1".to_string())
     );
 
+    // P7 safety invariants: every teardown runs the
+    // four-invariants check so any latent safety bug
+    // surfaces here, not in a future test.
+    oxide_kv::raft::invariants::assert_invariants(&cluster)
+        .expect("safety invariants violated at teardown");
     cluster.shutdown().await;
 }
 
@@ -218,6 +228,11 @@ async fn dst_election_restriction_stale_candidate_loses() {
         "n1 should win — it has the more recent log"
     );
 
+    // P7 safety invariants: every teardown runs the
+    // four-invariants check so any latent safety bug
+    // surfaces here, not in a future test.
+    oxide_kv::raft::invariants::assert_invariants(&cluster)
+        .expect("safety invariants violated at teardown");
     cluster.shutdown().await;
 }
 
@@ -303,6 +318,11 @@ async fn dst_partition_isolates_leader_minority_wins_then_heal() {
     assert_eq!(cluster.read(2, "k1"), Some("v1".to_string()));
     assert_eq!(cluster.read(2, "k2"), Some("v2".to_string()));
 
+    // P7 safety invariants: every teardown runs the
+    // four-invariants check so any latent safety bug
+    // surfaces here, not in a future test.
+    oxide_kv::raft::invariants::assert_invariants(&cluster)
+        .expect("safety invariants violated at teardown");
     cluster.shutdown().await;
 }
 
