@@ -1,5 +1,5 @@
 use crate::raft::node::{RaftNode, NodeState};
-use crate::protocol::{Command, TxDecision};
+use crate::protocol::Command;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
@@ -183,37 +183,52 @@ impl ClientHandler {
 
     /// Begin a two-phase-commit transaction.
     ///
-    /// On a single-node cluster the leader is the sole participant, so we
-    /// auto-append the matching `DecideTx(Commit)` right after `BeginTx`.
-    /// On a multi-node cluster the coordinator (the leader) will instead
-    /// solicit votes via the side-channel `VoteRequest` RPC (see
-    /// `proto/coordination.proto`) and only then append `DecideTx`. The
-    /// auto-pair below is the single-node fast path; the multi-node path
-    /// lands in PR #13 (see `ROADMAP.md`).
+    /// Delegates to the leader-side coordinator
+    /// (`crate::raft::coordinator::coordinate_tx`). The coordinator
+    /// detects single-node vs multi-node membership and drives the
+    /// appropriate path:
+    ///   - **Single-node**: propose BeginTx + DecideTx(Commit) as one
+    ///     batch.
+    ///   - **Multi-node**: propose BeginTx, broadcast VoteRequest over
+    ///     the multiplexed transport, apply the all-yes quorum policy
+    ///     (textbook 2PC), then propose DecideTx(Commit | Abort).
+    ///
+    /// See `ROADMAP.md` P6 and `src/raft/coordinator.rs` for the locked
+    /// decisions (coordinator = leader, all-yes quorum, side-channel
+    /// vote transport).
     async fn begin_tx(
         tx_id: String,
         ops: Vec<crate::protocol::TxOp>,
         node_arc: &Arc<RwLock<RaftNode>>,
     ) -> serde_json::Value {
-        let mut entries = vec![Command::BeginTx { tx_id: tx_id.clone(), ops }];
-        entries.push(Command::DecideTx {
-            tx_id: tx_id.clone(),
-            decision: TxDecision::Commit,
-        });
-
-        // Propose both as a single batch so they commit together.
-        let (success, first_index) = {
-            let mut node = node_arc.write().unwrap();
-            let ok = node.propose_batch(entries);
-            let first = node.log.len().saturating_sub(1) as u64;
-            (ok, first)
-        };
-
-        if success {
-            RaftNode::sync_logs(node_arc.clone());
-            serde_json::json!({"status": "ok", "tx_id": tx_id, "index": first_index})
-        } else {
-            serde_json::json!({"status": "error"})
+        let outcome =
+            crate::raft::coordinator::coordinate_tx(node_arc.clone(), tx_id.clone(), ops).await;
+        match outcome {
+            crate::raft::coordinator::TxOutcome::Committed {
+                begin_index,
+                decide_index,
+                tx_id,
+            } => serde_json::json!({
+                "status": "ok",
+                "tx_id": tx_id,
+                "decision": "commit",
+                "begin_index": begin_index,
+                "decide_index": decide_index,
+            }),
+            crate::raft::coordinator::TxOutcome::Aborted { tx_id, reason } => {
+                serde_json::json!({
+                    "status": "aborted",
+                    "tx_id": tx_id,
+                    "reason": reason,
+                })
+            }
+            crate::raft::coordinator::TxOutcome::NotLeader { tx_id } => {
+                serde_json::json!({
+                    "status": "error",
+                    "message": "not leader",
+                    "tx_id": tx_id,
+                })
+            }
         }
     }
 }
