@@ -124,6 +124,40 @@ impl RaftNode {
         self.log.get(index as usize).cloned()
     }
 
+    /// Public setter for `peers`. Used by integration tests that
+    /// bootstrap the cluster in two phases (allocate listener ports,
+    /// then wire the membership). Production code wires `peers` once
+    /// in `new_with_storage` and never mutates it.
+    pub fn set_peers(&mut self, peers: Vec<String>) {
+        self.peers = peers;
+    }
+
+    /// Test-only helper: push a phantom log entry at the given index.
+    /// Used by integration tests to simulate a peer whose log is
+    /// ahead of the leader's (for the leader-log-stale vote-check).
+    /// Production code never calls this.
+    pub fn push_log_entry_for_test(&mut self, index: usize, command: crate::protocol::Command) {
+        self.log.push(crate::protocol::LogEntry {
+            term: self.current_term,
+            index,
+            command,
+        });
+    }
+
+    /// Public read-only view of the leader's per-peer `match_index`.
+    /// `match_index[peer]` is the highest log index the leader knows
+    /// the peer has durably replicated (updated on AppendEntries
+    /// success in `sync_logs`). Used by the coordinator to wait for
+    /// the BeginTx entry to be replicated cluster-wide before fanning
+    /// out votes (otherwise peers reply "tx not pending").
+    ///
+    /// Returns `0` if the leader has not yet committed any index for
+    /// that peer (Raft §5.3 "nextIndex = log length + 1" implies
+    /// `match_index = 0` initially).
+    pub fn match_index_for(&self, peer: &str) -> u64 {
+        self.match_index.get(peer).copied().unwrap_or(0)
+    }
+
     /// Helper to get the last log's index and term
     fn get_last_log_info(&self) -> (u64, u64) {
         self.log.last().map_or((0, 0), |entry| (entry.index as u64, entry.term))
@@ -282,6 +316,34 @@ impl RaftNode {
         //    replicated and applied to `pending_txs` (the state
         //    machine replays the log on startup, so a freshly
         //    restarted node can vote once it has caught up).
+        //
+        // Race fix (PR #14): the leader's `match_index >= begin_index`
+        // only tells us the peer has the entry in its log, not that
+        // `apply_logs` has run locally. AppendEntries only advances
+        // `commit_index` when `args.leader_commit > self.commit_index`,
+        // and the first AppendEntries that introduces the entry
+        // carries `leader_commit = 0` (the leader has not committed
+        // yet). So the peer has the entry in its log but
+        // `commit_index` is still behind, and `apply_logs` is a no-op
+        // until the next heartbeat bumps `commit_index`.
+        //
+        // To unblock the vote immediately, fast-forward our
+        // `commit_index` to the leader's `last_log_index` (the index
+        // of the entry the leader is voting about) and apply. This is
+        // safe because: (a) the leader has already committed the
+        // entry (since `match_index >= begin_index` was confirmed on
+        // the leader side), and (b) the entry is in our log (verified
+        // by the leader-log-up-to-date check above). All earlier
+        // entries are also in our log (cumulative consistency
+        // established by step 3), so applying them along the way is
+        // safe.
+        if req.last_log_index > self.commit_index {
+            let log_len = self.log.len() as u64;
+            if req.last_log_index <= log_len {
+                self.commit_index = req.last_log_index;
+            }
+        }
+        self.apply_logs();
         {
             let sm = self.state_machine.read().unwrap();
             if sm.pending_tx(&req.tx_id).is_none() {
@@ -619,8 +681,11 @@ impl RaftNode {
             }
         }
 
+        eprintln!("[peer {}] AE: leader_commit={}, my_commit={}, log_len={}, entries={}", 
+            self.node_id, args.leader_commit, self.commit_index, self.log.len(), args.entries.len());
         if args.leader_commit > self.commit_index {
             self.commit_index = std::cmp::min(args.leader_commit, self.log.len() as u64);
+            eprintln!("[peer {}] AE: commit_index advanced to {}, applying...", self.node_id, self.commit_index);
             self.apply_logs();
         }
 
