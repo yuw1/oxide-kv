@@ -460,7 +460,6 @@ mod tests {
         use crate::state_machine::{StateMachine, StateMachineConfig};
         use prost::Message;
         use std::sync::{Arc, RwLock};
-        use tempfile::TempDir;
 
         // Build a node with a pending tx so the vote can be granted.
         let dir = tempfile::tempdir().unwrap();
@@ -533,7 +532,6 @@ mod tests {
         use crate::raft::storage::RaftStorage;
         use crate::state_machine::{StateMachine, StateMachineConfig};
         use std::sync::{Arc, RwLock};
-        use tempfile::TempDir;
 
         let dir = tempfile::tempdir().unwrap();
         let wal = dir.path().join("u.wal").to_str().unwrap().to_string();
