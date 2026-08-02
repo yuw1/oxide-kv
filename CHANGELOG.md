@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (P7 foundation: SimHarness)
+- `crate::raft::sim_harness` module (~480 lines, 6 tests):
+  - `SimCluster` — a 3-node (or N-node) in-process cluster wired
+    against `SimTransport` + `SimClock`. Each node owns a
+    `tempfile::tempdir` (WAL/meta/snapshot), a `StopSignal`, and
+    a spawned heartbeat loop. No real sockets, no real OS
+    scheduling, no real disk I/O.
+  - `SimCluster::new_3_nodes(scheduler)` / `new_n_nodes(n, scheduler)`
+    — construct the cluster with a shared `FaultScheduler`.
+  - `drive_election(candidate_idx)` — force a candidate via
+    `become_candidate` (skips the 5-10s randomized timer) and
+    poll until the candidate wins.
+  - `submit_set(leader_idx, key, value)` — propose a `Set`
+    command on the leader (returns the log index).
+  - `wait_for_replication(target_index, timeout)` — poll until
+    every node has applied `target_index`.
+  - `read(node_idx, key)` — read from a node's local state
+    machine.
+  - `shutdown()` — stop all serve loops and heartbeat loops.
+- `SimTransport` now implements `Clone` (via
+  `Arc<Mutex<Option<Receiver>>>` on the inbound channel).
+- `tempfile` moved from `[dev-dependencies]` to `[dependencies]`
+  so the harness can live in the library (reusable from any
+  `tests/*.rs`).
+
+### Fixed
+- Single-node cluster election: `become_candidate` on a node
+  with zero peers never transitioned to Leader because the
+  majority check only ran inside the per-peer RPC callback.
+  Added an early return in `request_votes` when
+  `total_nodes == 1` (self-vote is already a majority).
+  Discovered by `sim_harness_1_node_cluster_is_immediately_leader`.
+
 ### Added (P7 foundation: FaultScheduler)
 - `crate::raft::fault_scheduler` module (~530 lines, including
   7 new tests):

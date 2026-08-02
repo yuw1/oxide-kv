@@ -8,4 +8,5 @@ pub(crate) mod coordinator;
 pub mod clock;
 pub mod fault_scheduler;
 pub mod net;
+pub mod sim_harness;
 pub mod sim_transport;

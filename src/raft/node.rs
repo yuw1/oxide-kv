@@ -725,6 +725,16 @@ impl RaftNode {
         let total_nodes = peers.len() + 1;
         let votes_received = Arc::new(std::sync::atomic::AtomicUsize::new(1));
 
+        // Single-node cluster: we already have a majority (1 > 0).
+        // Skip the RPC fan-out entirely and become leader now.
+        if total_nodes == 1 {
+            let mut n = raft_arc.write().unwrap();
+            if n.state == NodeState::Candidate && n.current_term == term {
+                n.become_leader();
+            }
+            return;
+        }
+
         for peer_addr in peers {
             let raft_clone = raft_arc.clone();
             let votes_clone = votes_received.clone();

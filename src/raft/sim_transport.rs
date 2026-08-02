@@ -218,11 +218,18 @@ impl Default for Network {
 /// its own inbound receiver. `send_raft` looks up the target in the
 /// network and pushes. `serve` consumes from the inbound receiver
 /// and dispatches each message to the matching `RaftNode` handler.
+///
+/// `Clone` is implemented by bumping the `Arc` on `inbound`. The
+/// `Mutex<Option<Receiver>>` becomes `Arc<Mutex<Option<Receiver>>>`
+/// so multiple handles to the same transport can each take the
+/// receiver out — only the first `serve` wins; subsequent
+/// `serve`s see `None` and panic.
+#[derive(Clone)]
 pub struct SimTransport {
     #[allow(dead_code)]
     self_id: String,
     network: Network,
-    inbound: Mutex<Option<mpsc::Receiver<InboundMessage>>>,
+    inbound: Arc<Mutex<Option<mpsc::Receiver<InboundMessage>>>>,
 }
 
 impl SimTransport {
@@ -238,7 +245,7 @@ impl SimTransport {
         Self {
             self_id,
             network,
-            inbound: Mutex::new(Some(inbound)),
+            inbound: Arc::new(Mutex::new(Some(inbound))),
         }
     }
 }

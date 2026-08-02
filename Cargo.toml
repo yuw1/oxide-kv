@@ -15,12 +15,16 @@ rand = "0.8"
 bincode = "1.3"
 clap = { version = "4.0", features = ["derive"] }
 prost = "0.13"
+# `tempfile` is used by the SimHarness (P7 foundation) in lib
+# tests + the integration test suite. Keeping it as a regular
+# dependency (not just dev-dep) lets the harness live in the
+# library so it can be reused from any `tests/*.rs`.
+tempfile = "3.10"
 
 [build-dependencies]
 prost-build = "0.13"
 
 [dev-dependencies]
-tempfile = "3.10"
 # `test-util` enables `#[tokio::test(start_paused = true)]`, which
 # the SimClock determinism tests rely on. Feature is only pulled in
 # for dev builds (test compilation), not for the release binary.

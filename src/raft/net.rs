@@ -416,7 +416,6 @@ mod tests {
             // fail before touching the node.
             use crate::raft::storage::RaftStorage;
             use crate::state_machine::{StateMachine, StateMachineConfig};
-            use tempfile::TempDir;
             let dir = tempfile::tempdir().unwrap();
             let storage = RaftStorage::new_with_paths(
                 dir.path().join("t.wal").to_str().unwrap().to_string(),
