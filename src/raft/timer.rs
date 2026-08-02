@@ -1,7 +1,7 @@
 use crate::raft::node::{NodeState, RaftNode};
+use crate::raft::clock::{system_clock, Clock};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
-use tokio::time::Duration as TokioDuration;
 use crate::config::Config;
 
 /// Pure decision function: should the node start a new election at `now`?
@@ -33,6 +33,13 @@ pub async fn run_election_timer(raft: Arc<RwLock<RaftNode>>) {
     // election on every loop iteration → term inflation → leader churn.
     let election_threshold = Duration::from_millis(Config::min_election_timeout_ms());
 
+    // Pull the clock out once. The election timer reads `now()` against
+    // `last_heartbeat` (held inside RaftNode), so it must use the same
+    // clock as the node does. Pulling it from the node guarantees
+    // consistency; in simulation, this is the SimClock the harness
+    // injected at construction time.
+    let clock = raft.read().unwrap().clock.clone();
+
     loop {
         // 1. Randomize the *sleep* duration to spread elections across nodes
         //    and avoid split votes. The sleep is just a polling cadence; it is
@@ -44,7 +51,7 @@ pub async fn run_election_timer(raft: Arc<RwLock<RaftNode>>) {
                 Config::min_election_timeout_ms()..Config::max_election_timeout_ms(),
             )
         };
-        tokio::time::sleep(TokioDuration::from_millis(sleep_ms)).await;
+        clock.sleep(Duration::from_millis(sleep_ms)).await;
 
         // 2. Snapshot the state under the read lock, then release before
         //    deciding + sleeping. This keeps the critical section short.
@@ -53,7 +60,7 @@ pub async fn run_election_timer(raft: Arc<RwLock<RaftNode>>) {
             (node.state, node.last_heartbeat)
         };
 
-        if !should_start_election(state, last_heartbeat, Instant::now(), election_threshold) {
+        if !should_start_election(state, last_heartbeat, clock.now(), election_threshold) {
             continue;
         }
 
@@ -63,7 +70,7 @@ pub async fn run_election_timer(raft: Arc<RwLock<RaftNode>>) {
             let mut rng = rand::thread_rng();
             rand::Rng::gen_range(&mut rng, 0u64..200u64)
         };
-        tokio::time::sleep(TokioDuration::from_millis(jitter_ms)).await;
+        clock.sleep(Duration::from_millis(jitter_ms)).await;
 
         // 4. Re-check after jitter: another path (incoming heartbeat, vote
         //    reply with higher term, etc.) may have refreshed `last_heartbeat`
@@ -73,7 +80,7 @@ pub async fn run_election_timer(raft: Arc<RwLock<RaftNode>>) {
             let node = raft.read().unwrap();
             (node.state, node.last_heartbeat)
         };
-        if should_start_election(state2, last_heartbeat2, Instant::now(), election_threshold) {
+        if should_start_election(state2, last_heartbeat2, clock.now(), election_threshold) {
             println!(
                 "⏰ Election timeout (slept {}ms + {}ms jitter), starting election...",
                 sleep_ms, jitter_ms
@@ -81,6 +88,16 @@ pub async fn run_election_timer(raft: Arc<RwLock<RaftNode>>) {
             RaftNode::become_candidate(raft.clone());
         }
     }
+}
+
+/// Helper used by `main.rs` and tests to bootstrap the election
+/// timer on a freshly constructed `RaftNode` that already has a
+/// `clock` injected. Today this is just `system_clock()`; it exists
+/// so future test wiring has a single seam to substitute a `SimClock`
+/// without grepping for every callsite.
+#[allow(dead_code)]
+pub fn default_clock() -> Arc<dyn Clock> {
+    system_clock()
 }
 
 #[cfg(test)]

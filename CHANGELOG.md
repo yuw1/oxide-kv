@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (P7 foundation: clock abstraction)
+- New `crate::raft::clock::Clock` trait + `SystemClock` production impl.
+- `RaftNode::new_with_clock(...)` constructor for injecting a custom
+  clock; production `new` / `new_with_storage` default to
+  `SystemClock`.
+- All `last_heartbeat` / `last_quorum_heartbeat_at` /
+  `ReadIndex::issued_at` stamps (7 production sites in
+  `RaftNode`) now route through `self.clock.now()` instead of
+  `Instant::now()`.
+- Election timer (`raft::timer::run_election_timer`) and heartbeat
+  loop (`RaftNode::run_heartbeat_loop`) now pull the clock from the
+  node and use `clock.sleep(d)` instead of `tokio::time::sleep` /
+  `tokio::time::interval`, so a future `SimClock` can drive virtual
+  time without touching the consensus code.
+- 3 new unit tests for `SystemClock` (monotonicity, Arc object
+  safety, real-sleep smoke test).
+
 ### Changed (roadmap)
 - P6 (multi-node 2PC coordinator RPC) marked complete (PR #11–#14 merged).
 - P7 pinned as the active phase: **Deterministic simulation testing (DST)**
