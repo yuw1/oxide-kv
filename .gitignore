@@ -1,3 +1,5 @@
 /target
 .idea/
 .DS_Store
+/data
+/127.0.0.1:*

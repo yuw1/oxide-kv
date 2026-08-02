@@ -262,6 +262,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `state_machine::tests::record_vote_updates_pending_tx_view`). Net
   +8 tests vs. PR #10 baseline (116 → 124).
 
+### Added (P6 — 2PC coordinator RPC transport, PR #12)
+- **Multiplexed inter-node transport** (`src/raft/transport.rs`):
+  the existing Raft TCP listener now carries two RPC surfaces,
+  discriminated by a 1-byte prefix:
+  - `0x01` — Raft consensus RPCs (RequestVote, AppendEntries,
+    InstallSnapshot and their replies) — unchanged semantically.
+  - `0x02` — 2PC coordinator vote RPC (`VoteRequest` /
+    `VoteResponse`), the side-channel introduced in P6.
+  - Wire format: `[kind:u8][length:u32 BE][protobuf payload]`.
+    The discriminator keeps the single-port topology the project
+    has shipped with since P3 (no second port for vote RPCs);
+    rationale recorded in `ROADMAP.md` P6 section.
+  - 16 MiB per-frame cap (`MAX_FRAME_BYTES`) so a hostile or
+    buggy peer cannot force unbounded memory allocation.
+  - `DispatchKind::from_byte` rejects unknown discriminators so
+    frames never get silently misrouted.
+- **`RpcClient::send_tx_vote_rpc`** (`src/raft/rpc.rs`): client-side
+  half of the vote RPC. Connects to a peer, writes a `Vote`
+  envelope, and decodes the `VoteResponse`. Carries the
+  P6-configurable timeout so the future coordinator (PR #13) can
+  drive vote collection without blocking on a slow peer.
+- **`RpcServer::dispatch` + `dispatch_on`** (`src/raft/rpc.rs`):
+  reads the discriminator and routes each connection to the
+  matching handler. The existing `handle_raft_rpc` name is
+  preserved as an alias so older call sites and any external
+  tooling that imported the symbol keep working.
+- **`RaftNode::handle_tx_vote_request`** (`src/raft/node.rs`):
+  receiver-side decision for the vote RPC. Implements the all-yes
+  2PC policy locked at PR #11: rejects stale terms, adopts newer
+  terms but defers the vote to the elected leader of the new
+  term, rejects when the `BeginTx` log entry is not yet pending
+  locally, mirrors Raft's election-restriction log-up-to-date
+  check, and on a grant records a `Vote::Yes` on the local
+  state machine so a future `DecideTx(Commit)` can apply the
+  operations atomically.
+
+### Changed / Breaking (P6 — PR #12)
+- **Wire format on the inter-node listener is now prefixed with a
+  1-byte discriminator.** Pre-P6 peers sending `[length:4][payload]`
+  frames will be rejected as `unknown protocol discriminator`.
+  This is acceptable because no inter-node deployment exists
+  yet (P6 is the first phase to drive multi-node behavior) and
+  the cutover was performed as a single coordinated change in
+  this PR.
+
+### Test suite (140 tests, all passing)
+- 9 new in `transport::tests` (envelope round-trip, large payload,
+  EOF before byte, unknown discriminator, oversized length,
+  zero-length discriminator, `from_byte` known/unknown values).
+- 5 new in `raft::node::tests` (`handle_tx_vote_request` coverage:
+  stale term, term advance, tx not pending, leader log stale,
+  grant + state machine `record_vote`).
+- 2 new in `raft::rpc::tests` (`vote_rpc_dispatch_roundtrip_on_duplex`,
+  `dispatch_on_rejects_unknown_discriminator`).
+- Net +16 tests vs. PR #11 baseline (124 → 140). All previous
+  124 tests still pass; no regressions.
+
 ## [0.1.0] - 2026-02-24
 
 ### Added
