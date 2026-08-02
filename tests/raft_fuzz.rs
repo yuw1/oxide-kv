@@ -20,6 +20,10 @@
 //!
 //! - `SubmitSet { key, value }` — propose a `Set` op on the leader.
 //! - `SubmitDelete { key }` — propose a `Delete` op on the leader.
+//! - `SubmitTx { tx_id, ops }` — drive a full 2PC round on the
+//!   leader via the real coordinator (`BeginTx` → vote fan-out →
+//!   `DecideTx`). Exercises the 2PC-atomicity invariant and the
+//!   reference model's transaction handling under faults.
 //! - `DriveElection { candidate_idx }` — start a new election.
 //! - `KillNode { idx }` — crash a follower.
 //! - `RestartNode { idx }` — bring back a killed node.
@@ -31,7 +35,7 @@
 //! Each action is parameterized with a random sample from the
 //! fuzzer's seeded RNG, so the same seed always produces the same
 //! sequence. When a cross-check fails, the fuzzer logs the seed
-//! + the action sequence up to the failure so the bug can be
+//! plus the action sequence up to the failure so the bug can be
 //! reproduced.
 //!
 //! # Throughput
@@ -57,7 +61,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use oxide_kv::raft::fault_scheduler::{AlwaysDeliver, LinkId, PartitionedNetwork};
+use oxide_kv::protocol::TxOp;
+use oxide_kv::raft::fault_scheduler::{LinkId, PartitionedNetwork};
 use oxide_kv::raft::invariants::assert_invariants;
 use oxide_kv::raft::node::NodeState;
 use oxide_kv::raft::reference_model::ReferenceModel;
@@ -68,6 +73,7 @@ use oxide_kv::raft::sim_harness::SimCluster;
 enum Action {
     SubmitSet { key: String, value: String },
     SubmitDelete { key: String },
+    SubmitTx { tx_id: String, ops: Vec<TxOp> },
     DriveElection { candidate_idx: usize },
     KillNode { idx: usize },
     RestartNode { idx: usize },
@@ -85,6 +91,9 @@ impl Action {
             }
             Action::SubmitDelete { key } => {
                 format!("SubmitDelete {{ key: {:?} }}", key)
+            }
+            Action::SubmitTx { tx_id, ops } => {
+                format!("SubmitTx {{ tx_id: {:?}, ops: {} }}", tx_id, ops.len())
             }
             Action::DriveElection { candidate_idx } => {
                 format!("DriveElection {{ candidate_idx: {} }}", candidate_idx)
@@ -142,12 +151,18 @@ impl FuzzRng {
 /// vocabulary is constrained).
 fn generate_actions(rng: &mut FuzzRng, len: usize, n_nodes: usize) -> Vec<Action> {
     let mut out = Vec::with_capacity(len);
+    let mut tx_counter = 0u64;
     for _ in 0..len {
         // Bias the distribution toward "useful" actions:
-        // 40% ops, 20% kills/restarts, 20% partitions,
-        // 10% elections, 10% yields.
+        // 30% plain ops, 12% 2PC tx, 18% kills/restarts,
+        // 18% partitions, 12% elections, 10% yields.
+        //
+        // 2PC is deliberately a minority of the mix: a faulted
+        // tx round blocks ~2s on the vote-RPC wall-clock timeout
+        // before aborting, so a high tx fraction would push
+        // faulted scenarios toward the 15s scenario deadline.
         let roll = rng.next_u64() % 100;
-        let action = if roll < 40 {
+        let action = if roll < 30 {
             if rng.next_bool() {
                 Action::SubmitSet {
                     key: format!("k{}", rng.next_u64() % 8),
@@ -158,6 +173,27 @@ fn generate_actions(rng: &mut FuzzRng, len: usize, n_nodes: usize) -> Vec<Action
                     key: format!("k{}", rng.next_u64() % 8),
                 }
             }
+        } else if roll < 42 {
+            // A 2PC transaction with 1-3 ops over the same
+            // key space as plain ops, so tx effects and plain
+            // effects interleave and can conflict.
+            let n_ops = 1 + (rng.next_u64() % 3) as usize;
+            let mut ops = Vec::with_capacity(n_ops);
+            for _ in 0..n_ops {
+                if rng.next_bool() {
+                    ops.push(TxOp::Put {
+                        key: format!("k{}", rng.next_u64() % 8),
+                        value: format!("v{}", rng.next_u64() % 8),
+                    });
+                } else {
+                    ops.push(TxOp::Delete {
+                        key: format!("k{}", rng.next_u64() % 8),
+                    });
+                }
+            }
+            let tx_id = format!("tx-{}", tx_counter);
+            tx_counter += 1;
+            Action::SubmitTx { tx_id, ops }
         } else if roll < 60 {
             let idx = rng.next_usize(n_nodes);
             if rng.next_bool() {
@@ -165,7 +201,7 @@ fn generate_actions(rng: &mut FuzzRng, len: usize, n_nodes: usize) -> Vec<Action
             } else {
                 Action::RestartNode { idx }
             }
-        } else if roll < 80 {
+        } else if roll < 78 {
             let from = rng.next_usize(n_nodes);
             let to = rng.next_usize(n_nodes);
             if from != to {
@@ -191,18 +227,18 @@ async fn run_scenario(seed: u64, action_len: usize) -> Result<(), String> {
     let mut rng = FuzzRng::new(seed);
     let actions = generate_actions(&mut rng, action_len, 3);
 
-    // Build a cluster with both an AlwaysDeliver (used by
-    // most traffic) and a partition controller (manipulated
-    // by PartitionLink / HealPartitions actions). We use the
-    // PartitionedNetwork from the start so we can flip
-    // individual links without rebuilding.
+    // Build a cluster with a partition controller
+    // (manipulated by PartitionLink / HealPartitions
+    // actions). We use the PartitionedNetwork from the
+    // start so we can flip individual links without
+    // rebuilding.
     //
-    // We pass `AlwaysDeliver` as the scheduler so individual
-    // message-level faults (drop / delay / reorder) are
-    // off during fuzz. The fuzzer exercises only
-    // link-level partitions + node crashes. Message-level
-    // faults are covered by the unit tests in PR #21 and
-    // the integration tests in PR #26.
+    // We pass the partition controller as the scheduler
+    // so individual message-level faults (drop / delay /
+    // reorder) are off during fuzz. The fuzzer exercises
+    // only link-level partitions + node crashes.
+    // Message-level faults are covered by the unit tests
+    // in PR #21 and the integration tests in PR #26.
     let partition = Arc::new(PartitionedNetwork::new());
     let scheduler: Arc<dyn oxide_kv::raft::fault_scheduler::FaultScheduler> =
         partition.clone();
@@ -248,6 +284,28 @@ async fn run_scenario(seed: u64, action_len: usize) -> Result<(), String> {
                     let _ = cluster.submit_command(leader, cmd);
                 }
             }
+            Action::SubmitTx { tx_id, ops } => {
+                // Drive a real 2PC round on the current leader.
+                // Bounded to 1s: a healthy round completes in
+                // ~500ms (heartbeat-driven replication in the
+                // sim); a faulted round (partition / killed peer)
+                // would otherwise stall on the coordinator's 2s
+                // vote-RPC / 5s replication-wait bounds. The 1s
+                // cap keeps a faulted tx cheap so the sweep stays
+                // CI-bounded. Cancelling a round is safe: at worst
+                // it leaves `BeginTx` committed with no `DecideTx`
+                // (a pending tx), which is invisible to reads and
+                // tolerated by both the 2PC-atomicity invariant
+                // and the reference model. `run_tx` cancels the
+                // round on timeout (see SimCluster::run_tx docs),
+                // so no background coordinator can land a late
+                // DecideTx after our cross-checks.
+                if let Some(leader) = cluster.leader_index() {
+                    let _ = cluster
+                        .run_tx(leader, tx_id.clone(), ops.clone(), Duration::from_secs(1))
+                        .await;
+                }
+            }
             Action::DriveElection { candidate_idx } => {
                 let _ = cluster
                     .try_drive_election(*candidate_idx, Duration::from_millis(500))
@@ -288,9 +346,16 @@ async fn run_scenario(seed: u64, action_len: usize) -> Result<(), String> {
         // asserts cluster reads match the reference
         // model; for that to be meaningful we need the
         // entry to have committed.
+        //
+        // `SubmitTx` is included: `run_tx` awaits the round
+        // to completion (or its 3s bound), so on return the
+        // leader's commit_index already covers the BeginTx
+        // and (for a committed round) the DecideTx. Draining
+        // here keeps the reference model's staged/committed
+        // tx state in step with the leader.
         if matches!(
             action,
-            Action::SubmitSet { .. } | Action::SubmitDelete { .. }
+            Action::SubmitSet { .. } | Action::SubmitDelete { .. } | Action::SubmitTx { .. }
         ) {
             // Drain the reference model up to the
             // current leader's commit_index (which may
@@ -312,15 +377,14 @@ async fn run_scenario(seed: u64, action_len: usize) -> Result<(), String> {
         if matches!(
             action,
             Action::HealPartitions | Action::RestartNode { .. }
-        ) {
-            if let Some(leader) = cluster.leader_index() {
-                let commit_idx = cluster.nodes[leader]
-                    .raft
-                    .read()
-                    .unwrap()
-                    .commit_index;
-                rm.drain_to(&cluster, commit_idx);
-            }
+        ) && let Some(leader) = cluster.leader_index()
+        {
+            let commit_idx = cluster.nodes[leader]
+                .raft
+                .read()
+                .unwrap()
+                .commit_index;
+            rm.drain_to(&cluster, commit_idx);
         }
 
         // If this is the last action, log progress for

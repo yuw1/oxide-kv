@@ -14,20 +14,21 @@
 //! # What it covers
 //!
 //! Raft guarantees linearizability for the state-machine
-//! commands (`Set`, `Delete`) that get committed. The
-//! reference model doesn't model 2PC (`BeginTx` / `DecideTx`)
-//! directly — the integration tests in
-//! `tests/integration_2pc.rs` already exercise that path end
-//! to end — and it ignores `Compact` (which is a Raft-internal
+//! commands (`Set`, `Delete`) that get committed, and 2PC
+//! atomicity for transactions (`BeginTx` / `DecideTx`). The
+//! reference model models both: plain KV ops apply immediately,
+//! while a transaction's ops stay staged (invisible) until a
+//! matching `DecideTx(Commit)` applies them atomically — an
+//! `Abort` discards them. `Compact` is ignored (a Raft-internal
 //! marker, not a state-machine mutation).
 //!
 //! The cross-check is: after every `submit_set` /
-//! `submit_delete`, the cluster's `commit_index` advances by
-//! 1 on a quorum. The reference model applies that entry in
-//! order. Every `cluster.read(node, key)` should return the
-//! same value the reference model would produce *at the same
-//! committed-index prefix*. If not, the cluster is serving a
-//! stale or anomalous state.
+//! `submit_delete` / `submit_tx`, the cluster's `commit_index`
+//! advances on a quorum. The reference model applies each
+//! committed entry in order. Every `cluster.read(node, key)`
+//! should return the same value the reference model would
+//! produce *at the same committed-index prefix*. If not, the
+//! cluster is serving a stale or anomalous state.
 //!
 //! # What it does NOT cover
 //!
@@ -56,16 +57,32 @@
 
 use std::collections::HashMap;
 
-use crate::protocol::Command;
+use crate::protocol::{Command, TxDecision, TxOp};
 
 use super::sim_harness::SimCluster;
 
 /// Sequential reference model. Single-threaded HashMap that
 /// applies committed `Set` / `Delete` commands in log-index
 /// order.
+///
+/// # 2PC modelling
+///
+/// The model also tracks two-phase-commit transactions so the
+/// fuzz harness can cross-check committed tx effects. A
+/// `BeginTx` stages its ops in `pending` (invisible to reads);
+/// a `DecideTx(Commit)` applies them atomically; a
+/// `DecideTx(Abort)` discards them. A `DecideTx` for an
+/// unknown `tx_id` is a no-op (the coordinator may abort a tx
+/// whose `BeginTx` never committed, e.g. after a leader
+/// step-down). This mirrors `StateMachine::begin_tx` /
+/// `decide_tx` exactly, so the model and the real state
+/// machine agree on every committed prefix.
 #[derive(Debug, Default, Clone)]
 pub struct ReferenceModel {
     state: HashMap<String, String>,
+    /// Staged-but-undecided 2PC transactions, keyed by tx_id.
+    /// Populated by `BeginTx`, drained by `DecideTx`.
+    pending: HashMap<String, Vec<TxOp>>,
     /// The log index of the *next* entry to apply.
     /// Raft log indices start at 1 (per the thesis), so
     /// a freshly-created model has `next_index = 1`.
@@ -76,6 +93,7 @@ impl ReferenceModel {
     pub fn new() -> Self {
         Self {
             state: HashMap::new(),
+            pending: HashMap::new(),
             next_index: 1,
         }
     }
@@ -115,10 +133,32 @@ impl ReferenceModel {
             // Compact: Raft-internal marker, no
             // state-machine effect.
             Command::Compact => {}
-            // 2PC ops: out of scope for the KV
-            // linearizability check. The integration
-            // tests cover them.
-            Command::BeginTx { .. } | Command::DecideTx { .. } => {}
+            // 2PC: stage ops on BeginTx; apply or discard
+            // atomically on DecideTx. Mirrors
+            // `StateMachine::begin_tx` / `decide_tx` so the
+            // model agrees with the real state machine on
+            // every committed prefix.
+            Command::BeginTx { tx_id, ops } => {
+                self.pending.insert(tx_id.clone(), ops.clone());
+            }
+            Command::DecideTx { tx_id, decision } => {
+                if let Some(ops) = self.pending.remove(tx_id)
+                    && matches!(decision, TxDecision::Commit)
+                {
+                    for op in ops {
+                        match op {
+                            TxOp::Put { key, value } => {
+                                self.state.insert(key, value);
+                            }
+                            TxOp::Delete { key } => {
+                                self.state.remove(&key);
+                            }
+                        }
+                    }
+                }
+                // Abort (or unknown tx_id): dropping the staged
+                // ops is the whole effect.
+            }
             // Get: a read op that shouldn't appear in the
             // log (it's handled by the client layer). If
             // we see one, ignore it — the production
@@ -186,6 +226,7 @@ impl ReferenceModel {
     /// no longer reflects.
     pub fn reset(&mut self) {
         self.state.clear();
+        self.pending.clear();
         self.next_index = 1;
     }
 
@@ -314,5 +355,113 @@ mod tests {
         assert_eq!(snap.len(), 2);
         assert_eq!(snap.get("a"), Some(&"1".to_string()));
         assert_eq!(snap.get("b"), Some(&"2".to_string()));
+    }
+
+    // =================== 2PC modelling ===================
+
+    #[test]
+    fn reference_model_begin_tx_stages_ops_invisibly() {
+        let mut rm = ReferenceModel::new();
+        // BeginTx stages ops but they must NOT be readable yet.
+        assert!(rm.apply(
+            1,
+            &Command::BeginTx {
+                tx_id: "t1".into(),
+                ops: vec![TxOp::Put { key: "a".into(), value: "1".into() }],
+            }
+        ));
+        assert_eq!(rm.get("a"), None, "staged ops must be invisible pre-commit");
+        assert_eq!(rm.applied_index(), 1);
+    }
+
+    #[test]
+    fn reference_model_decide_commit_applies_atomically() {
+        let mut rm = ReferenceModel::new();
+        rm.apply(
+            1,
+            &Command::BeginTx {
+                tx_id: "t1".into(),
+                ops: vec![
+                    TxOp::Put { key: "a".into(), value: "1".into() },
+                    TxOp::Put { key: "b".into(), value: "2".into() },
+                ],
+            },
+        );
+        assert!(rm.apply(
+            2,
+            &Command::DecideTx { tx_id: "t1".into(), decision: TxDecision::Commit }
+        ));
+        assert_eq!(rm.get("a"), Some(&"1".to_string()));
+        assert_eq!(rm.get("b"), Some(&"2".to_string()));
+    }
+
+    #[test]
+    fn reference_model_decide_abort_discards_ops() {
+        let mut rm = ReferenceModel::new();
+        rm.apply(1, &Command::Set { key: "a".into(), value: "pre".into() });
+        rm.apply(
+            2,
+            &Command::BeginTx {
+                tx_id: "t1".into(),
+                ops: vec![TxOp::Put { key: "a".into(), value: "new".into() }],
+            },
+        );
+        assert!(rm.apply(
+            3,
+            &Command::DecideTx { tx_id: "t1".into(), decision: TxDecision::Abort }
+        ));
+        // Abort must leave the pre-tx value intact.
+        assert_eq!(rm.get("a"), Some(&"pre".to_string()));
+    }
+
+    #[test]
+    fn reference_model_decide_delete_op_applies() {
+        let mut rm = ReferenceModel::new();
+        rm.apply(1, &Command::Set { key: "a".into(), value: "1".into() });
+        rm.apply(
+            2,
+            &Command::BeginTx {
+                tx_id: "t1".into(),
+                ops: vec![TxOp::Delete { key: "a".into() }],
+            },
+        );
+        rm.apply(
+            3,
+            &Command::DecideTx { tx_id: "t1".into(), decision: TxDecision::Commit },
+        );
+        assert_eq!(rm.get("a"), None);
+    }
+
+    #[test]
+    fn reference_model_decide_unknown_tx_is_no_op() {
+        let mut rm = ReferenceModel::new();
+        rm.apply(1, &Command::Set { key: "a".into(), value: "1".into() });
+        // DecideTx for a tx that was never begun: no-op, no panic.
+        assert!(rm.apply(
+            2,
+            &Command::DecideTx { tx_id: "ghost".into(), decision: TxDecision::Commit }
+        ));
+        assert_eq!(rm.get("a"), Some(&"1".to_string()));
+        assert_eq!(rm.applied_index(), 2);
+    }
+
+    #[test]
+    fn reference_model_reset_clears_pending_txs() {
+        let mut rm = ReferenceModel::new();
+        rm.apply(
+            1,
+            &Command::BeginTx {
+                tx_id: "t1".into(),
+                ops: vec![TxOp::Put { key: "a".into(), value: "1".into() }],
+            },
+        );
+        rm.reset();
+        // After reset, a DecideTx for the old tx must be a no-op
+        // (the staged ops are gone), not a resurrection.
+        rm.apply(
+            1,
+            &Command::DecideTx { tx_id: "t1".into(), decision: TxDecision::Commit },
+        );
+        assert_eq!(rm.get("a"), None);
     }
 }
