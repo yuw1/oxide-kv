@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="faceTop" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#F4AC66"/>
+      <stop offset="1" stop-color="#E07B2E"/>
+    </linearGradient>
+    <linearGradient id="faceLeft" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#C1440E"/>
+      <stop offset="1" stop-color="#9A3409"/>
+    </linearGradient>
+    <linearGradient id="faceRight" x1="1" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#8A2F08"/>
+      <stop offset="1" stop-color="#5E2005"/>
+    </linearGradient>
+    <radialGradient id="leaderGlow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#FFC07A" stop-opacity="0.9"/>
+      <stop offset="0.4" stop-color="#F2913F" stop-opacity="0.4"/>
+      <stop offset="1" stop-color="#F2913F" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- ===== Isometric oxide crystal (cube) ===== -->
+  <polygon points="377,186 377,326 256,396 256,256" fill="url(#faceRight)"/>
+  <polygon points="135,186 256,256 256,396 135,326" fill="url(#faceLeft)"/>
+  <polygon points="256,116 377,186 256,256 135,186" fill="url(#faceTop)"/>
+
+  <!-- Lit top ridges -->
+  <g stroke="#FFE0B8" stroke-width="2.5" stroke-linecap="round" opacity="0.9" fill="none">
+    <line x1="256" y1="116" x2="135" y2="186"/>
+    <line x1="256" y1="116" x2="377" y2="186"/>
+  </g>
+  <!-- Inner facet ridges -->
+  <g stroke="#3A1403" stroke-width="1.5" opacity="0.3" fill="none">
+    <line x1="256" y1="256" x2="256" y2="396"/>
+    <line x1="256" y1="256" x2="135" y2="186"/>
+    <line x1="256" y1="256" x2="377" y2="186"/>
+  </g>
+
+  <!-- Network ring connecting the 6 outer nodes -->
+  <g stroke="#FFC793" stroke-width="2" stroke-linecap="round" opacity="0.6" fill="none">
+    <line x1="256" y1="116" x2="377" y2="186"/>
+    <line x1="377" y1="186" x2="377" y2="326"/>
+    <line x1="377" y1="326" x2="256" y2="396"/>
+    <line x1="256" y1="396" x2="135" y2="326"/>
+    <line x1="135" y1="326" x2="135" y2="186"/>
+    <line x1="135" y1="186" x2="256" y2="116"/>
+  </g>
+
+  <!-- Data packets on the ring (midpoints of edges) -->
+  <g fill="#FFE6C8">
+    <circle cx="316.5" cy="151"   r="3.5"/>
+    <circle cx="377"   cy="256"   r="3.5"/>
+    <circle cx="316.5" cy="361"   r="3.5"/>
+    <circle cx="195.5" cy="361"   r="3.5"/>
+    <circle cx="135"   cy="256"   r="3.5"/>
+    <circle cx="195.5" cy="151"   r="3.5"/>
+  </g>
+
+  <!-- Follower nodes -->
+  <g>
+    <circle cx="377" cy="186" r="11" fill="#1A0D06"/>
+    <circle cx="377" cy="326" r="11" fill="#1A0D06"/>
+    <circle cx="256" cy="396" r="11" fill="#1A0D06"/>
+    <circle cx="135" cy="326" r="11" fill="#1A0D06"/>
+    <circle cx="135" cy="186" r="11" fill="#1A0D06"/>
+    <g fill="none" stroke="#F2913F" stroke-width="3.5">
+      <circle cx="377" cy="186" r="11"/>
+      <circle cx="377" cy="326" r="11"/>
+      <circle cx="256" cy="396" r="11"/>
+      <circle cx="135" cy="326" r="11"/>
+      <circle cx="135" cy="186" r="11"/>
+    </g>
+  </g>
+
+  <!-- Leader node at apex -->
+  <circle cx="256" cy="116" r="30" fill="url(#leaderGlow)"/>
+  <circle cx="256" cy="116" r="13" fill="#FFE0B8"/>
+  <circle cx="256" cy="116" r="13" fill="none" stroke="#C1440E" stroke-width="3"/>
+</svg>

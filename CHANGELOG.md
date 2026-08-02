@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (project branding)
+- Project logo under `assets/` (`logo-light.svg` for light themes,
+  `logo-dark.svg` for dark themes)
+- README hero: theme-aware logo via `<picture>` (dark/light SVG variants),
+  centered title, tagline, and badge row
+
 ### Added
 - Apache-2.0 LICENSE file
 - This CHANGELOG file
