@@ -382,8 +382,7 @@ impl SimCluster {
     /// - Its heartbeat loop is stopped.
     /// - Its state is forced to Follower (simulating "this
     ///   node has been removed from the cluster"). This is a
-    ///   slightly stronger guarantee than real Raft provides —
-    ///   in production a leader that loses quorum eventually
+    ///   slightly stronger guarantee than real Raft provides —   in production a leader that loses quorum eventually
     ///   steps down on the next election timeout, but in the
     ///   DST harness election timers aren't running. Forcing
     ///   the state change makes `leader_index()` deterministic
@@ -409,6 +408,70 @@ impl SimCluster {
         self.nodes[node_idx].stop.stop();
         // Give the tasks a moment to observe the stop signal.
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    /// Re-spawn a previously-killed node's serve loop and
+    /// heartbeat loop. Used to model "node restarts after crash
+    /// and rejoins the cluster."
+    ///
+    /// After this returns, the node's inbound channel is open
+    /// again and the leader's heartbeat will reach it on the
+    /// next round. The node's in-memory `RaftNode` state is
+    /// preserved — that is, we don't simulate disk reload here.
+    /// This is a deliberate simplification: Oxide-KV persists
+    /// term / vote / log to WAL, so on a real restart the
+    /// in-memory state *would* match the on-disk state. The
+    /// DST doesn't need to verify the reload path; that is
+    /// covered by the integration tests in
+    /// `tests/integration_2pc.rs`.
+    ///
+    /// Calling `restart_node` on a node that's still running
+    /// is a no-op (we just no-op the re-spawn; the existing
+    /// serve / heartbeat tasks keep going).
+    pub async fn restart_node(&mut self, node_idx: usize) {
+        // Stop the existing tasks (idempotent — if they're
+        // already stopped, the second stop() is a no-op on
+        // a Notify).
+        self.nodes[node_idx].stop.stop();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // The previous serve loop consumed the inbound
+        // receiver and then dropped it (when stop was
+        // observed). The sender side, held by `Network::peers`,
+        // is now a dead sender — every push to it fails with
+        // "channel closed" and surfaces to the sender as
+        // `TransportError::Unreachable`. We re-register a fresh
+        // inbound channel so the sender side has a live
+        // receiver to push to.
+        let id = self.nodes[node_idx].id.clone();
+        let transport = self.nodes[node_idx].transport.clone();
+        let new_rx = transport.network.re_register(&id);
+        transport.replace_inbound(new_rx);
+
+        // Re-spawn fresh serve + heartbeat tasks with a
+        // fresh StopSignal. The RaftNode itself is reused
+        // — its in-memory state (term, vote, log, state
+        // machine handle) survives the restart. This is a
+        // deliberate simplification of "real restart" which
+        // would discard and reload from disk; the DST
+        // doesn't need to verify that path.
+        let raft = self.nodes[node_idx].raft.clone();
+        let new_stop = StopSignal::new();
+        // Replace the stored StopSignal so a subsequent
+        // shutdown() reaches the new tasks.
+        self.nodes[node_idx].stop = new_stop.clone();
+
+        let serve_node = raft.clone();
+        let serve_stop = new_stop.clone();
+        let serve_transport = transport.clone();
+        tokio::spawn(async move {
+            let _ = serve_transport.serve(serve_node, serve_stop).await;
+        });
+
+        let hb_node = raft.clone();
+        tokio::spawn(async move {
+            RaftNode::run_heartbeat_loop(hb_node).await;
+        });
     }
 
     /// Read the current `current_term` of a node. Tests use this to
@@ -676,6 +739,65 @@ mod tests {
         // Leader).
         cluster.wait_for_replication(idx, Duration::from_secs(5)).await;
         assert_eq!(cluster.read(0, "k"), Some("v".to_string()));
+
+        cluster.shutdown().await;
+    }
+
+    /// DST scenario: kill a follower, restart it, and verify
+    /// the leader's heartbeat reaches it on the next round and
+    /// the follower catches up to the leader's log.
+    #[tokio::test]
+    async fn sim_harness_kill_then_restart_node_catches_up() {
+        let mut cluster = SimCluster::new_3_nodes(Arc::new(AlwaysDeliver)).await;
+        cluster.drive_election(0).await;
+        let leader_idx = cluster.leader_index().unwrap();
+        // Use n2 as the follower we'll kill. n2 is currently
+        // a follower with an empty log.
+        let victim = 2;
+
+        // Submit a Set before the kill; it should replicate
+        // to n2.
+        let idx_before = cluster.submit_set(leader_idx, "before_kill", "v1");
+        cluster
+            .wait_for_replication_except(idx_before, &[victim], Duration::from_secs(5))
+            .await;
+        assert_eq!(cluster.read(victim, "before_kill"), Some("v1".to_string()));
+
+        // Kill n2.
+        cluster.kill_node(victim).await;
+
+        // Submit another Set; it replicates to n1 only.
+        let idx_after = cluster.submit_set(leader_idx, "after_kill", "v2");
+        cluster
+            .wait_for_replication_except(idx_after, &[victim], Duration::from_secs(5))
+            .await;
+        // n2 still has only the pre-kill entries.
+        let n2_applied = cluster.nodes[victim].raft.read().unwrap().last_applied;
+        assert!(
+            n2_applied < idx_after,
+            "n2 must not have applied idx_after while killed, got last_applied = {}",
+            n2_applied
+        );
+
+        // Restart n2.
+        cluster.restart_node(victim).await;
+
+        // Wait for n2 to catch up.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let n2_applied = cluster.nodes[victim].raft.read().unwrap().last_applied;
+            if n2_applied >= idx_after {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "n2 did not catch up after restart; last_applied = {} (target = {})",
+                    n2_applied, idx_after
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(cluster.read(victim, "after_kill"), Some("v2".to_string()));
 
         cluster.shutdown().await;
     }

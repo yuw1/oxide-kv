@@ -38,13 +38,15 @@
 //! see the late message. This models the classic "slow link"
 //! scenario in Raft testing.
 //!
-//! Note: the first cut of `SimTransport::send_raft` honours
-//! `Drop` and `Deliver` but treats `Delay` as a no-op (we log a
-//! warning). This is intentional — proper delay handling
-//! requires integrating the scheduler's `Clock` with the
-//! transport's `tokio::time::timeout`, which is the next PR's
-//! job. Today the public surface is in place so the next PR
-//! doesn't have to re-shape the trait.
+//! Note: the `Delay` outcome is now properly honoured —
+//! `SimTransport::send_raft` and `send_vote` sleep the
+//! requested delay (in wall-clock time, since `tokio::time::sleep`
+//! is what they use) before pushing. If the delay exceeds the
+//! `rpc_timeout`, the sender surfaces `TransportError::Timeout`
+//! while the receiver still receives the late message — modelling
+//! the classic "slow link" scenario in Raft testing. Virtual-clock
+//! alignment of the delay is deferred to a future PR (would
+//! require threading `Clock` through `Network`).
 
 use crate::raft::sim_transport::InboundMessageBody;
 use std::sync::Mutex;
@@ -82,6 +84,14 @@ pub enum ScheduleOutcome {
     /// Forward the message after `delay` of virtual time has
     /// elapsed. The sender may time out before delivery.
     Delay(Duration),
+    /// Forward the message twice — once immediately and once
+    /// after `delay`. Models packet duplication on a lossy
+    /// link. The duplicated message has the same `from` /
+    /// `body` as the original. Useful for verifying that the
+    /// receiver's handlers are idempotent under duplicate
+    /// delivery (Raft AppendEntries and RequestVote are by
+    /// construction; snapshot install needs special care).
+    Duplicate(Duration),
 }
 
 /// Future returned by [`FaultScheduler::before_send`]. Resolves to
@@ -330,6 +340,109 @@ impl FaultScheduler for PartitionedNetwork {
                 ScheduleOutcome::Deliver
             }
         })
+    }
+}
+
+/// Test scheduler: each outbound message is delivered with
+/// probability `1 - p_delay` immediately, or delayed by `delay`
+/// with probability `p_delay`. The delayed message still arrives
+/// — the sender may time out before delivery, modelling a slow
+/// link.
+///
+/// `R: FnMut() -> f64 + Send + 'static` is the random source. The
+/// harness typically wraps a seeded ChaCha20 (or any deterministic
+/// `f64` generator) so a test is replayable bit-for-bit.
+///
+/// Implementation note: the RNG closure must be held inside a
+/// `Mutex` so `before_send` (`&self`) can mutate it. We sample
+/// inside the sync part (no await), then move the boolean into
+/// the future so the future only owns a `bool` (Send).
+pub struct RandomDelay<R: FnMut() -> f64 + Send + 'static> {
+    rng: Mutex<R>,
+    p_delay: f64,
+    delay: Duration,
+}
+
+impl<R: FnMut() -> f64 + Send + 'static> RandomDelay<R> {
+    /// `p_delay ∈ [0.0, 1.0]`: probability that any given message
+    /// is delayed. `delay`: how long delayed messages sleep
+    /// before being pushed.
+    pub fn new(rng: R, p_delay: f64, delay: Duration) -> Self {
+        let p_delay = p_delay.clamp(0.0, 1.0);
+        Self {
+            rng: Mutex::new(rng),
+            p_delay,
+            delay,
+        }
+    }
+}
+
+impl<R: FnMut() -> f64 + Send + 'static> FaultScheduler for RandomDelay<R> {
+    fn before_send<'a>(
+        &'a self,
+        _link: &'a LinkId,
+        _body: &'a InboundMessageBody,
+    ) -> ScheduleFuture {
+        // Sample inside the sync part so the RNG closure is
+        // released before any await.
+        let sample = self.rng.lock().unwrap()();
+        let delayed = sample < self.p_delay;
+        let delay = self.delay;
+        Box::pin(async move {
+            if delayed {
+                ScheduleOutcome::Delay(delay)
+            } else {
+                ScheduleOutcome::Deliver
+            }
+        })
+    }
+}
+
+/// Test scheduler: every message is delivered AND duplicated
+/// — i.e. the receiver's inbound channel sees the same message
+/// body twice in a row.
+///
+/// This is a strong model for "packet duplication on a lossy
+/// link" — useful for verifying that idempotent RPC handlers
+/// (Raft consensus, which is itself idempotent for
+/// AppendEntries and RequestVote) handle duplicates correctly.
+///
+/// Implementation: `before_send` returns `Duplicate(delay)`
+/// where `delay` is the inter-duplicate spacing. The transport
+/// honours the `Duplicate` outcome by pushing the message body
+/// once immediately and once again after `delay`.
+///
+/// Today only `DuplicateAll` exists; a probabilistic variant
+/// (`RandomDuplicate { p, delay }`) is straightforward to add
+/// if tests need it.
+pub struct DuplicateAll {
+    delay: Duration,
+}
+
+impl DuplicateAll {
+    /// `delay`: how long after the first delivery the duplicate
+    /// is sent. Set to `Duration::ZERO` to send both
+    /// simultaneously (the receiver may see them in either
+    /// order — its inbound channel is an mpsc).
+    pub fn new(delay: Duration) -> Self {
+        Self { delay }
+    }
+}
+
+impl Default for DuplicateAll {
+    fn default() -> Self {
+        Self::new(Duration::from_millis(50))
+    }
+}
+
+impl FaultScheduler for DuplicateAll {
+    fn before_send<'a>(
+        &'a self,
+        _link: &'a LinkId,
+        _body: &'a InboundMessageBody,
+    ) -> ScheduleFuture {
+        let delay = self.delay;
+        Box::pin(async move { ScheduleOutcome::Duplicate(delay) })
     }
 }
 #[cfg(test)]
@@ -620,5 +733,65 @@ mod tests {
 
         stop.stop();
         let _ = tokio::time::timeout(Duration::from_secs(2), serve_handle).await;
+    }
+
+    /// Unit test: RandomDelay with p=1.0 always delays; p=0.0
+    /// always delivers. Boundary inclusive.
+    #[tokio::test]
+    async fn random_delay_with_p1_always_delays() {
+        let sched = RandomDelay::new(|| 0.5, 1.0, Duration::from_millis(10));
+        let link = LinkId::new("n1", "n2");
+        let outcome = sched.before_send(&link, &request_vote(1)).await;
+        match outcome {
+            ScheduleOutcome::Delay(d) => assert_eq!(d, Duration::from_millis(10)),
+            other => panic!("expected Delay, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn random_delay_with_p0_always_delivers() {
+        let sched = RandomDelay::new(|| 0.5, 0.0, Duration::from_millis(10));
+        let link = LinkId::new("n1", "n2");
+        let outcome = sched.before_send(&link, &request_vote(1)).await;
+        assert!(matches!(outcome, ScheduleOutcome::Deliver));
+    }
+
+    #[tokio::test]
+    async fn random_delay_p_clamps_to_unit_interval() {
+        // p=2.0 should be treated as 1.0 (always delay).
+        let sched = RandomDelay::new(|| 0.5, 2.0, Duration::from_millis(10));
+        let link = LinkId::new("n1", "n2");
+        let outcome = sched.before_send(&link, &request_vote(1)).await;
+        assert!(matches!(outcome, ScheduleOutcome::Delay(_)));
+        // p=-0.5 should be treated as 0.0 (always deliver).
+        let sched = RandomDelay::new(|| 0.5, -0.5, Duration::from_millis(10));
+        let outcome = sched.before_send(&link, &request_vote(1)).await;
+        assert!(matches!(outcome, ScheduleOutcome::Deliver));
+    }
+
+    /// Unit test: DuplicateAll returns a Duplicate outcome with
+    /// the configured spacing.
+    #[tokio::test]
+    async fn duplicate_all_returns_duplicate_outcome() {
+        let sched = DuplicateAll::new(Duration::from_millis(7));
+        let link = LinkId::new("n1", "n2");
+        let outcome = sched.before_send(&link, &request_vote(1)).await;
+        match outcome {
+            ScheduleOutcome::Duplicate(d) => assert_eq!(d, Duration::from_millis(7)),
+            other => panic!("expected Duplicate, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_all_default_spacing_is_50ms() {
+        let sched = DuplicateAll::default();
+        let link = LinkId::new("n1", "n2");
+        let outcome = sched.before_send(&link, &request_vote(1)).await;
+        match outcome {
+            ScheduleOutcome::Duplicate(d) => {
+                assert_eq!(d, Duration::from_millis(50))
+            }
+            other => panic!("expected Duplicate, got {:?}", other),
+        }
     }
 }

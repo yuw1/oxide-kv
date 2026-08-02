@@ -73,6 +73,7 @@ pub(crate) type ReplySender = oneshot::Sender<Result<InboundMessageBody, Transpo
 /// the type level. The `Raft` variant carries both request and
 /// reply because `RaftMessage` already discriminates the two via
 /// its own enum.
+#[derive(Debug, Clone)]
 pub enum InboundMessageBody {
     /// A Raft consensus RPC. Reply is the matching `RaftMessage`
     /// reply variant (`AppendReply`, `VoteResponse`, etc.).
@@ -214,6 +215,27 @@ impl Default for Network {
     }
 }
 
+impl Network {
+    /// Re-register an existing node id, dropping the
+    /// (possibly dead) sender and installing a fresh one.
+    /// Returns the inbound receiver half so a SimTransport
+    /// can install it via `SimTransport::replace_inbound`.
+    ///
+    /// Used by DST scenarios that "kill and restart" a node —
+    /// after kill, the original sender is a dead handle
+    /// because the previous receiver was dropped when the
+    /// serve loop exited.
+    pub fn re_register(&self, node_id: &str) -> mpsc::Receiver<InboundMessage> {
+        let (tx, rx) = mpsc::channel(INBOUND_CAPACITY);
+        self.inner
+            .peers
+            .lock()
+            .unwrap()
+            .insert(node_id.to_string(), tx);
+        rx
+    }
+}
+
 /// In-memory transport. Holds a clone of the shared [`Network`] and
 /// its own inbound receiver. `send_raft` looks up the target in the
 /// network and pushes. `serve` consumes from the inbound receiver
@@ -228,7 +250,11 @@ impl Default for Network {
 pub struct SimTransport {
     #[allow(dead_code)]
     self_id: String,
-    network: Network,
+    /// The shared cluster network. Exposed so DST scenarios
+    /// that need to re-register an inbound channel (e.g. after
+    /// `kill_node` + `restart_node`) can do so via
+    /// [`Network::re_register`].
+    pub network: Network,
     inbound: Arc<Mutex<Option<mpsc::Receiver<InboundMessage>>>>,
 }
 
@@ -247,6 +273,24 @@ impl SimTransport {
             network,
             inbound: Arc::new(Mutex::new(Some(inbound))),
         }
+    }
+
+    /// Replace the inbound receiver with a fresh one. Used by
+    /// DST restart_node: after the previous serve loop has
+    /// dropped the receiver (during kill_node), we install a
+    /// fresh receiver here so the next `serve` call has
+    /// something to read from.
+    ///
+    /// Panics if a receiver is still installed (the previous
+    /// serve loop is still running). Callers should
+    /// `stop.stop()` + sleep before this.
+    pub fn replace_inbound(&self, new_inbound: mpsc::Receiver<InboundMessage>) {
+        let mut guard = self.inbound.lock().unwrap();
+        assert!(
+            guard.is_none(),
+            "SimTransport::replace_inbound called while a receiver is still installed"
+        );
+        *guard = Some(new_inbound);
     }
 }
 
@@ -338,10 +382,37 @@ impl Transport for SimTransport {
                     tokio::time::sleep(rpc_timeout).await;
                     return Err(TransportError::Timeout(rpc_timeout));
                 }
-                ScheduleOutcome::Delay(_) | ScheduleOutcome::Deliver => {
-                    // First cut: Delay collapses to Deliver.
-                    // See fault_scheduler.rs module docs.
+                ScheduleOutcome::Delay(delay) => {
+                    // Real Delay impl: sleep for `delay` of
+                    // wall-clock time before pushing. If the
+                    // sender has a shorter `rpc_timeout`, the
+                    // surrounding `tokio::time::timeout` below
+                    // will fire and the message will arrive at
+                    // the receiver *after* the sender has given
+                    // up — modelling the classic "slow link"
+                    // scenario in Raft. (Virtual-clock alignment
+                    // is deferred to a future PR; today the
+                    // delay is wall-clock so a Delay > rpc_timeout
+                    // matches the documented semantics.)
+                    tokio::time::sleep(delay).await;
                 }
+                ScheduleOutcome::Duplicate(delay) => {
+                    // Push the original now; push the duplicate
+                    // after `delay`. We do the duplicate on a
+                    // separate spawned task so the sender's
+                    // RPC isn't held open by it. If the sender's
+                    // rpc_timeout fires before the duplicate
+                    // task gets to push, the duplicate still
+                    // arrives (it doesn't gate on the sender).
+                    let dup_sender = sender.clone();
+                    let dup_from = self_id.clone();
+                    let dup_body = body.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        let _ = push_with_reply(&dup_sender, dup_from, dup_body).await;
+                    });
+                }
+                ScheduleOutcome::Deliver => {}
             }
             let push_fut = push_with_reply(&sender, self_id, body);
             let body = match tokio::time::timeout(rpc_timeout, push_fut).await {
@@ -381,7 +452,25 @@ impl Transport for SimTransport {
                     tokio::time::sleep(rpc_timeout).await;
                     return Err(TransportError::Timeout(rpc_timeout));
                 }
-                ScheduleOutcome::Delay(_) | ScheduleOutcome::Deliver => {}
+                ScheduleOutcome::Delay(delay) => {
+                    // Real Delay impl: sleep `delay` before
+                    // pushing. See send_raft's matching branch
+                    // for the semantics.
+                    tokio::time::sleep(delay).await;
+                }
+                ScheduleOutcome::Duplicate(delay) => {
+                    // See send_raft's matching branch. Vote
+                    // duplication is unusual but the same
+                    // mechanism applies.
+                    let dup_sender = sender.clone();
+                    let dup_from = self_id.clone();
+                    let dup_body = body.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(delay).await;
+                        let _ = push_with_reply(&dup_sender, dup_from, dup_body).await;
+                    });
+                }
+                ScheduleOutcome::Deliver => {}
             }
             let push_fut = push_with_reply(&sender, self_id, body);
             let body = match tokio::time::timeout(rpc_timeout, push_fut).await {
