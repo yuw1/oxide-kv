@@ -194,7 +194,13 @@ impl RaftNode {
     }
 
     pub fn get_log_entry(&self, index: u64) -> Option<crate::protocol::LogEntry> {
-        self.log.get(index as usize).cloned()
+        // Log array is 0-indexed in storage; log[0] holds the
+        // entry at Raft-log index 1 (Raft uses 1-indexed log
+        // indices per the thesis). Translate before indexing.
+        if index == 0 {
+            return None;
+        }
+        self.log.get((index - 1) as usize).cloned()
     }
 
     /// Public setter for `peers`. Used by integration tests that

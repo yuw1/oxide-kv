@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (P7 reference model + cross-check)
+- New `src/raft/reference_model.rs` (170 lines): a sequential
+  single-threaded HashMap that applies committed `Set` /
+  `Delete` ops in log-index order. Exposes
+  `apply(index, &Command)`, `drain_to(&SimCluster,
+  commit_index)`, `get(key)`, `snapshot()`, `applied_index()`.
+  Treats `Compact` and the 2PC ops as no-ops (those paths are
+  covered by other tests; this is the KV linearizability
+  oracle).
+- 3 new DST cross-check scenarios in `tests/raft_dst.rs`
+  (cross-check against the reference model under various
+  fault combinations):
+  - `dst_reference_model_cross_check_under_faults` —
+    3 writes on steady-state leader, partition n2 off,
+    write 2 more entries, heal, verify post-heal all 3
+    nodes match the reference model.
+  - `dst_reference_model_cross_check_after_leader_failover` —
+    2 writes, kill n0, drive n1 to leader, verify new
+    leader's reads match reference model, then submit
+    new write under new leader and cross-check.
+  - `dst_reference_model_cross_check_with_delete` —
+    submit a `Set`, then a `Delete`, verify every node
+    observes the deletion and matches the reference
+    model.
+
+### Fixed
+- `RaftNode::get_log_entry(index)` had an off-by-one bug:
+  it was doing `self.log.get(index as usize)`, but the log
+  array is 0-indexed in storage (`log[0]` = Raft-log
+  index 1). The bug was latent because the only existing
+  caller (`coordinator.rs`) always passed `index = log.len()`
+  (one past the last entry), which is out-of-bounds so the
+  function returned `None` and the caller fell back to
+  `current_term()`. With this fix, callers can now actually
+  read the entry at a given log index. This is the
+  correctness-required for the reference model's
+  `drain_to` path. Verified: `tests/integration_2pc.rs`
+  (3 tests) still pass with the fix.
+
 ### Added (P7 fault coverage: delay / reorder / duplicate / restart)
 - Real `Delay(d)` outcome in `SimTransport::send_raft` and
   `send_vote`: the transport now `tokio::time::sleep`s for `d`
