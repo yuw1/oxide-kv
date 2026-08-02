@@ -40,7 +40,6 @@ use tokio::time::timeout;
 use crate::coordination::{VoteRequest, VoteResponse};
 use crate::protocol::{Command, TxDecision, Vote};
 use crate::raft::node::{NodeState, RaftNode};
-use crate::raft::rpc::RpcClient;
 
 /// Outcome of a coordinator-driven 2PC round.
 ///
@@ -173,16 +172,23 @@ async fn coordinate_tx_inner(
             reason: format!("replication failed: {}", reason),
         };
     }
-    // Snapshot the leader's term and peer set BEFORE fanning out: any
-    // term advance reported by a peer needs to be compared against this
-    // snapshot to decide whether to step down.
-    let (leader_term, peer_addrs, leader_id, begin_log_term) = {
+    // Snapshot the leader's term, peer set, and transport BEFORE fanning
+    // out: any term advance reported by a peer needs to be compared
+    // against this snapshot to decide whether to step down, and the
+    // transport is cloned per peer for the side-channel vote RPC.
+    let (leader_term, peer_addrs, leader_id, begin_log_term, transport) = {
         let n = node_arc.read().unwrap();
         let begin_term = n
             .get_log_entry(begin_index)
             .map(|e| e.term)
             .unwrap_or_else(|| n.current_term());
-        (n.current_term(), n.peers().to_vec(), n.node_id().to_string(), begin_term)
+        (
+            n.current_term(),
+            n.peers().to_vec(),
+            n.node_id().to_string(),
+            begin_term,
+            n.transport.clone(),
+        )
     };
 
     // ---- Step 2: record the leader's implicit Yes -------------------------
@@ -211,17 +217,31 @@ async fn coordinate_tx_inner(
     // a single slow peer does not stretch the round beyond its own RPC
     // timeout. We collect into a Vec<(peer_addr, result)> preserving the
     // (addr, result) shape the rest of the function expects.
+    //
+    // The per-call `TX_VOTE_TIMEOUT_MS` is applied at the caller level
+    // (here) rather than inside the Transport impl, so the abstraction
+    // stays neutral on whether the timeout is wall-clock or virtual.
     let mut handles = Vec::with_capacity(peer_addrs.len());
     for addr in &peer_addrs {
         let addr = addr.clone();
         let req = req.clone();
+        let transport = transport.clone();
         handles.push(tokio::spawn(async move {
-            let result = RpcClient::send_tx_vote_rpc(
-                &addr,
-                req,
+            // Wall-clock timeout (preserved from pre-trait code).
+            // Future SimTransport tests will use virtual time and may
+            // wrap with `tokio::time::timeout` differently.
+            let result = match tokio::time::timeout(
                 Duration::from_millis(TX_VOTE_TIMEOUT_MS),
+                transport.send_vote(&addr, req),
             )
-            .await;
+            .await
+            {
+                Ok(inner) => inner.map_err(|e| anyhow::anyhow!("vote transport error: {}", e)),
+                Err(_) => Err(anyhow::anyhow!(
+                    "vote RPC timed out after {}ms",
+                    TX_VOTE_TIMEOUT_MS
+                )),
+            };
             (addr, result)
         }));
     }

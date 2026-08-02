@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (P7 foundation: transport abstraction)
+- New `crate::raft::net::Transport` trait + `TcpTransport` real impl
+  (message-level, not byte-level).
+- New `StopSignal` (`Arc<tokio::sync::Notify>`) for clean listener
+  shutdown; `main.rs` wires `ctrl_c` into it.
+- `RaftNode::new_with_clock_and_transport(...)` constructor for
+  injecting both abstractions; `new` / `new_with_storage` /
+  `new_with_clock` default to `system_transport()` (send-only TCP).
+- 4 production RPC paths now route through the trait:
+  - `sync_logs` → `AppendEntries` per peer
+  - `request_votes` → `RequestVote` per peer
+  - `coordinate_tx` → 2PC `VoteRequest` fan-out (timeout still
+    applied at the call site via `TX_VOTE_TIMEOUT_MS`)
+  - `main.rs` listener loop → `serve(...)` with `StopSignal`
+- `RpcClient::call` is now `pub(crate)` so `TcpTransport::send_raft`
+  can route every Raft variant through one helper. The per-variant
+  `send_request_vote_rpc` / `send_append_entries_rpc` helpers are
+  removed (callers now pattern-match on the `RaftMessage` reply at
+  the call site).
+- 4 new transport unit tests: error classification (`Unreachable` /
+  `Timeout` / `Protocol`), `StopSignal` roundtrip,
+  `serve_without_listener` fails fast.
+
 ### Added (P7 foundation: clock abstraction)
 - New `crate::raft::clock::Clock` trait + `SystemClock` production impl.
 - `RaftNode::new_with_clock(...)` constructor for injecting a custom

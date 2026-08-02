@@ -2,9 +2,10 @@ use crate::config::Config;
 use crate::coordination::{VoteRequest, VoteResponse};
 use crate::protocol::{Command, LogEntry, ReadIndex, Snapshot, Vote};
 use crate::raft::clock::{system_clock, Clock};
+use crate::raft::net::{system_transport, Transport};
 use crate::raft::rpc::{
     AppendEntriesArgs, AppendReplyArgs, InstallSnapshotArgs, InstallSnapshotReplyArgs,
-    RequestVoteArgs, RpcClient, VoteResponseArgs,
+    RaftMessage, RequestVoteArgs, VoteResponseArgs,
 };
 use crate::raft::storage::RaftStorage;
 use crate::state_machine::StateMachine;
@@ -52,6 +53,12 @@ pub struct RaftNode {
     /// via `new_with_clock`. See `src/raft/clock.rs`.
     pub(crate) clock: Arc<dyn Clock>,
 
+    /// Transport abstraction for real TCP vs future simulation
+    /// in-memory channels (P7). Production nodes get a fresh
+    /// `TcpTransport` from `new` / `new_with_storage`; tests inject a
+    /// custom impl via `new_with_transport`. See `src/raft/net.rs`.
+    pub(crate) transport: Arc<dyn Transport>,
+
     // --- Volatile state on leaders ---
     pub next_index: HashMap<String, u64>,
     pub match_index: HashMap<String, u64>,
@@ -80,9 +87,17 @@ impl RaftNode {
         state_machine: Arc<RwLock<StateMachine>>,
         storage: RaftStorage,
     ) -> Self {
-        // Production default: SystemClock. Tests / future sim harness
-        // use `new_with_clock` to inject a custom impl.
-        Self::new_with_clock(raft_addr, peers, state_machine, storage, system_clock())
+        // Production defaults: SystemClock + TcpTransport (no listener).
+        // Tests / future sim harness use `new_with_clock` /
+        // `new_with_transport` to inject custom impls.
+        Self::new_with_clock_and_transport(
+            raft_addr,
+            peers,
+            state_machine,
+            storage,
+            system_clock(),
+            system_transport(),
+        )
     }
 
     /// Construct a `RaftNode` with an explicit `RaftStorage` instance
@@ -101,6 +116,34 @@ impl RaftNode {
         storage: RaftStorage,
         clock: Arc<dyn Clock>,
     ) -> Self {
+        // Default to a listener-less TcpTransport. Callers that
+        // need both custom clock AND custom transport should use
+        // `new_with_clock_and_transport` directly.
+        Self::new_with_clock_and_transport(
+            raft_addr,
+            peers,
+            state_machine,
+            storage,
+            clock,
+            system_transport(),
+        )
+    }
+
+    /// Construct a `RaftNode` with both a custom `Clock` and a custom
+    /// `Transport`. Used by tests that drive either abstraction
+    /// independently; future sim harness will use this to inject a
+    /// `SimClock` + `SimTransport` pair.
+    ///
+    /// Added in P7 as part of the DST foundation. See
+    /// `src/raft/clock.rs` / `src/raft/net.rs`.
+    pub fn new_with_clock_and_transport(
+        raft_addr: String,
+        peers: Vec<String>,
+        state_machine: Arc<RwLock<StateMachine>>,
+        storage: RaftStorage,
+        clock: Arc<dyn Clock>,
+        transport: Arc<dyn Transport>,
+    ) -> Self {
         // Load persistent state from disk
         let (term, vote, logs) = storage.load_initial_state();
 
@@ -108,6 +151,7 @@ impl RaftNode {
             storage,
             state_machine,
             clock: clock.clone(),
+            transport,
 
             // Populate from restored data
             current_term: term,
@@ -469,6 +513,14 @@ impl RaftNode {
         for peer_addr in peers {
             let raft_clone = raft_node.clone();
             let peer_addr_clone = peer_addr.clone();
+            // Snapshot the transport once per peer under the read lock
+            // (released before spawn). The clone is `Send + 'static`
+            // because `Transport: Send + Sync + 'static`, so the spawn
+            // future is `Send` and the per-peer task can run on any
+            // tokio worker. Avoids holding `RwLockReadGuard` across
+            // an await point, which would break the `Send` bound on
+            // the `tokio::spawn` future.
+            let transport_for_peer = raft_node.read().unwrap().transport.clone();
 
             let (prev_log_index, prev_log_term, entries) = {
                 let n = raft_node.read().unwrap();
@@ -498,8 +550,14 @@ impl RaftNode {
             };
 
             tokio::spawn(async move {
-                match RpcClient::send_append_entries_rpc(peer_addr_clone.clone(), args.clone()).await {
-                    Ok(reply) => {
+                match transport_for_peer
+                    .send_raft(
+                        &peer_addr_clone,
+                        RaftMessage::AppendEntries(args.clone()),
+                    )
+                    .await
+                {
+                    Ok(RaftMessage::AppendReply(reply)) => {
                         let mut n = raft_clone.write().unwrap();
                         if reply.success {
                             let last_idx = args.prev_log_index + args.entries.len() as u64;
@@ -521,6 +579,20 @@ impl RaftNode {
                                 n.next_index.insert(peer_addr_clone, next - 1);
                             }
                         }
+                    }
+                    Ok(other) => {
+                        // Peer replied with an unexpected RaftMessage variant.
+                        // Log and ignore — this can only happen if a buggy
+                        // peer echoes back something other than the matching
+                        // reply type. The pre-trait code couldn't
+                        // encounter this because each send_*_rpc helper
+                        // unwrapped the variant itself; with the trait
+                        // surface, the dispatch happens at the caller.
+                        eprintln!(
+                            "[Protocol] AppendEntries to {} got unexpected reply variant {:?}",
+                            peer_addr_clone,
+                            std::mem::discriminant(&other)
+                        );
                     }
                     Err(e) => eprintln!("[Network] RPC error with {}: {}", peer_addr_clone, e),
                 }
@@ -637,10 +709,17 @@ impl RaftNode {
     }
 
     pub fn request_votes(raft_arc: Arc<RwLock<Self>>) {
-        let (peers, term, candidate_id, last_idx, last_term) = {
+        let (peers, term, candidate_id, last_idx, last_term, transport) = {
             let node = raft_arc.read().unwrap();
             let (li, lt) = node.get_last_log_info();
-            (node.peers.clone(), node.current_term, node.node_id.clone(), li, lt)
+            (
+                node.peers.clone(),
+                node.current_term,
+                node.node_id.clone(),
+                li,
+                lt,
+                node.transport.clone(),
+            )
         };
 
         let total_nodes = peers.len() + 1;
@@ -650,25 +729,44 @@ impl RaftNode {
             let raft_clone = raft_arc.clone();
             let votes_clone = votes_received.clone();
             let cid = candidate_id.clone();
+            let transport = transport.clone();
 
             tokio::spawn(async move {
                 let args = RequestVoteArgs { term, candidate_id: cid, last_log_index: last_idx, last_log_term: last_term };
-                if let Ok(reply) = RpcClient::send_request_vote_rpc(&peer_addr, args).await {
-                    if reply.vote_granted {
-                        let count = votes_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                        if count > total_nodes / 2 {
-                            let mut n = raft_clone.write().unwrap();
-                            if n.state == NodeState::Candidate && n.current_term == term {
-                                n.become_leader();
+                match transport
+                    .send_raft(&peer_addr, RaftMessage::RequestVote(args))
+                    .await
+                {
+                    Ok(RaftMessage::VoteResponse(reply)) => {
+                        if reply.vote_granted {
+                            let count = votes_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                            if count > total_nodes / 2 {
+                                let mut n = raft_clone.write().unwrap();
+                                if n.state == NodeState::Candidate && n.current_term == term {
+                                    n.become_leader();
+                                }
                             }
+                        } else if reply.term > term {
+                            let mut n = raft_clone.write().unwrap();
+                            n.current_term = reply.term;
+                            n.state = NodeState::Follower;
+                            n.vote_for = None;
+                            let _ = n.storage.save_meta(n.current_term.clone(), n.vote_for.clone());
                         }
-                    } else if reply.term > term {
-                        let mut n = raft_clone.write().unwrap();
-                        n.current_term = reply.term;
-                        n.state = NodeState::Follower;
-                        n.vote_for = None;
-                        let _ = n.storage.save_meta(n.current_term.clone(), n.vote_for.clone());
                     }
+                    Ok(other) => {
+                        // Unexpected reply variant from a buggy peer.
+                        // Pre-trait code couldn't hit this path because
+                        // each send_*_rpc helper unwrapped its own
+                        // expected reply; the trait surface defers
+                        // dispatch to the caller. Log and move on.
+                        eprintln!(
+                            "[Protocol] RequestVote to {} got unexpected reply variant {:?}",
+                            peer_addr,
+                            std::mem::discriminant(&other)
+                        );
+                    }
+                    Err(e) => eprintln!("[Network] RPC error with {}: {}", peer_addr, e),
                 }
             });
         }
