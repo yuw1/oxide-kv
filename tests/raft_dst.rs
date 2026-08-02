@@ -23,7 +23,7 @@
 //! - Timeouts are generous (5-10s) to absorb CI host load. The
 //!   actual cluster wall-clock for any scenario below is <3s.
 
-use oxide_kv::raft::fault_scheduler::{AlwaysDeliver, LinkId, PartitionedNetwork};
+use oxide_kv::raft::fault_scheduler::{AlwaysDeliver, FaultScheduler, LinkId, PartitionedNetwork};
 use oxide_kv::raft::sim_harness::SimCluster;
 use std::sync::Arc;
 use std::time::Duration;
@@ -361,4 +361,180 @@ async fn dst_leader_failover_repeated_5x_no_state_leak() {
 
         cluster.shutdown().await;
     }
+}
+// =====================================================================
+// Reference-model cross-check
+// =====================================================================
+
+/// DST scenario: cross-check the cluster against a
+/// sequential reference model while exercising
+/// partition + crash + restart + heal. The reference
+/// model is a single-threaded HashMap that applies
+/// committed `Set` / `Delete` ops in log-index order.
+/// Every `cluster.read(node, key)` must match the
+/// reference model's `get(key)` at the same committed
+/// prefix.
+#[tokio::test]
+async fn dst_reference_model_cross_check_under_faults() {
+    use oxide_kv::raft::reference_model::ReferenceModel;
+
+    // Build a cluster whose links go through a partition
+    // controller from the start. We can flip links on/off
+    // without rebuilding the cluster.
+    let partition = Arc::new(PartitionedNetwork::new());
+    let cluster = SimCluster::new_3_nodes(
+        partition.clone() as Arc<dyn FaultScheduler>
+    ).await;
+    cluster.drive_election(0).await;
+    let leader_idx = cluster.leader_index().unwrap();
+
+    let mut rm = ReferenceModel::new();
+
+    // Helper: drain the reference model up to the
+    // current leader's commit_index.
+    let drain = |rm: &mut ReferenceModel, cluster: &SimCluster| {
+        let idx = cluster.leader_index()
+            .map(|l| cluster.nodes[l].raft.read().unwrap().commit_index)
+            .unwrap_or(0);
+        rm.drain_to(cluster, idx);
+    };
+
+    // Phase 1: 3 writes on the steady-state leader.
+    let i1 = cluster.submit_set(leader_idx, "alpha", "1");
+    let i2 = cluster.submit_set(leader_idx, "beta", "2");
+    let i3 = cluster.submit_set(leader_idx, "gamma", "3");
+    cluster.wait_for_replication(i3, Duration::from_secs(5)).await;
+    drain(&mut rm, &cluster);
+
+    // Cross-check: every node's read should match the
+    // reference model.
+    for n in 0..cluster.nodes.len() {
+        assert_eq!(cluster.read(n, "alpha"), rm.get("alpha").cloned(),
+            "alpha mismatch on n{}", n);
+        assert_eq!(cluster.read(n, "beta"), rm.get("beta").cloned(),
+            "beta mismatch on n{}", n);
+        assert_eq!(cluster.read(n, "gamma"), rm.get("gamma").cloned(),
+            "gamma mismatch on n{}", n);
+    }
+
+    // Phase 2: partition n2 off, write on n0/n1.
+    partition.partition(LinkId::new("n0", "n2"));
+    partition.partition(LinkId::new("n1", "n2"));
+
+    let i4 = cluster.submit_set(leader_idx, "delta", "4");
+    let i5 = cluster.submit_set(leader_idx, "epsilon", "5");
+    cluster
+        .wait_for_replication_except(i5, &[2], Duration::from_secs(5))
+        .await;
+    drain(&mut rm, &cluster);
+
+    // n0, n1 agree with reference.
+    assert_eq!(cluster.read(0, "delta"), rm.get("delta").cloned());
+    assert_eq!(cluster.read(1, "delta"), rm.get("delta").cloned());
+    assert_eq!(cluster.read(0, "epsilon"), rm.get("epsilon").cloned());
+    assert_eq!(cluster.read(1, "epsilon"), rm.get("epsilon").cloned());
+
+    // Phase 3: heal, n2 catches up, cross-check post-heal.
+    partition.heal();
+    cluster
+        .wait_for_replication(i5, Duration::from_secs(5))
+        .await;
+    drain(&mut rm, &cluster);
+
+    for n in 0..cluster.nodes.len() {
+        assert_eq!(cluster.read(n, "delta"), rm.get("delta").cloned(),
+            "post-heal delta mismatch on n{}", n);
+        assert_eq!(cluster.read(n, "epsilon"), rm.get("epsilon").cloned(),
+            "post-heal epsilon mismatch on n{}", n);
+    }
+
+    cluster.shutdown().await;
+}
+
+/// DST scenario: cross-check against the reference model
+/// while the leader fails over mid-stream. The new
+/// leader's log should match the reference model's
+/// applied-index prefix after recovery.
+#[tokio::test]
+async fn dst_reference_model_cross_check_after_leader_failover() {
+    use oxide_kv::raft::reference_model::ReferenceModel;
+
+    let cluster = SimCluster::new_3_nodes(Arc::new(AlwaysDeliver)).await;
+    cluster.drive_election(0).await;
+    let leader_idx = cluster.leader_index().unwrap();
+    let mut rm = ReferenceModel::new();
+    let drain = |rm: &mut ReferenceModel, cluster: &SimCluster| {
+        let idx = cluster.leader_index()
+            .map(|l| cluster.nodes[l].raft.read().unwrap().commit_index)
+            .unwrap_or(0);
+        rm.drain_to(cluster, idx);
+    };
+
+    let i1 = cluster.submit_set(leader_idx, "k1", "v1");
+    let i2 = cluster.submit_set(leader_idx, "k2", "v2");
+    cluster.wait_for_replication(i2, Duration::from_secs(5)).await;
+    drain(&mut rm, &cluster);
+    assert_eq!(rm.applied_index(), i2);
+
+    // Fail over n0 -> n1.
+    cluster.kill_node(0).await;
+    cluster.drive_election(1).await;
+    let new_leader = cluster.leader_index().unwrap();
+    assert_eq!(new_leader, 1);
+
+    // n1 (new leader) reads must match the reference
+    // model's view, even though its view of the log
+    // might have caught up only after the failover.
+    drain(&mut rm, &cluster);
+    assert_eq!(cluster.read(1, "k1"), rm.get("k1").cloned());
+    assert_eq!(cluster.read(1, "k2"), rm.get("k2").cloned());
+
+    // New writes under new leader.
+    let i3 = cluster.submit_set(new_leader, "k3", "v3");
+    cluster
+        .wait_for_replication_except(i3, &[0], Duration::from_secs(5))
+        .await;
+    drain(&mut rm, &cluster);
+    assert_eq!(cluster.read(1, "k3"), rm.get("k3").cloned());
+
+    cluster.shutdown().await;
+}
+
+/// DST scenario: cross-check after a Delete op. The
+/// reference model applies Delete at the committed index;
+/// subsequent reads must observe the deletion.
+#[tokio::test]
+async fn dst_reference_model_cross_check_with_delete() {
+    use oxide_kv::raft::reference_model::ReferenceModel;
+
+    let cluster = SimCluster::new_3_nodes(Arc::new(AlwaysDeliver)).await;
+    cluster.drive_election(0).await;
+    let leader_idx = cluster.leader_index().unwrap();
+    let mut rm = ReferenceModel::new();
+    let drain = |rm: &mut ReferenceModel, cluster: &SimCluster| {
+        let idx = cluster.leader_index()
+            .map(|l| cluster.nodes[l].raft.read().unwrap().commit_index)
+            .unwrap_or(0);
+        rm.drain_to(cluster, idx);
+    };
+
+    let i1 = cluster.submit_set(leader_idx, "ephemeral", "alive");
+    cluster.wait_for_replication(i1, Duration::from_secs(5)).await;
+    drain(&mut rm, &cluster);
+    assert_eq!(cluster.read(0, "ephemeral"), rm.get("ephemeral").cloned());
+
+    // Delete via submit_command (submit_set hardcodes Set).
+    let cmd = oxide_kv::protocol::Command::Delete { key: "ephemeral".into() };
+    let i2 = cluster.submit_command(leader_idx, cmd);
+    cluster.wait_for_replication(i2, Duration::from_secs(5)).await;
+    drain(&mut rm, &cluster);
+
+    for n in 0..cluster.nodes.len() {
+        assert_eq!(cluster.read(n, "ephemeral"), None,
+            "n{} should observe the Delete", n);
+        assert_eq!(cluster.read(n, "ephemeral"), rm.get("ephemeral").cloned(),
+            "n{}'s view should match reference model post-Delete", n);
+    }
+
+    cluster.shutdown().await;
 }
