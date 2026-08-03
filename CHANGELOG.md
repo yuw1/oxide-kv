@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (P7 fuzz 2PC coverage)
+- The fuzz harness now drives real two-phase-commit rounds.
+  New `SubmitTx { tx_id, ops }` action in `tests/raft_fuzz.rs`
+  calls the production coordinator (`raft::coordinator::
+  coordinate_tx`) through a new test bridge
+  `SimCluster::run_tx`, so every scenario exercises `BeginTx`
+  → vote fan-out → `DecideTx` under partitions and node kills.
+  This is what actually feeds the 2PC-atomicity invariant
+  (`check_2pc_atomicity`) — previously it was wired into
+  `assert_invariants` but never saw a transaction. Action
+  distribution is now 30% plain ops, 12% 2PC tx, 18%
+  kill/restart, 18% partition, 12% election, 10% yield.
+- `SimCluster::run_tx(leader_idx, tx_id, ops, bound)` — a
+  bounded, cancellable bridge to the `pub(crate)` coordinator
+  so integration tests can drive 2PC. The bound is applied to
+  the `coordinate_tx` future directly (not a spawned handle),
+  so a timeout *cancels* the round rather than detaching it —
+  no background coordinator can land a late `DecideTx` after a
+  caller's cross-check.
+- `ReferenceModel` now models 2PC: `BeginTx` stages ops
+  (invisible to reads), `DecideTx(Commit)` applies them
+  atomically, `DecideTx(Abort)` discards them — mirroring
+  `StateMachine::begin_tx` / `decide_tx` exactly. Without this,
+  the leader-vs-reference-model cross-check would false-positive
+  on any committed transaction. +6 unit tests for the tx paths.
+
+### Changed (P7 fuzz 2PC coverage)
+- `ReferenceModel` gains a `pending` map for staged
+  transactions; `reset()` clears it alongside `state`.
+
 ### Added (P7 fuzz harness)
 - New `tests/raft_fuzz.rs` (1 integration test file, 5 test
   functions, ~750 lines): seeded-RNG scenario fuzz with three

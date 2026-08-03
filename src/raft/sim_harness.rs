@@ -285,6 +285,53 @@ impl SimCluster {
         new_index
     }
 
+    /// Drive a full 2PC round on the leader, bounded by `bound`,
+    /// and return the outcome (`None` if the bound elapsed first).
+    ///
+    /// This is the test-facing bridge to
+    /// [`crate::raft::coordinator::coordinate_tx`], which is
+    /// `pub(crate)` and therefore unreachable from integration tests.
+    /// It runs the real coordinator: propose `BeginTx` → replicate →
+    /// fan-out `VoteRequest` over the side channel → tally (all-yes)
+    /// → propose `DecideTx(Commit|Abort)`.
+    ///
+    /// # Why bounded + cancellable (not fire-and-forget)
+    ///
+    /// The coordinator's per-peer vote RPC uses a **wall-clock**
+    /// timeout (`TX_VOTE_TIMEOUT_MS`, 2s) and its own outer bound is
+    /// 10s. Under a partition or with a killed peer a round can stall
+    /// for seconds, so the fuzz harness must cap how long it waits.
+    ///
+    /// Critically, the bound is applied to the `coordinate_tx` future
+    /// **directly** (not to a spawned `JoinHandle`): when the bound
+    /// elapses, `tokio::time::timeout` drops the future, which
+    /// *cancels* the round. Cancellation is safe — the only log
+    /// proposals in the coordinator (`BeginTx`, `DecideTx`) run inline
+    /// in this future, while the vote fan-out tasks merely send RPCs
+    /// and never touch the log. A round cancelled after `BeginTx`
+    /// committed but before `DecideTx` simply leaves the transaction
+    /// pending, which both the 2PC-atomicity invariant and the
+    /// reference model tolerate (a pending tx is invisible to reads).
+    /// Spawning and timing out a `JoinHandle` would instead *detach*
+    /// the task, letting it land a late `DecideTx` after the caller's
+    /// cross-check — a false-positive race this API deliberately
+    /// avoids.
+    pub async fn run_tx(
+        &self,
+        leader_idx: usize,
+        tx_id: String,
+        ops: Vec<crate::protocol::TxOp>,
+        bound: Duration,
+    ) -> Option<crate::raft::coordinator::TxOutcome> {
+        let node_arc = Arc::clone(&self.nodes[leader_idx].raft);
+        tokio::time::timeout(
+            bound,
+            crate::raft::coordinator::coordinate_tx(node_arc, tx_id, ops),
+        )
+        .await
+        .ok()
+    }
+
     /// Poll until every **non-killed** node has applied at least
     /// `target_index` on its state machine, or panic after
     /// `timeout`. Replication is driven by the heartbeat loop's

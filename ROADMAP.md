@@ -247,6 +247,15 @@ The work below is what P7 needs; how it splits into PRs is decided as
 the work actually lands (GitHub assigns numbers at creation time, so
 pinning them here would be false precision).
 
+**Progress (2026-08-03):** the first three bullets are merged (traits,
+sim clock/network/scheduler, invariants + reference model + seed fuzz).
+The fuzz harness now also drives real 2PC rounds (`SubmitTx` action →
+`SimCluster::run_tx` → the production coordinator), which is what feeds
+the 2PC-atomicity invariant and the reference model's transaction
+handling. Remaining: a failing-seed shrinker, scaling the scenario count
+to ≥1000 in a CI-bounded way (default gate vs nightly), and the
+"how to run / reproduce a failing seed" docs.
+
 - **Abstract transport + clock behind traits.** Introduce `Transport`
   and `Clock` traits; `real` impls wrap the current TCP + `tokio::time`
   with no behavior change and existing tests green. This is the
