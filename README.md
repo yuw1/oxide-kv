@@ -310,14 +310,79 @@ The shrinker (`PR #30`) applies delta debugging — chunk removal
 followed by single-element removal — and emits a copy-pasteable
 `Vec<Action>` literal you can drop into a regression test.
 
+### Action vocabulary
+
+The fuzzer draws actions from this set. Each action is parameterized
+with a random sample from the seeded RNG so the same seed always
+produces the same sequence.
+
+| Action | What it does |
+|---|---|
+| `SubmitSet { key, value }` | propose a `Set` op on the current leader |
+| `SubmitDelete { key }` | propose a `Delete` op on the current leader |
+| `SubmitTx { tx_id, ops }` | drive a real 2PC round (`BeginTx` → vote fan-out → `DecideTx`) on the leader via the production coordinator |
+| `DriveElection { candidate_idx }` | force node `candidate_idx` to start a new election |
+| `KillNode { idx }` | crash node `idx` (its heartbeat / serve loops stop, on-disk WAL/meta preserved) |
+| `RestartNode { idx }` | bring a killed node back; reloads WAL, restarts loops |
+| `PartitionLink { from, to }` | drop messages on the directed link `from -> to` |
+| `HealPartitions` | restore every dropped link |
+| `Yield` | let the runtime advance a few ticks (so heartbeats / replication can propagate) |
+
+Default distribution: 30% plain ops, 12% 2PC tx, 18% kill/restart,
+18% partition/heal, 12% election, 10% yield. After every op
+action the harness gives the cluster a beat to replicate before
+cross-checking. The 2PC round is bounded to 1s; a timeout cancels
+the round (worst case a `BeginTx` is committed with no
+`DecideTx`, which both the 2PC-atomicity invariant and the
+reference model tolerate).
+
+### From panic to regression test
+
+When a fuzz scenario fails, the panic message contains:
+
+1. **The failure mode** — `invariant violation: ...`, `reference model mismatch on leader nN ...`, or `follower nN log diverges from leader ...`.
+2. **The seed and action length** — pick these out of the panic header and run the shrinker.
+3. **The full action sequence** — preserved verbatim for diff against the shrunk sequence.
+
+To convert a failing seed into a locked-in regression test:
+
+```bash
+# Step 1: shrink. Prints a minimal Vec<Action> literal.
+OXIDE_FUZZ_SEED=<seed> OXIDE_FUZZ_LEN=<len> \
+  cargo test --release --test raft_fuzz shrink_repro -- \
+  --ignored --nocapture
+```
+
+The shrinker output ends with a block like:
+
+```rust
+let actions = vec![
+    Action::SubmitSet { key: "k2".into(), value: "v1".into() },
+    Action::PartitionLink { from: 0, to: 1 },
+    Action::RestartNode { idx: 1 },
+];
+run_actions(&actions).await.unwrap();
+```
+
+Paste it into a new `#[tokio::test]` in `tests/raft_fuzz.rs` (or a
+new `tests/regressions_p7.rs` if you prefer to keep fuzz tests
+separate). The minimal sequence still reproduces the failure
+under `cargo test`, so a follow-up fix PR can verify the
+regression is gone with a single `cargo test --test raft_fuzz`.
+
+If a real bug is surfaced, file the fix in its own
+`fix/...` branch — the P7 fuzz harness *tests* the existing
+code; fixes don't belong inside the harness PRs.
+
 ---
 
 ## Roadmap
 
 The active roadmap lives in [ROADMAP.md](./ROADMAP.md). That file is
 the single source of truth for phase status, in-progress work, and
-acceptance criteria. The current phase is **P7 — Deterministic
-simulation testing (DST)**.
+acceptance criteria. The current phase is **P7 ✅ — Deterministic
+simulation testing (DST)** (shipped via PRs #25–#31; the next
+phase is to be proposed).
 
 ### Phase summary
 
@@ -332,7 +397,7 @@ simulation testing (DST)**.
 | Bug | Election timer brain-split + heartbeat:election ratio | ✅ | [#8](https://github.com/yuw1/oxide-kv/pull/8) |
 | Bug | Single-node read fallback + commit advancement | ✅ | [#9](https://github.com/yuw1/oxide-kv/pull/9) |
 | P6 | Multi-node 2PC coordinator RPC | ✅ | [#11](https://github.com/yuw1/oxide-kv/pull/11)–[#14](https://github.com/yuw1/oxide-kv/pull/14) |
-| **P7** | **Deterministic simulation testing (DST)** | **🔄 In progress** | [ROADMAP.md](./ROADMAP.md) |
+| **P7** | **Deterministic simulation testing (DST)** | **✅** | [#25](https://github.com/yuw1/oxide-kv/pull/25)–[#31](https://github.com/yuw1/oxide-kv/pull/31) |
 
 ### Candidate future directions (see ROADMAP.md for full list)
 
