@@ -3,3 +3,4 @@
 .DS_Store
 /data
 /127.0.0.1:*
+sdk/python/oxide_kv.egg-info/

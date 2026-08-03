@@ -1,31 +1,21 @@
-[package]
-name = "oxide-kv"
+[workspace]
+resolver = "2"
+members = [
+    "crates/oxide-kv",
+    "crates/oxide-kv-client",
+]
+
+# Workspace-level settings shared by every member crate.
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/yuw1/oxide-kv"
-description = "A lightweight distributed key-value store built in Rust, implementing the Raft Consensus Algorithm."
 
-[dependencies]
-anyhow = "1.0"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-tokio = { version = "1.0", features = ["full"] }
-rand = "0.8"
-bincode = "1.3"
-clap = { version = "4.0", features = ["derive"] }
-prost = "0.13"
-# `tempfile` is used by the SimHarness (P7 foundation) in lib
-# tests + the integration test suite. Keeping it as a regular
-# dependency (not just dev-dep) lets the harness live in the
-# library so it can be reused from any `tests/*.rs`.
-tempfile = "3.10"
-
-[build-dependencies]
-prost-build = "0.13"
-
-[dev-dependencies]
-# `test-util` enables `#[tokio::test(start_paused = true)]`, which
-# the SimClock determinism tests rely on. Feature is only pulled in
-# for dev builds (test compilation), not for the release binary.
-tokio = { version = "1.0", features = ["full", "test-util"] }
+# Lint inheritance: every member crate picks up these lints.
+# `-D warnings` on the `cargo clippy` line still works because the
+# nightly cron invokes clippy directly, not via the workspace.
+[workspace.lints.clippy]
+# Reserve the key for future workspace-wide lints; intentionally
+# empty for now so member crates aren't surprised by a sudden
+# tightening.
