@@ -1,0 +1,136 @@
+syntax = "proto3";
+
+package oxide_kv.raft;
+
+// Wire-format notes:
+// - All RPC types below are emitted/consumed by prost on the Rust side.
+// - Transport framing on the TCP socket is 4-byte big-endian length prefix
+//   followed by the protobuf payload (length-prefixed framing is the standard
+//   pattern over a byte stream; pure line-delimited JSON does not work for
+//   binary protobuf).
+//
+// Schema covers the on-the-wire Raft RPC surface only. Storage formats
+// (WAL, snapshot file, meta) and the external client command protocol are
+// intentionally out of scope and remain on their existing formats.
+
+// ---- Log entries (nested so AppendEntries can carry them) ----
+
+message LogEntry {
+  uint64 term = 1;
+  uint64 index = 2;
+  Command command = 3;
+}
+
+message Command {
+  oneof body {
+    Set set = 1;
+    Get get = 2;
+    Delete delete = 3;
+    Empty compact = 4;
+    BeginTx begin_tx = 5;
+    // Tag 6 (was `TxVote`) intentionally unused: in P6 the 2PC
+    // coordinator votes travel on the side-channel RPC defined in
+    // `proto/coordination.proto` rather than through the Raft log.
+    // The tag is left open rather than `reserved` because `reserved`
+    // cannot be declared inside a `oneof`; instead we simply omit the
+    // variant and rely on the absence to discourage reuse.
+    DecideTx decide_tx = 7;
+  }
+}
+
+message Set {
+  string key = 1;
+  string value = 2;
+}
+
+message Get {
+  string key = 1;
+}
+
+message Delete {
+  string key = 1;
+}
+
+// Sentinel for the no-op Compact command (the wire format must always
+// carry a payload for a `oneof` field).
+message Empty {}
+
+message TxOp {
+  oneof body {
+    Set put = 1;
+    Delete delete = 2;
+  }
+}
+
+message BeginTx {
+  string tx_id = 1;
+  repeated TxOp ops = 2;
+}
+
+// `TxVote` was removed in P6 (see `proto/coordination.proto`).
+// Votes now travel on the side-channel RPC rather than through the
+// Raft log. The Command body tag 6 is reserved above to prevent reuse.
+
+message DecideTx {
+  string tx_id = 1;
+  bool commit = 2;
+}
+
+// ---- RPC arguments ----
+
+message RequestVoteArgs {
+  uint64 term = 1;
+  string candidate_id = 2;
+  uint64 last_log_index = 3;
+  uint64 last_log_term = 4;
+}
+
+message VoteResponseArgs {
+  uint64 term = 1;
+  bool vote_granted = 2;
+}
+
+message AppendEntriesArgs {
+  uint64 term = 1;
+  string leader_id = 2;
+  uint64 prev_log_index = 3;
+  uint64 prev_log_term = 4;
+  repeated LogEntry entries = 5;
+  uint64 leader_commit = 6;
+}
+
+message AppendReplyArgs {
+  uint64 term = 1;
+  bool success = 2;
+}
+
+message Snapshot {
+  uint64 last_included_index = 1;
+  uint64 last_included_term = 2;
+  map<string, string> data = 3;
+}
+
+message InstallSnapshotArgs {
+  uint64 term = 1;
+  string leader_id = 2;
+  uint64 last_included_index = 3;
+  uint64 last_included_term = 4;
+  Snapshot snapshot = 5;
+}
+
+message InstallSnapshotReplyArgs {
+  uint64 term = 1;
+}
+
+// ---- Top-level RPC envelope (one per TCP request) ----
+
+message RaftMessage {
+  oneof body {
+    RequestVoteArgs request_vote = 1;
+    VoteResponseArgs vote_response = 2;
+    AppendEntriesArgs append_entries = 3;
+    AppendReplyArgs append_reply = 4;
+    InstallSnapshotArgs install_snapshot = 5;
+    InstallSnapshotReplyArgs install_snapshot_reply = 6;
+  }
+}

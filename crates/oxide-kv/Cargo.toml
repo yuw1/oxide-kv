@@ -1,0 +1,36 @@
+[package]
+name = "oxide-kv"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A lightweight distributed key-value store built in Rust, implementing the Raft Consensus Algorithm."
+
+[dependencies]
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["full"] }
+rand = "0.8"
+bincode = "1.3"
+clap = { version = "4.0", features = ["derive"] }
+prost = "0.13"
+# `oxide-kv-client` is the standalone Rust client crate (P8 PR 2).
+# Pulled in here so the `examples/oxide_kv_cli.rs` example can
+# demonstrate using it from the server crate's binary context.
+# Cargo workspace resolves this from the sibling crate.
+oxide-kv-client = { path = "../oxide-kv-client" }
+# `tempfile` is used by the SimHarness (P7 foundation) in lib
+# tests + the integration test suite. Keeping it as a regular
+# dependency (not just dev-dep) lets the harness live in the
+# library so it can be reused from any `tests/*.rs`.
+tempfile = "3.10"
+
+[build-dependencies]
+prost-build = "0.13"
+
+[dev-dependencies]
+# `test-util` enables `#[tokio::test(start_paused = true)]`, which
+# the SimClock determinism tests rely on. Feature is only pulled in
+# for dev builds (test compilation), not for the release binary.
+tokio = { version = "1.0", features = ["full", "test-util"] }

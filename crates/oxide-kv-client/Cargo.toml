@@ -1,0 +1,15 @@
+[package]
+name = "oxide-kv-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Async TCP client for Oxide-KV. Talks the JSON line protocol; usable from CLI / Desktop / embedded agents / future PyO3 bindings."
+
+[dependencies]
+tokio = { version = "1.0", features = ["full"] }
+serde_json = "1.0"
+thiserror = "1.0"
+
+[dev-dependencies]
+tokio = { version = "1.0", features = ["full", "test-util"] }
