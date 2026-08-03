@@ -69,7 +69,7 @@ use oxide_kv::raft::reference_model::ReferenceModel;
 use oxide_kv::raft::sim_harness::SimCluster;
 
 /// A single action the fuzzer may take during a scenario.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 enum Action {
     SubmitSet { key: String, value: String },
     SubmitDelete { key: String },
@@ -223,10 +223,28 @@ fn generate_actions(rng: &mut FuzzRng, len: usize, n_nodes: usize) -> Vec<Action
 /// Run one scenario to completion. Returns `Err` with a
 /// diagnostic message if any cross-check fails; `Ok(())` if
 /// the cluster survives the action sequence cleanly.
+///
+/// The seed only drives action *generation*; the actual
+/// execution lives in [`run_actions`], so the shrinker can
+/// replay arbitrary subsets of the original sequence without
+/// re-drawing from the RNG.
 async fn run_scenario(seed: u64, action_len: usize) -> Result<(), String> {
     let mut rng = FuzzRng::new(seed);
     let actions = generate_actions(&mut rng, action_len, 3);
+    run_actions(&actions).await
+}
 
+/// Replay a pre-generated action sequence against a fresh
+/// 3-node cluster and cross-check the post-run state against
+/// the safety invariant checker + sequential reference model.
+///
+/// This is the entry point used by both the seed-driven fuzz
+/// tests and the shrinker: the shrinker re-runs the failing
+/// scenario with progressively smaller prefixes / single
+/// removals until the failure persists at the minimum
+/// length, then prints the minimal sequence as a copy-paste
+/// regression-test stub.
+async fn run_actions(actions: &[Action]) -> Result<(), String> {
     // Build a cluster with a partition controller
     // (manipulated by PartitionLink / HealPartitions
     // actions). We use the PartitionedNetwork from the
@@ -266,8 +284,8 @@ async fn run_scenario(seed: u64, action_len: usize) -> Result<(), String> {
     for (i, action) in actions.iter().enumerate() {
         if std::time::Instant::now() >= scenario_deadline {
             return Err(format!(
-                "[fuzz seed={}] scenario deadline exceeded at action {}/{}; aborting",
-                seed, i, actions.len()
+                "[fuzz] scenario deadline exceeded at action {}/{}; aborting",
+                i, actions.len()
             ));
         }
         match action {
@@ -391,8 +409,7 @@ async fn run_scenario(seed: u64, action_len: usize) -> Result<(), String> {
         // the test harness.
         if i == actions.len() - 1 {
             eprintln!(
-                "[fuzz seed={} action={}/{}] {}",
-                seed,
+                "[fuzz action={}/{}] {}",
                 i + 1,
                 actions.len(),
                 action.label()
@@ -485,10 +502,9 @@ async fn run_scenario(seed: u64, action_len: usize) -> Result<(), String> {
     // Cross-check 1: safety invariants.
     assert_invariants(&cluster).map_err(|e| {
         format!(
-            "[fuzz seed={}] invariant violation: {}\n\
+            "[fuzz] invariant violation: {}\n\
              action sequence:\n{}\n\
              reference model state: {:?}",
-            seed,
             e,
             actions
                 .iter()
@@ -539,11 +555,10 @@ async fn run_scenario(seed: u64, action_len: usize) -> Result<(), String> {
             if actual.as_ref() != Some(expected) {
                 cluster.shutdown().await;
                 return Err(format!(
-                    "[fuzz seed={}] reference model mismatch on leader \
+                    "[fuzz] reference model mismatch on leader \
                      (n{}) for key {:?}: cluster={:?} reference={:?}\n\
                      action sequence:\n{}\n\
                      killed={:?} leader_commit={}",
-                    seed,
                     l,
                     key,
                     actual,
@@ -613,14 +628,13 @@ async fn run_scenario(seed: u64, action_len: usize) -> Result<(), String> {
                 if l_idx != (entry.index as u64) || l_term != entry.term {
                     cluster.shutdown().await;
                     return Err(format!(
-                        "[fuzz seed={}] follower n{} log diverges from \
+                        "[fuzz] follower n{} log diverges from \
                          leader at index {}: follower (idx={}, term={}) \
                          vs leader (idx={}, term={}). Follower \
                          commit_index={} last_applied={} term={} \
                          state={:?}; leader commit_index={} term={}\n\
                          action sequence:\n{}\n\
                          killed={:?}",
-                        seed,
                         n,
                         entry.index,
                         entry.index,
@@ -648,6 +662,403 @@ async fn run_scenario(seed: u64, action_len: usize) -> Result<(), String> {
 
     cluster.shutdown().await;
     Ok(())
+}
+
+// =====================================================================
+// Shrinker
+// =====================================================================
+//
+// When a fuzz scenario fails, the `Err` message includes the
+// full action sequence. To turn that into a minimal
+// regression-test repro we apply a delta-debugging style
+// shrinker:
+//
+// 1. **Chunk removal.** Repeatedly split the action sequence
+//    in half and try dropping each half. If the failure still
+//    reproduces with one half missing, recurse on the
+//    surviving half. Halve until the chunk size reaches 1.
+// 2. **Single removal.** Walk every index in the (now possibly
+//    smaller) sequence; for each i, try removing just `i` and
+//    keep the minimum-length sequence that still fails.
+//
+// The output is a Rust `Vec<Action>` literal you can paste
+// straight into a `#[tokio::test]` to lock in the regression.
+// The shrinker is **deterministic** for a given input: every
+// step just re-runs `run_actions(&candidate)` against the
+// existing harness with no new randomness, so a failed input
+// shrinks to the same minimal sequence on every run.
+
+// Limit on shrink iterations. Each failed candidate pays the
+// full scenario cost (~25 actions * 2ms sleep + cluster
+// bringup ~50ms = ~100ms), so 256 candidates ≈ 25s ceiling.
+// Realistic shrinks finish in <50 iterations.
+const SHRINK_MAX_ITERATIONS: usize = 256;
+
+/// Shrink a failing (seed, action_len) down to a minimal
+/// action sequence that still fails. Returns `None` if the
+/// original scenario doesn't fail in the first place (callers
+/// can use this to gate the entry-point test on actual
+/// reproduction).
+async fn shrink_failing_scenario(
+    seed: u64,
+    action_len: usize,
+) -> Option<Vec<Action>> {
+    // Step 0: reproduce. We need a known-failing scenario to
+    // shrink; bail out otherwise.
+    let mut rng = FuzzRng::new(seed);
+    let original = generate_actions(&mut rng, action_len, 3);
+    if run_actions(&original).await.is_ok() {
+        return None;
+    }
+    Some(
+        shrink_with_async_checker(&original, |candidate| async move {
+            run_actions(&candidate).await.is_err()
+        })
+        .await,
+    )
+}
+
+/// Sync variant of [`shrink_with_async_checker`]: used by
+/// the property tests so they don't need to drive the full
+/// cluster harness. Algorithmically identical to the async
+/// version; only the checker type differs.
+async fn shrink_with_checker<F>(
+    original: &[Action],
+    check: F,
+) -> Vec<Action>
+where
+    F: Fn(&[Action]) -> bool,
+{
+    let mut current = original.to_vec();
+    let mut iterations = 0usize;
+
+    let mut chunk = current.len() / 2;
+    while chunk > 0 && iterations < SHRINK_MAX_ITERATIONS {
+        let mut progressed = false;
+        let mut start = 0usize;
+        while start + chunk <= current.len()
+            && iterations < SHRINK_MAX_ITERATIONS
+        {
+            let mut candidate = current.clone();
+            candidate.drain(start..start + chunk);
+            iterations += 1;
+            if check(&candidate) {
+                current = candidate;
+                progressed = true;
+            } else {
+                start += chunk;
+            }
+        }
+        if !progressed {
+            chunk /= 2;
+        }
+        if current.is_empty() {
+            break;
+        }
+    }
+
+    let mut i = 0usize;
+    while i < current.len() && iterations < SHRINK_MAX_ITERATIONS {
+        let mut candidate = current.clone();
+        candidate.remove(i);
+        iterations += 1;
+        if check(&candidate) {
+            current = candidate;
+        } else {
+            i += 1;
+        }
+    }
+
+    current
+}
+
+/// Async variant of [`shrink_with_checker`]: drives `check`
+/// (an async closure) sequentially so we can use the real
+/// `run_actions` future as the failure oracle.
+async fn shrink_with_async_checker<F, Fut>(
+    original: &[Action],
+    check: F,
+) -> Vec<Action>
+where
+    F: Fn(Vec<Action>) -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let mut current = original.to_vec();
+    let mut iterations = 0usize;
+
+    // ---- Pass 1: chunk removal (delta debugging) ----
+    let mut chunk = current.len() / 2;
+    while chunk > 0 && iterations < SHRINK_MAX_ITERATIONS {
+        let mut progressed = false;
+        let mut start = 0usize;
+        while start + chunk <= current.len()
+            && iterations < SHRINK_MAX_ITERATIONS
+        {
+            let mut candidate = current.clone();
+            candidate.drain(start..start + chunk);
+            iterations += 1;
+            if check(candidate.clone()).await {
+                current = candidate;
+                progressed = true;
+            } else {
+                start += chunk;
+            }
+        }
+        if !progressed {
+            chunk /= 2;
+        }
+        if current.is_empty() {
+            break;
+        }
+    }
+
+    // ---- Pass 2: single removal ----
+    let mut i = 0usize;
+    while i < current.len() && iterations < SHRINK_MAX_ITERATIONS {
+        let mut candidate = current.clone();
+        candidate.remove(i);
+        iterations += 1;
+        if check(candidate.clone()).await {
+            current = candidate;
+        } else {
+            i += 1;
+        }
+    }
+
+    current
+}
+
+/// Format a minimal failing action sequence as both a
+/// human-readable label list (for the panic message) and a
+/// Rust `Vec<Action>` literal (for copy-pasting into a
+/// regression test).
+fn format_shrunk_sequence(actions: &[Action]) -> String {
+    let mut out = String::new();
+    out.push_str("Minimal failing sequence (");
+    out.push_str(&actions.len().to_string());
+    out.push_str(" actions):\n");
+    for (i, a) in actions.iter().enumerate() {
+        out.push_str(&format!("  {}: {}\n", i, a.label()));
+    }
+    out.push_str("\nPaste into a regression test as:\n");
+    out.push_str("    let actions = vec![\n");
+    for a in actions {
+        out.push_str("        Action::");
+        match a {
+            Action::SubmitSet { key, value } => {
+                out.push_str(&format!(
+                    "SubmitSet {{ key: {}.into(), value: {}.into() }},\n",
+                    key, value
+                ));
+            }
+            Action::SubmitDelete { key } => {
+                out.push_str(&format!(
+                    "SubmitDelete {{ key: {}.into() }},\n",
+                    key
+                ));
+            }
+            Action::SubmitTx { tx_id, ops } => {
+                out.push_str(&format!(
+                    "SubmitTx {{ tx_id: {}.into(), ops: vec![",
+                    tx_id
+                ));
+                for op in ops {
+                    match op {
+                        oxide_kv::protocol::TxOp::Put { key, value } => {
+                            out.push_str(&format!(
+                                "TxOp::Put {{ key: {}.into(), value: {}.into() }},",
+                                key, value
+                            ));
+                        }
+                        oxide_kv::protocol::TxOp::Delete { key } => {
+                            out.push_str(&format!(
+                                "TxOp::Delete {{ key: {}.into() }},",
+                                key
+                            ));
+                        }
+                    }
+                }
+                out.push_str("] },\n");
+            }
+            Action::DriveElection { candidate_idx } => {
+                out.push_str(&format!(
+                    "DriveElection {{ candidate_idx: {} }},\n",
+                    candidate_idx
+                ));
+            }
+            Action::KillNode { idx } => {
+                out.push_str(&format!("KillNode {{ idx: {} }},\n", idx));
+            }
+            Action::RestartNode { idx } => {
+                out.push_str(&format!(
+                    "RestartNode {{ idx: {} }},\n",
+                    idx
+                ));
+            }
+            Action::PartitionLink { from, to } => {
+                out.push_str(&format!(
+                    "PartitionLink {{ from: {}, to: {} }},\n",
+                    from, to
+                ));
+            }
+            Action::HealPartitions => {
+                out.push_str("HealPartitions,\n");
+            }
+            Action::Yield => {
+                out.push_str("Yield,\n");
+            }
+        }
+    }
+    out.push_str("    ];\n");
+    out.push_str("    run_actions(&actions).await.unwrap();\n");
+    out
+}
+
+/// Shrink a failing fuzz scenario to a minimal repro. Driven
+/// by `OXIDE_FUZZ_SEED` (default 0) and `OXIDE_FUZZ_LEN`
+/// (default 25). Ignored by default so it doesn't run in CI;
+/// invoke manually:
+///
+/// ```text
+/// OXIDE_FUZZ_SEED=186 OXIDE_FUZZ_LEN=25 \
+///   cargo test --release --test raft_fuzz shrink_repro -- \
+///   --ignored --nocapture
+/// ```
+///
+/// If the seed doesn't fail, the test prints a hint and passes
+/// (so it can be invoked against any seed during investigation
+/// without panicking).
+#[tokio::test]
+#[ignore = "manual: requires a failing seed; see OXIDE_FUZZ_SEED docs"]
+async fn shrink_repro() {
+    let seed: u64 = std::env::var("OXIDE_FUZZ_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let action_len: usize = std::env::var("OXIDE_FUZZ_LEN")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(25);
+
+    eprintln!(
+        "[shrink_repro] seed={} action_len={} (override via OXIDE_FUZZ_SEED / OXIDE_FUZZ_LEN)",
+        seed, action_len
+    );
+
+    match shrink_failing_scenario(seed, action_len).await {
+        Some(minimal) => {
+            let report = format_shrunk_sequence(&minimal);
+            eprintln!("\n{}", report);
+            // Re-run the minimal sequence one more time so the
+            // panic (if any) carries the same shrunk trace.
+            // If even the minimal repro doesn't fail, that's a
+            // shrinker bug — surface it loudly.
+            if run_actions(&minimal).await.is_ok() {
+                panic!(
+                    "[shrink_repro] shrinker returned a sequence that does not fail: {}",
+                    report
+                );
+            }
+        }
+        None => {
+            eprintln!(
+                "[shrink_repro] seed={} action_len={} does not fail; nothing to shrink. \
+                 Try a different OXIDE_FUZZ_SEED (e.g. 0..200 from fuzz_default_seeds_0_to_200).",
+                seed, action_len
+            );
+        }
+    }
+}
+
+/// Property test: the sync shrinker reduces a long failing
+/// sequence to a shorter failing sequence. Predicate:
+/// "fails iff at least one `SubmitSet` is present". The
+/// minimal sequence is therefore exactly one `SubmitSet`.
+#[tokio::test]
+async fn shrink_algorithm_reduces_to_minimum() {
+    // 25 actions: 1 SubmitSet + 24 Yield. Original length 25.
+    let mut actions: Vec<Action> = (0..24)
+        .map(|_| Action::Yield)
+        .collect();
+    actions.push(Action::SubmitSet {
+        key: "k0".into(),
+        value: "v0".into(),
+    });
+
+    let shrunk = shrink_with_checker(&actions, |candidate| {
+        candidate
+            .iter()
+            .any(|a| matches!(a, Action::SubmitSet { .. }))
+    })
+    .await;
+
+    // The minimal failing sequence is exactly the single
+    // SubmitSet: dropping any other action still leaves
+    // (or removes) the SubmitSet.
+    assert_eq!(
+        shrunk.len(),
+        1,
+        "expected shrinker to reduce 25 actions to 1 SubmitSet, got {} actions: {:?}",
+        shrunk.len(),
+        shrunk.iter().map(|a| a.label()).collect::<Vec<_>>()
+    );
+    assert!(
+        matches!(shrunk[0], Action::SubmitSet { .. }),
+        "expected SubmitSet, got {}",
+        shrunk[0].label()
+    );
+}
+
+/// Property test: shrinking a sequence that *never* fails is
+/// a no-op — the shrinker preserves the empty-or-pass case
+/// (it returns the input unchanged because no deletion can
+/// keep the failure predicate true).
+#[tokio::test]
+async fn shrink_algorithm_no_op_on_pass() {
+    let actions: Vec<Action> = (0..10).map(|_| Action::Yield).collect();
+    // Predicate: never fails.
+    let shrunk = shrink_with_checker(&actions, |_| false).await;
+    // No failure to preserve, so the shrinker leaves the
+    // sequence unchanged: every removal would drop a
+    // passing element, so the shrinker can't progress.
+    assert_eq!(shrunk.len(), actions.len());
+    assert!(shrunk.iter().all(|a| matches!(a, Action::Yield)));
+}
+
+/// Property test: a longer failing input shrinks to a shorter
+/// failing input (and never longer).
+#[tokio::test]
+async fn shrink_algorithm_strictly_shorter_or_equal() {
+    let mut actions: Vec<Action> = (0..50)
+        .map(|_| Action::Yield)
+        .collect();
+    // Mark "fail iff there is at least one DriveElection".
+    actions.push(Action::DriveElection { candidate_idx: 0 });
+    actions.push(Action::Yield);
+    actions.push(Action::Yield);
+
+    let shrunk = shrink_with_checker(&actions, |c| {
+        c.iter()
+            .any(|a| matches!(a, Action::DriveElection { .. }))
+    })
+    .await;
+
+    assert!(
+        shrunk.len() <= actions.len(),
+        "shrinker grew the sequence: {} -> {}",
+        actions.len(),
+        shrunk.len()
+    );
+    assert!(
+        shrunk.len() >= 1,
+        "shrinker removed the only failing action"
+    );
+    assert!(
+        shrunk
+            .iter()
+            .any(|a| matches!(a, Action::DriveElection { .. })),
+        "shrinker dropped the failing predicate"
+    );
 }
 
 // =====================================================================
