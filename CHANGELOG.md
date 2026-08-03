@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (P7 fuzz shrinker)
+- `tests/raft_fuzz.rs` now includes a delta-debugging
+  shrinker that turns a failing fuzz scenario into a
+  minimal reproduction:
+  - `shrink_with_checker` (sync, used by property tests)
+    and `shrink_with_async_checker` (async, drives the
+    real `run_actions` future) — algorithmically
+    identical; two passes: chunk removal (halve → quarter
+    → … → single) then single-element removal.
+  - `shrink_failing_scenario(seed, action_len)` —
+    top-level entry: regenerates the action sequence,
+    bails out with `None` if the scenario doesn't fail,
+    otherwise returns the minimal failing prefix.
+  - `format_shrunk_sequence` — emits both a human-
+    readable label list and a copy-pasteable
+    `Vec<Action>` literal for the regression test.
+- New `#[ignore]` entry `shrink_repro` driven by
+  `OXIDE_FUZZ_SEED` / `OXIDE_FUZZ_LEN` env vars
+  (defaults 0 / 25). Manual invocation:
+  `OXIDE_FUZZ_SEED=186 OXIDE_FUZZ_LEN=25 cargo test
+   --release --test raft_fuzz shrink_repro --
+   --ignored --nocapture`. If the seed passes, the
+  test prints a hint and exits successfully so it can
+  be tried against any candidate seed during
+  investigation.
+- `run_scenario` was split into `run_scenario` (RNG
+  entry, for fuzz sweeps) + `run_actions(actions)`
+  (vector entry, used by the shrinker to replay
+  arbitrary sub-sequences without re-drawing from the
+  RNG). Determinism preserved: same action list →
+  same scenario outcome.
+- `Action` enum gains `PartialEq` for test assertions.
+- 3 new property tests for the shrinker:
+  `shrink_algorithm_reduces_to_minimum` (25 actions →
+  1 `SubmitSet`), `shrink_algorithm_no_op_on_pass`
+  (10 yields → unchanged), and
+  `shrink_algorithm_strictly_shorter_or_equal`
+  (50 yields + 1 election → ≤ input length, still
+  contains the election).
+- Iteration budget `SHRINK_MAX_ITERATIONS = 256`
+  (~25s ceiling; realistic shrinks finish in <50).
+
 ### Added (P7 fuzz 2PC coverage)
 - The fuzz harness now drives real two-phase-commit rounds.
   New `SubmitTx { tx_id, ops }` action in `tests/raft_fuzz.rs`
