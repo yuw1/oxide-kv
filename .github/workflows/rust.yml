@@ -17,9 +17,29 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: Install protoc
-      # Required by build.rs (prost-build). Not pre-installed on ubuntu-latest runners.
+      # Required by build.rs (prost-build) inside crates/oxide-kv.
+      # Not pre-installed on ubuntu-latest runners.
       run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+    - name: Build (workspace)
+      # Cargo workspace introduced by PR #34; must use `--workspace` so
+      # both `crates/oxide-kv` (server) and `crates/oxide-kv-client`
+      # (new client crate) are built.
+      run: cargo build --workspace --verbose
+    - name: Run tests (workspace, default only)
+      # Default CI skips the fuzz scenarios in
+      # `crates/oxide-kv/tests/raft_fuzz.rs` (`fuzz_default_seeds_*`,
+      # `fuzz_long_seeds_*`, `fuzz_short_seeds_*`, `fuzz_smoke_single_seed`).
+      # Those scenarios take ~8 minutes on a runner and are entirely
+      # redundant with the nightly sweep (see
+      # `.github/workflows/nightly.yml`, which runs
+      # `fuzz_nightly_seeds_10000_to_11000`, 1000 scenarios × 25 actions).
+      # The shrink property tests (`shrink_algorithm_*`) live in the same
+      # file but are not skipped — they're millisecond-scale unit tests,
+      # not scenarios, and gate the shrinker itself.
+      run: cargo test --workspace --verbose -- --skip fuzz_
+    - name: Run examples (workspace)
+      # `--examples` is part of `--all-targets`, but call it explicitly so
+      # future readers see the intent. The CLI example under
+      # `crates/oxide-kv/examples/oxide_kv_cli.rs` exercises the new
+      # `oxide-kv-client` crate end-to-end at build time.
+      run: cargo build --workspace --examples --verbose

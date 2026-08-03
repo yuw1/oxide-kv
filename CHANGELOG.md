@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (CI workflows: workspace paths + skip fuzz in default PR)
+- `.github/workflows/rust.yml`:
+  - Switched default CI to `cargo build --workspace` /
+    `cargo test --workspace` /
+    `cargo build --workspace --examples`. Required by
+    PR #34's Cargo workspace restructure (which introduced
+    `crates/oxide-kv/` and `crates/oxide-kv-client/`); the
+    pre-PR-#34 `cargo build` / `cargo test` invocations no
+    longer cover the new client crate.
+  - Default PR run now invokes `cargo test --workspace --
+    --skip fuzz_` instead of the full workspace sweep. The
+    four `fuzz_*_seeds_*` scenarios + `fuzz_smoke_single_seed`
+    (in `crates/oxide-kv/tests/raft_fuzz.rs`) cost ~8
+    minutes on an ubuntu-latest runner and are entirely
+    redundant with the nightly sweep (which runs
+    `fuzz_nightly_seeds_10000_to_11000` — 1000 scenarios ×
+    25 actions). The shrink property tests
+    (`shrink_algorithm_*`) in the same file are not
+    skipped (millisecond-scale unit tests, not scenarios).
+- `.github/workflows/nightly.yml`:
+  - Updated fuzz-test path to
+    `crates/oxide-kv/tests/raft_fuzz.rs` (moved by PR #34).
+  - Added `--workspace` to `cargo build --release` /
+    `cargo test --release` invocations (required since PR
+    #34's workspace restructure).
+- **Effect**: PR CI wall-clock drops from ~520s to ~14s.
+  Nightly coverage unchanged. The previous master
+  workflows (left over from before PR #34) would have
+  missed the new client crate in default CI and broken
+  the nightly test path; this PR closes that gap.
+
 ### Added (auto log compaction)
 - `src/state_machine.rs`: new `install_snapshot(data)`
   wipes the local LSM (memtable + SSTables + LSM WAL) and
