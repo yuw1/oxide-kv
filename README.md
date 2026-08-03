@@ -265,6 +265,53 @@ proto/
 
 ---
 
+## Running the simulation (P7 DST)
+
+The fuzz harness in `tests/raft_fuzz.rs` runs the real RaftNode code
+under deterministic fault injection (kill / restart / partition /
+heal / election / yield) and cross-checks post-run state against the
+safety invariant checker and a sequential reference model.
+
+### Default CI
+
+PR / push runs the 5 default sweeps (~601 scenarios, ~8 min):
+
+```text
+fuzz_default_seeds_0_to_200       200 scenarios × 25 actions
+fuzz_default_seeds_1000_to_1200   200 scenarios × 25 actions
+fuzz_long_seeds_2000_to_2100      100 scenarios × 50 actions
+fuzz_short_seeds_3000_to_3100     100 scenarios × 5 actions
+fuzz_smoke_single_seed            1 trivial scenario
+```
+
+### Nightly sweep
+
+A separate `#[ignore]` entry runs a fresh 1000-scenario sweep,
+driven by `.github/workflows/nightly.yml` on a daily cron
+(02:00 UTC). Locally:
+
+```bash
+cargo test --release --test raft_fuzz -- \
+  --ignored fuzz_nightly_seeds_10000_to_11000 --nocapture
+```
+
+### Reproducing a failing seed
+
+When a fuzz test panics, the message includes the failing seed and
+the full action sequence. To turn that into a minimal repro:
+
+```bash
+OXIDE_FUZZ_SEED=<seed> OXIDE_FUZZ_LEN=<len> \
+  cargo test --release --test raft_fuzz shrink_repro -- \
+  --ignored --nocapture
+```
+
+The shrinker (`PR #30`) applies delta debugging — chunk removal
+followed by single-element removal — and emits a copy-pasteable
+`Vec<Action>` literal you can drop into a regression test.
+
+---
+
 ## Roadmap
 
 The active roadmap lives in [ROADMAP.md](./ROADMAP.md). That file is

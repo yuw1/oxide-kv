@@ -252,10 +252,10 @@ sim clock/network/scheduler, invariants + reference model + seed fuzz).
 The fuzz harness now also drives real 2PC rounds (`SubmitTx` action →
 `SimCluster::run_tx` → the production coordinator), which is what feeds
 the 2PC-atomicity invariant and the reference model's transaction
-handling. Remaining: scaling the scenario count to ≥1000 in a
-CI-bounded way (default gate vs nightly) and the "how to run /
-reproduce a failing seed" docs. (Shrinker landed — see
-`#[ignore] shrink_repro` in `tests/raft_fuzz.rs`.)
+handling. Remaining: the "how to run / reproduce a failing seed"
+docs. (Shrinker + nightly-1000 split landed — see `#[ignore]
+shrink_repro` and `fuzz_nightly_seeds_10000_to_11000` in
+`tests/raft_fuzz.rs`, plus `.github/workflows/nightly.yml`.)
 
 - **Abstract transport + clock behind traits.** Introduce `Transport`
   and `Clock` traits; `real` impls wrap the current TCP + `tokio::time`
