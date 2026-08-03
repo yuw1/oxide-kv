@@ -1,0 +1,37 @@
+name: nightly
+
+# Daily fuzz sweep. Runs the `#[ignore]` `fuzz_nightly_seeds_10000_to_11000`
+# test entry in `tests/raft_fuzz.rs` (1000 scenarios × 25 actions), which is
+# skipped by default CI to keep PR feedback fast. Driven on a cron so we
+# surface safety violations within ~24h of landing.
+#
+# Manual trigger: GitHub UI → Actions → nightly → Run workflow.
+# Local repro: cargo test --release --test raft_fuzz --
+#              --ignored fuzz_nightly_seeds_10000_to_11000
+
+on:
+  schedule:
+    # 02:00 UTC ≈ 10:00 Asia/Shanghai — quiet hour for the cluster
+    - cron: '0 2 * * *'
+  workflow_dispatch: # allow manual trigger from the Actions UI
+
+jobs:
+  fuzz-nightly:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protoc
+        # Required by build.rs (prost-build). Not pre-installed on
+        # ubuntu-latest runners.
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Run nightly fuzz sweep
+        # Single-threaded to keep the simulation deterministic; a single
+        # nightly scenario drives a fresh 3-node cluster + 25 actions so
+        # parallel runs wouldn't share state anyway.
+        run: |
+          cargo build --release --tests
+          cargo test --release --test raft_fuzz -- \
+            --ignored fuzz_nightly_seeds_10000_to_11000 --nocapture

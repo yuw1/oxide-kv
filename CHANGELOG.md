@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (P7 nightly fuzz + CI split)
+- New `#[ignore]` test entry
+  `fuzz_nightly_seeds_10000_to_11000` in `tests/raft_fuzz.rs`:
+  1000 scenarios × 25 actions over a fresh seed range
+  (10000..11000) that doesn't overlap the default CI
+  sweeps. Marked `#[ignore]` so PR pushes stay fast
+  (~8 min); the GitHub Actions `nightly` workflow
+  drives it on a daily cron.
+- New `.github/workflows/nightly.yml`: schedules a
+  single-threaded `cargo test --release --test
+  raft_fuzz -- --ignored fuzz_nightly_seeds_10000_to_11000`
+  run at 02:00 UTC every day (~10:00 Asia/Shanghai).
+  Also exposes `workflow_dispatch` for manual trigger
+  from the Actions UI. Ubuntu runner, same as the
+  default CI; protobuf-compiler install reused from
+  `rust.yml`.
+- README: new "Running the simulation" section
+  documenting the default CI vs nightly split, the
+  env-var knobs (`OXIDE_FUZZ_SEED` / `OXIDE_FUZZ_LEN`),
+  and the failure-repro recipe (copy the printed
+  action list into `shrink_repro`).
+
 ### Added (P7 fuzz shrinker)
 - `tests/raft_fuzz.rs` now includes a delta-debugging
   shrinker that turns a failing fuzz scenario into a

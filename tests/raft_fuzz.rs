@@ -1115,3 +1115,22 @@ async fn fuzz_smoke_single_seed() {
     // happy path of cluster bringup + shutdown.
     run_scenario(42, 0).await.unwrap();
 }
+
+/// Nightly sweep: 1000 scenarios × 25 actions over a fresh
+/// seed range that doesn't overlap the default CI runs
+/// (0..200, 1000..1200, 2000..2100, 3000..3100). Marked
+/// `#[ignore]` so `cargo test` on PRs / pushes doesn't run
+/// it; the GitHub Actions `nightly` workflow drives it via
+/// `cargo test -- --ignored` on a daily cron.
+///
+/// On a fast CI host this takes ~14 minutes wall-clock. If
+/// it surfaces a violation, the printed action sequence can
+/// be fed to `OXIDE_FUZZ_SEED=<n>` + `OXIDE_FUZZ_LEN=25` to
+/// reproduce via the `shrink_repro` entry (see PR #30).
+#[tokio::test]
+#[ignore = "nightly: 1000-scenario sweep driven by .github/workflows/nightly.yml"]
+async fn fuzz_nightly_seeds_10000_to_11000() {
+    for seed in 10000..11000u64 {
+        run_scenario(seed, 25).await.unwrap_or_else(|e| panic!("{}", e));
+    }
+}
