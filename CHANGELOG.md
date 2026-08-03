@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (P7 simulation docs)
+- README "Running the simulation (P7 DST)" section now
+  includes:
+  - an **Action vocabulary** table documenting all 9
+    actions (`SubmitSet` / `SubmitDelete` / `SubmitTx` /
+    `DriveElection` / `KillNode` / `RestartNode` /
+    `PartitionLink` / `HealPartitions` / `Yield`) and
+    the 30/12/18/18/12/10 distribution;
+  - a **From panic to regression test** walkthrough that
+    shows exactly what to paste into a `#[tokio::test]`
+    after `shrink_repro` emits a minimal `Vec<Action>`
+    literal.
+
 ### Added (P7 nightly fuzz + CI split)
 - New `#[ignore]` test entry
   `fuzz_nightly_seeds_10000_to_11000` in `tests/raft_fuzz.rs`:
