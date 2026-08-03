@@ -1,12 +1,12 @@
 name: nightly
 
 # Daily fuzz sweep. Runs the `#[ignore]` `fuzz_nightly_seeds_10000_to_11000`
-# test entry in `tests/raft_fuzz.rs` (1000 scenarios × 25 actions), which is
-# skipped by default CI to keep PR feedback fast. Driven on a cron so we
-# surface safety violations within ~24h of landing.
+# test entry in `crates/oxide-kv/tests/raft_fuzz.rs` (1000 scenarios × 25
+# actions), which is skipped by default CI to keep PR feedback fast. Driven
+# on a cron so we surface safety violations within ~24h of landing.
 #
 # Manual trigger: GitHub UI → Actions → nightly → Run workflow.
-# Local repro: cargo test --release --test raft_fuzz --
+# Local repro: cargo test --release --workspace --test raft_fuzz --
 #              --ignored fuzz_nightly_seeds_10000_to_11000
 
 on:
@@ -23,15 +23,17 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install protoc
-        # Required by build.rs (prost-build). Not pre-installed on
-        # ubuntu-latest runners.
+        # Required by build.rs (prost-build) inside crates/oxide-kv.
+        # Not pre-installed on ubuntu-latest runners.
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
       - name: Run nightly fuzz sweep
         # Single-threaded to keep the simulation deterministic; a single
         # nightly scenario drives a fresh 3-node cluster + 25 actions so
-        # parallel runs wouldn't share state anyway.
+        # parallel runs wouldn't share state anyway. `--workspace` is
+        # required after the PR #34 workspace restructure; the fuzz
+        # harness itself now lives under `crates/oxide-kv/tests/`.
         run: |
-          cargo build --release --tests
-          cargo test --release --test raft_fuzz -- \
+          cargo build --release --workspace --tests
+          cargo test --release --workspace --test raft_fuzz -- \
             --ignored fuzz_nightly_seeds_10000_to_11000 --nocapture
