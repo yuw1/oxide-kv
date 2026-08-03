@@ -75,4 +75,20 @@ impl Config {
 
     /// Max time to wait for a response of AppendEntries RPC.
     pub fn rpc_append_entries_timeout_ms() -> u64 { 1500 }
+
+    /// When the on-disk WAL grows past this many bytes, the leader takes
+    /// a snapshot of its current state machine and truncates the WAL.
+    /// Defaults to 64 MiB which keeps the WAL small enough to replay in
+    /// well under a second on a typical machine while still letting a
+    /// busy node accumulate a useful amount of history between snapshots.
+    ///
+    /// Override via the `OXIDE_SNAPSHOT_THRESHOLD_BYTES` env var (mainly
+    /// for tests that need a tiny threshold so a few entries trigger a
+    /// snapshot). Followers never snapshot — only the leader does.
+    pub fn snapshot_threshold_bytes() -> u64 {
+        std::env::var("OXIDE_SNAPSHOT_THRESHOLD_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(64 * 1024 * 1024)
+    }
 }

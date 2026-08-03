@@ -311,6 +311,37 @@ impl StateMachine {
         Ok(result)
     }
 
+    /// Replace the entire state with `data` from a freshly-installed snapshot.
+    ///
+    /// This is the path used by [`crate::raft::node::RaftNode::new`] when
+    /// restoring from disk on startup: a snapshot exists from a previous
+    /// run, the local LSM is wiped, and the snapshot data is loaded in.
+    ///
+    /// After this returns the state machine holds exactly the contents of
+    /// `data`; subsequent WAL replays will replay any log entries written
+    /// *after* `last_included_index`. 2PC `pending_txs` are also cleared,
+    /// since they belong to Raft log state, not LSM state — and we cannot
+    /// reconstruct them from the snapshot alone.
+    pub fn install_snapshot(
+        &mut self,
+        data: HashMap<String, String>,
+    ) -> io::Result<()> {
+        self.clear_for_snapshot()?;
+        // Reset memtable_bytes so the loop below sees a clean slate, then
+        // let each insert bump it via the same accounting used by the live
+        // `set` path. We can't route through `set` directly because that
+        // also writes to the LSM WAL — the snapshot is the source of truth
+        // here, and the LSM WAL has already been truncated by
+        // `clear_for_snapshot`.
+        self.memtable_bytes = 0;
+        for (k, v) in data {
+            self.memtable_bytes += estimate_entry(&k);
+            self.memtable_bytes += v.len();
+            self.memtable.insert(k, MemEntry { value: Some(v) });
+        }
+        Ok(())
+    }
+
     /// Wipe all on-disk state. Used when a follower installs a snapshot
     /// from the leader — the local LSM is discarded wholesale.
     pub fn clear_for_snapshot(&mut self) -> io::Result<()> {
@@ -804,6 +835,44 @@ mod tests {
         assert_eq!(sm.sstable_count(), 0);
         assert_eq!(sm.get("a"), None);
         assert_eq!(sm.get("b"), None);
+    }
+
+    #[test]
+    fn install_snapshot_replaces_state_with_supplied_data() {
+        let (_d, mut sm) = open_default();
+        // Seed the state machine with entries that should be wiped.
+        sm.set("old_key", "old_val").unwrap();
+        sm.set("another", "v").unwrap();
+
+        let mut snap_data = std::collections::HashMap::new();
+        snap_data.insert("fresh_a".to_string(), "1".to_string());
+        snap_data.insert("fresh_b".to_string(), "2".to_string());
+        snap_data.insert("fresh_c".to_string(), "3".to_string());
+
+        sm.install_snapshot(snap_data).unwrap();
+
+        // Old entries are gone.
+        assert_eq!(sm.get("old_key"), None);
+        assert_eq!(sm.get("another"), None);
+        // New entries are present.
+        assert_eq!(sm.get("fresh_a").as_deref(), Some("1"));
+        assert_eq!(sm.get("fresh_b").as_deref(), Some("2"));
+        assert_eq!(sm.get("fresh_c").as_deref(), Some("3"));
+        // Memtable bookkeeping matches the post-install size.
+        assert_eq!(sm.memtable_len(), 3);
+    }
+
+    #[test]
+    fn install_snapshot_with_empty_data_clears_state() {
+        let (_d, mut sm) = open_default();
+        sm.set("k", "v").unwrap();
+        sm.flush().unwrap();
+
+        sm.install_snapshot(std::collections::HashMap::new()).unwrap();
+
+        assert_eq!(sm.memtable_len(), 0);
+        assert_eq!(sm.sstable_count(), 0);
+        assert_eq!(sm.get("k"), None);
     }
 
     // ---------- crash recovery ----------

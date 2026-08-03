@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (auto log compaction)
+- `src/state_machine.rs`: new `install_snapshot(data)`
+  wipes the local LSM (memtable + SSTables + LSM WAL) and
+  reloads `data` into the memtable with size accounting
+  consistent with the live `set` path. Used by both
+  `RaftNode::handle_install_snapshot` (incoming from peer)
+  and `RaftNode::restore_from_snapshot` (startup).
+- `src/raft/storage.rs`: new `wal_size_bytes() -> u64`
+  for the on-disk WAL; returns 0 when the file is
+  missing or unreadable so a fresh node short-circuits
+  the threshold check.
+- `src/config.rs`: new `Config::snapshot_threshold_bytes()`
+  defaulting to 64 MiB, overridable via the
+  `OXIDE_SNAPSHOT_THRESHOLD_BYTES` env var (tests use
+  it to trigger snapshots with just a few entries).
+- `src/raft/node.rs`:
+  - `maybe_snapshot(threshold_bytes: u64)` replaces the
+    old entry-count `threshold: usize` signature; keys
+    off the on-disk WAL byte size, still leader-only.
+  - New `restore_from_snapshot() -> Option<(idx, term)>`
+    startup helper: loads the snapshot file, installs it
+    on the state machine, and bumps `commit_index` /
+    `last_applied` to the snapshot position so
+    `replay_logs` only replays WAL entries after the
+    snapshot.
+- `src/main.rs`:
+  - Startup path now calls `restore_from_snapshot()`
+    before `replay_logs()`. A fresh node logs nothing;
+    a restart with a snapshot on disk prints the
+    `Restored snapshot up to index=N term=T` line.
+  - Heartbeat loop ticks `maybe_snapshot` once per
+    250 ms (cheap `stat` call); followers no-op via
+    the existing leader-only guard.
+
 ### Added (P7 simulation docs)
 - README "Running the simulation (P7 DST)" section now
   includes:

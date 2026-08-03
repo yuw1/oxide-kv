@@ -380,9 +380,9 @@ code; fixes don't belong inside the harness PRs.
 
 The active roadmap lives in [ROADMAP.md](./ROADMAP.md). That file is
 the single source of truth for phase status, in-progress work, and
-acceptance criteria. The current phase is **P7 ✅ — Deterministic
-simulation testing (DST)** (shipped via PRs #25–#31; the next
-phase is to be proposed).
+acceptance criteria. The current phase is **P8 — Auto log
+compaction** (PRs #25–#32 ship DST; P8 closes the remaining
+production gap so the WAL doesn't grow unbounded on a 7×24 node).
 
 ### Phase summary
 
@@ -398,10 +398,12 @@ phase is to be proposed).
 | Bug | Single-node read fallback + commit advancement | ✅ | [#9](https://github.com/yuw1/oxide-kv/pull/9) |
 | P6 | Multi-node 2PC coordinator RPC | ✅ | [#11](https://github.com/yuw1/oxide-kv/pull/11)–[#14](https://github.com/yuw1/oxide-kv/pull/14) |
 | **P7** | **Deterministic simulation testing (DST)** | **✅** | [#25](https://github.com/yuw1/oxide-kv/pull/25)–[#31](https://github.com/yuw1/oxide-kv/pull/31) |
+| **P8** | **Auto log compaction + WAL truncation** | **🔄 In progress** | — |
 
 ### Candidate future directions (see ROADMAP.md for full list)
 
-- Deterministic simulation testing (P7, active) — fault injection + invariant proofs
+- Deterministic simulation testing (P7) — fault injection + invariant proofs
+- Auto log compaction + WAL truncation (P8, active) — bound the on-disk WAL size
 - Sharded multi-Raft
 - Joint consensus for membership change (Raft §6)
 - Tx timeout + admin-driven abort

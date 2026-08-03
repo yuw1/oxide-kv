@@ -55,9 +55,19 @@ async fn main() -> anyhow::Result<()> {
 
     let raft_node = Arc::new(RwLock::new(raft_node_inner));
 
-    // 5. Replay logs: Apply WAL commands to the in-memory state machine
+    // 5. Restore from snapshot (if any), then replay remaining WAL entries.
+    //    A snapshot covers everything up to its last_included_index; the
+    //    WAL still contains any entries appended after the snapshot, so
+    //    replay applies just the delta. A node with no prior snapshot
+    //    file simply replays from index 1.
     {
         let mut node = raft_node.write().unwrap();
+        if let Some((idx, term)) = node.restore_from_snapshot() {
+            println!(
+                "📸 Restored snapshot up to index={} term={}; replaying WAL delta",
+                idx, term
+            );
+        }
         node.replay_logs();
     }
 

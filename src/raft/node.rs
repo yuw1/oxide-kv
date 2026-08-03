@@ -171,6 +171,37 @@ impl RaftNode {
         }
     }
 
+    /// Restore the state machine contents from a previously-saved snapshot,
+    /// if one exists on disk. Returns `Some((last_included_index,
+    /// last_included_term))` if a snapshot was applied; `None` if no
+    /// snapshot file was found.
+    ///
+    /// The state machine must already be open (so its on-disk layout is
+    /// reachable) but its contents are wiped via `install_snapshot`. The
+    /// snapshot is the source of truth — any LSM data already on disk is
+    /// discarded, because by definition a snapshot existed at a later
+    /// point and the LSM is being replaced wholesale.
+    ///
+    /// Callers must follow this up by replaying any log entries written
+    /// *after* the snapshot's `last_included_index` (i.e. the entries
+    /// still present in the WAL after `rewrite_wal_after_snapshot` ran
+    /// during the previous run).
+    pub fn restore_from_snapshot(&mut self) -> Option<(u64, u64)> {
+        let snap = self.storage.load_snapshot()?;
+        let last_included_index = snap.last_included_index;
+        let last_included_term = snap.last_included_term;
+        let mut sm = self.state_machine.write().expect("state machine lock");
+        sm.install_snapshot(snap.data)
+            .expect("install_snapshot during startup restore");
+        drop(sm);
+        // Bring commit_index and last_applied forward to the snapshot
+        // position so replay skips the entries the snapshot already
+        // covers.
+        self.commit_index = self.commit_index.max(last_included_index);
+        self.last_applied = self.last_applied.max(last_included_index);
+        Some((last_included_index, last_included_term))
+    }
+
     /// Returns true iff this node was started with no peers (single-node
     /// standalone mode). Useful for fast-paths that would otherwise wait
     /// forever for a quorum that can never form.
@@ -709,6 +740,16 @@ impl RaftNode {
             let is_leader = node_arc.read().unwrap().state == NodeState::Leader;
             if is_leader {
                 Self::sync_logs(node_arc.clone());
+                // Check the WAL size once per heartbeat tick (cheap —
+                // just a `stat` call). If the WAL has grown past the
+                // threshold, take a snapshot and rewrite the WAL. The
+                // threshold is read fresh each tick so tests that tweak
+                // `OXIDE_SNAPSHOT_THRESHOLD_BYTES` mid-run get a chance
+                // to trigger with a low value.
+                {
+                    let mut node = node_arc.write().unwrap();
+                    let _ = node.maybe_snapshot(Config::snapshot_threshold_bytes());
+                }
             }
         }
     }
@@ -903,12 +944,25 @@ impl RaftNode {
         InstallSnapshotReplyArgs { term: self.current_term }
     }
 
-    /// Take a snapshot of the current state machine if the log has grown
-    /// beyond `threshold` entries, then truncate the WAL to free disk space.
+    /// Take a snapshot of the current state machine if the on-disk WAL has
+    /// grown past `threshold_bytes` bytes, then truncate the WAL to free
+    /// disk space.
     ///
-    /// Returns `true` if a snapshot was taken.
-    pub fn maybe_snapshot(&mut self, threshold: usize) -> bool {
-        if self.state != NodeState::Leader || self.log.len() <= threshold {
+    /// Returns `true` if a snapshot was taken. Only the leader snapshots
+    /// (followers receive snapshots from the leader via InstallSnapshot).
+    ///
+    /// The threshold should be sourced from
+    /// [`crate::config::Config::snapshot_threshold_bytes`]; passing the
+    /// raw usize keeps this method easily testable.
+    pub fn maybe_snapshot(&mut self, threshold_bytes: u64) -> bool {
+        if self.state != NodeState::Leader {
+            return false;
+        }
+        // Size check is best-effort (0 == WAL missing / unreadable). A 0
+        // return means "skip the threshold this round", which is the
+        // right thing for a fresh node.
+        let wal_size = self.storage.wal_size_bytes();
+        if wal_size <= threshold_bytes {
             return false;
         }
         // Snapshot at the last applied entry — only entries that have actually
@@ -2096,5 +2150,118 @@ mod tests {
         let view = sm.pending_tx(&tx_id).expect("tx still pending");
         assert_eq!(view.yes_votes, 1);
         assert_eq!(view.no_votes, 0);
+    }
+
+    // ---------- auto snapshot trigger + startup restore ----------
+
+    /// Build a node that is *already* a leader with a couple of Set
+    /// entries committed, so `maybe_snapshot` has something to capture.
+    /// We bypass the normal election path because we're not testing
+    /// leader election here — only the snapshot pipeline.
+    fn make_leader_with_committed_sets(node_id: &str, n: usize) -> (TempDir, RaftNode) {
+        let (dir, mut node) = make_node(node_id, vec![]);
+        node.state = NodeState::Leader;
+        node.current_term = 1;
+        let mut sm = node.state_machine.write().unwrap();
+        for i in 1..=n {
+            sm.set(&format!("k{i}"), &format!("v{i}")).unwrap();
+            node.log.push(crate::protocol::LogEntry {
+                term: 1,
+                index: i,
+                command: crate::protocol::Command::Set {
+                    key: format!("k{i}"),
+                    value: format!("v{i}"),
+                },
+            });
+            node.commit_index = i as u64;
+            node.last_applied = i as u64;
+        }
+        // Persist the matching WAL entries so wal_size_bytes reports a
+        // non-zero value (maybe_snapshot keys off the on-disk size).
+        for i in 1..=n {
+            node.storage.append_wal_log(&node.log[i - 1]).unwrap();
+        }
+        drop(sm);
+        (dir, node)
+    }
+
+    #[test]
+    fn maybe_snapshot_returns_false_when_wal_under_threshold() {
+        let (_d, mut node) = make_leader_with_committed_sets("n1", 3);
+        // Threshold of 1 MiB is far above a few entries; snapshot must
+        // not fire.
+        assert!(!node.maybe_snapshot(1024 * 1024));
+    }
+
+    #[test]
+    fn maybe_snapshot_returns_false_when_not_leader() {
+        let (_d, mut node) = make_leader_with_committed_sets("n2", 3);
+        node.state = NodeState::Follower;
+        // Even with threshold = 0 the follower path returns false.
+        assert!(!node.maybe_snapshot(0));
+    }
+
+    #[test]
+    fn maybe_snapshot_truncates_wal_and_writes_snapshot_when_over_threshold() {
+        let (_d, mut node) = make_leader_with_committed_sets("n3", 5);
+        let wal_before = node.storage.wal_size_bytes();
+        assert!(wal_before > 0);
+
+        // Threshold of 1 byte — guaranteed to trigger.
+        let took = node.maybe_snapshot(1);
+        assert!(took, "snapshot should fire when WAL > threshold");
+
+        // Snapshot file now exists and WAL has shrunk.
+        let snap = node.storage.load_snapshot().expect("snapshot saved");
+        assert_eq!(snap.last_included_index, 5);
+        assert_eq!(snap.last_included_term, 1);
+        assert!(snap.data.contains_key("k1"));
+        assert!(snap.data.contains_key("k5"));
+        let wal_after = node.storage.wal_size_bytes();
+        assert!(wal_after < wal_before, "WAL must shrink after snapshot");
+        // Everything up to index 5 was snapshotted, so 0 entries remain.
+        assert_eq!(wal_after, 0);
+    }
+
+    #[test]
+    fn restore_from_snapshot_returns_none_when_no_snapshot_file() {
+        let (_d, mut node) = make_node("n4", vec![]);
+        assert!(node.restore_from_snapshot().is_none());
+    }
+
+    #[test]
+    fn restore_from_snapshot_populates_state_machine_and_advances_indices() {
+        // First run: write a few entries, snapshot, drop the node.
+        let (dir, mut node) = make_leader_with_committed_sets("n5", 4);
+        assert!(node.maybe_snapshot(1));
+        let snapshot_index = node.storage
+            .load_snapshot()
+            .expect("snapshot saved")
+            .last_included_index;
+
+        // Second run: open a fresh node on the same on-disk files and
+        // restore from snapshot. The state machine should hold the
+        // snapshotted keys, and commit/last_applied should match the
+        // snapshot position.
+        let wal = dir.path().join("n5.wal").to_str().unwrap().to_string();
+        let meta = dir.path().join("n5_meta.json").to_str().unwrap().to_string();
+        let snap = dir.path().join("n5_snapshot.json").to_str().unwrap().to_string();
+        let storage = RaftStorage::new_with_paths(wal, meta, snap);
+        let sm_dir = dir.path().join("n5_sm");
+        let sm_config = crate::state_machine::StateMachineConfig {
+            data_dir: sm_dir,
+            memtable_size_threshold: 1024 * 1024,
+        };
+        let sm = Arc::new(RwLock::new(StateMachine::open(sm_config).unwrap()));
+        let mut new_node = RaftNode::new_with_storage("n5".into(), vec![], sm, storage);
+
+        let restored = new_node.restore_from_snapshot().expect("snapshot present");
+        assert_eq!(restored.0, snapshot_index);
+        assert_eq!(new_node.commit_index, snapshot_index);
+        assert_eq!(new_node.last_applied, snapshot_index);
+
+        let sm = new_node.state_machine.read().unwrap();
+        assert_eq!(sm.get("k1").as_deref(), Some("v1"));
+        assert_eq!(sm.get("k4").as_deref(), Some("v4"));
     }
 }
