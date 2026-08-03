@@ -198,7 +198,7 @@ async fn dst_election_restriction_stale_candidate_loses() {
     // test-only `push_log_entry_for_test` hook on n1.
     {
         let mut n1 = cluster.nodes[1].raft.write().unwrap();
-        n1.push_log_entry_for_test(2, oxide_kv::protocol::Command::Compact);
+        n1.push_log_entry_for_test(oxide_kv::protocol::Command::Compact);
     }
 
     // Kill n0 (the leader).

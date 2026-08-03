@@ -242,14 +242,30 @@ impl RaftNode {
         self.peers = peers;
     }
 
-    /// Test-only helper: push a phantom log entry at the given index.
+    /// Test-only helper: push a phantom log entry into the log.
     /// Used by integration tests to simulate a peer whose log is
-    /// ahead of the leader's (for the leader-log-stale vote-check).
-    /// Production code never calls this.
-    pub fn push_log_entry_for_test(&mut self, index: usize, command: crate::protocol::Command) {
+    /// ahead of the leader's (for the leader-log-stale vote-check
+    /// in `handle_tx_vote_request`).
+    ///
+    /// The entry's `index` is computed as `log.len() + 1`, matching
+    /// `propose()` (line ~489). Production code never calls this.
+    ///
+    /// Regression note: previously took an explicit `index` argument,
+    /// but a caller-passed `index` decouples the entry's index from
+    /// its array position in `log`, which breaks `apply_logs` —
+    /// `apply_logs` walks by `last_applied` (an array offset), but
+    /// displays `entry.index` (a logical index). With decoupled
+    /// indices the user sees phantom entries claiming index 5 while
+    /// occupying slot 0, the next real BeginTx (index 1) gets dropped
+    /// by the AppendEntries conflict-check on line ~878 because it
+    /// compares by array index, and the phantom's `no-op` apply
+    /// silently swallows the slot. CI once caught this as a flaky
+    /// `pending_tx_count` mismatch (PR #36 follow-up).
+    pub fn push_log_entry_for_test(&mut self, command: crate::protocol::Command) {
+        let new_index = self.log.len() + 1;
         self.log.push(crate::protocol::LogEntry {
             term: self.current_term,
-            index,
+            index: new_index,
             command,
         });
     }
@@ -2263,5 +2279,59 @@ mod tests {
         let sm = new_node.state_machine.read().unwrap();
         assert_eq!(sm.get("k1").as_deref(), Some("v1"));
         assert_eq!(sm.get("k4").as_deref(), Some("v4"));
+    }
+
+    /// Regression for the flaky `pending_tx_count` mismatch that
+    /// surfaced in PR #36 review: `push_log_entry_for_test` previously
+    /// took an explicit `index` argument. A caller-passed index
+    /// decoupled the entry's logical index from its array slot,
+    /// which made `apply_logs` (which walks by array offset) display
+    /// out-of-order indices and silently skip the BeginTx it shared
+    /// a slot with. CI caught it on PR #35's run; pin the invariant
+    /// that the helper assigns `log.len() + 1`.
+    #[test]
+    fn push_log_entry_for_test_assigns_monotonic_index() {
+        let (_tmp, mut node) = make_node("n1", vec![]);
+        node.current_term = 1;
+
+        // First push: index must be 1.
+        node.push_log_entry_for_test(crate::protocol::Command::Compact);
+        assert_eq!(node.log.len(), 1);
+        assert_eq!(node.log[0].index, 1, "first push should be index 1");
+
+        // Second push: index must be 2, *not* whatever the caller
+        // might have passed before the fix.
+        node.push_log_entry_for_test(crate::protocol::Command::Compact);
+        assert_eq!(node.log.len(), 2);
+        assert_eq!(node.log[1].index, 2, "second push should be index 2");
+
+        // get_last_log_info must reflect the array position so that
+        // the leader-log-stale check in `handle_tx_vote_request` sees
+        // the bumped index.
+        let (idx, term) = node.get_last_log_info();
+        assert_eq!(idx, 2);
+        assert_eq!(term, 1);
+    }
+
+    /// Companion to the above: after the phantom push, a *real*
+    /// BeginTx appended via `propose` must still apply in order,
+    /// so the phantom doesn't shadow it.
+    #[test]
+    fn push_log_entry_for_test_does_not_shadow_subsequent_propose() {
+        let (_tmp, mut node) = make_node("n1", vec![]);
+        node.state = crate::raft::node::NodeState::Leader;
+        node.current_term = 1;
+
+        node.push_log_entry_for_test(crate::protocol::Command::Compact);
+        // last_log_index = 1 now (helper assigns log.len() + 1 = 1).
+        assert_eq!(node.get_last_log_info().0, 1);
+
+        // Real propose: must get index 2, not collide with phantom.
+        assert!(node.propose(crate::protocol::Command::Set {
+            key: "k".into(),
+            value: "v".into(),
+        }));
+        assert_eq!(node.log.len(), 2);
+        assert_eq!(node.log[1].index, 2, "real propose must follow phantom");
     }
 }
