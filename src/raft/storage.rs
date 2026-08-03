@@ -47,6 +47,22 @@ impl RaftStorage {
         Ok(())
     }
 
+    /// Current on-disk size of the WAL in bytes. Returns 0 if the WAL
+    /// doesn't exist yet (a fresh node has nothing to compact) or if
+    /// the metadata lookup fails for any reason — callers treat a 0
+    /// result as "skip the threshold check this round".
+    ///
+    /// Used by `RaftNode::maybe_snapshot` to decide whether the WAL has
+    /// grown past `Config::snapshot_threshold_bytes`. The size check is
+    /// best-effort: the WAL can grow between this read and the next
+    /// append, so the threshold should be treated as a "snapshot roughly
+    /// every N bytes" target, not a hard ceiling.
+    pub fn wal_size_bytes(&self) -> u64 {
+        std::fs::metadata(&self.wal_path)
+            .map(|m| m.len())
+            .unwrap_or(0)
+    }
+
     pub fn restore_wal_log(&self) -> Vec<LogEntry> {
         let mut log = Vec::new();
 
@@ -343,5 +359,40 @@ mod tests {
         // snapshot_index=0 means "no snapshot taken yet" — keep everything.
         let kept = storage.rewrite_wal_after_snapshot(0).unwrap();
         assert_eq!(kept, 3);
+    }
+
+    // ---------- wal size probe ----------
+
+    #[test]
+    fn wal_size_bytes_returns_zero_when_wal_missing() {
+        let (_dir, storage) = temp_storage();
+        // No append_wal_log call -> no file on disk -> 0 is correct.
+        assert_eq!(storage.wal_size_bytes(), 0);
+    }
+
+    #[test]
+    fn wal_size_bytes_grows_monotonically_with_appends() {
+        let (_dir, storage) = temp_storage();
+        let initial = storage.wal_size_bytes();
+        for i in 1..=3 {
+            storage.append_wal_log(&entry(1, i, "k", "v")).unwrap();
+        }
+        let after = storage.wal_size_bytes();
+        assert!(after > initial, "WAL must grow after appends");
+        assert!(after >= 3, "3 entries must occupy at least a few bytes");
+    }
+
+    #[test]
+    fn wal_size_bytes_shrinks_after_rewrite() {
+        let (_dir, storage) = temp_storage();
+        for i in 1..=5 {
+            storage.append_wal_log(&entry(1, i, "k", "v")).unwrap();
+        }
+        let before = storage.wal_size_bytes();
+        // Snapshot at index 5 — nothing remains.
+        storage.rewrite_wal_after_snapshot(5).unwrap();
+        let after = storage.wal_size_bytes();
+        assert!(after < before, "rewrite must shrink the WAL");
+        assert_eq!(after, 0, "keeping 0 entries leaves an empty file");
     }
 }
