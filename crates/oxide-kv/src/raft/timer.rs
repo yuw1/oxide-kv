@@ -85,7 +85,20 @@ pub async fn run_election_timer(raft: Arc<RwLock<RaftNode>>) {
                 "⏰ Election timeout (slept {}ms + {}ms jitter), starting election...",
                 sleep_ms, jitter_ms
             );
-            RaftNode::become_candidate(raft.clone());
+            // P8 PR 5 (Raft §9.6): the timer entry point now goes
+            // through the pre-vote probe phase rather than bumping
+            // `current_term` directly. This avoids the disruptive
+            // server problem on partition recovery: a freshly
+            // recovered follower used to immediately `become_candidate`,
+            // which forced the live leader to step down on the next
+            // AppendEntries, churning the term until the partition
+            // fully healed. With pre-vote, the recovered follower
+            // probes first; if the cluster still has a live leader,
+            // the probe is refused (election restriction /
+            // higher-term-peer check), and `current_term` stays put.
+            // Tests / simulation harnesses still call `become_candidate`
+            // directly when they want to skip the probe.
+            RaftNode::become_pre_candidate(raft.clone());
         }
     }
 }

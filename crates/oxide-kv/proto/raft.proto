@@ -124,6 +124,15 @@ message InstallSnapshotReplyArgs {
 
 // ---- Top-level RPC envelope (one per TCP request) ----
 
+// `RaftMessage.body.request_pre_vote` (tag 7) and
+// `RaftMessage.body.pre_vote_response` (tag 8) carry the
+// pre-vote handshake added in P8 PR 5. They reuse the existing
+// `RequestVoteArgs` / `VoteResponseArgs` wire types because the
+// field shape is identical to a real RequestVote; the receiver
+// distinguishes the two via the `RaftMessage.body` tag, not via
+// an inner flag. Wire-level semantics: pre-vote **does not** bump
+// `current_term` on either side (Raft §9.6). See
+// `src/raft/node.rs::handle_pre_vote` for the policy.
 message RaftMessage {
   oneof body {
     RequestVoteArgs request_vote = 1;
@@ -132,5 +141,7 @@ message RaftMessage {
     AppendReplyArgs append_reply = 4;
     InstallSnapshotArgs install_snapshot = 5;
     InstallSnapshotReplyArgs install_snapshot_reply = 6;
+    RequestVoteArgs request_pre_vote = 7;
+    VoteResponseArgs pre_vote_response = 8;
   }
 }

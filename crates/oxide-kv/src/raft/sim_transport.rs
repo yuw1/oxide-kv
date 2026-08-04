@@ -309,6 +309,16 @@ pub(crate) fn dispatch_raft_message(
                 vote_granted: reply.vote_granted,
             }))
         }
+        // Pre-vote probe (P8 PR 5, Raft §9.6). Routed to the
+        // dedicated `handle_pre_vote` handler so the simulation
+        // harness exercises the same probe-only path as production.
+        RaftMessage::RequestPreVote(args) => {
+            let reply = node.handle_pre_vote(&args);
+            Ok(RaftMessage::PreVoteResponse(VoteResponseArgs {
+                term: reply.term,
+                vote_granted: reply.vote_granted,
+            }))
+        }
         RaftMessage::AppendEntries(args) => {
             let reply = node.handle_append_entries(&args);
             Ok(RaftMessage::AppendReply(reply))

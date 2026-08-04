@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (Pre-vote election probe — Raft §9.6)
+- **`RaftNode::handle_pre_vote`** — receiver-side handler for
+  pre-vote probes. Mirrors `handle_request_vote` but with
+  probe-only semantics: refuses to mutate `current_term`,
+  `vote_for`, or `state` regardless of outcome. Admission rule:
+  refuse probes at term `< current_term` (stale peer) or `>
+  current_term + 1` (peer whose observation is too far
+  behind); refuse same-term probes when we are the established
+  Leader; otherwise grant iff the probe's `(last_log_index,
+  last_log_term)` passes the §5.4.1 election restriction at the
+  probed term.
+- **`RaftNode::become_pre_candidate`** — the new election-timer
+  entry point. Moves the node to `NodeState::PreCandidate`,
+  fans out a `RequestPreVote` at `current_term + 1` to every
+  peer, and on quorum-grant promotes to real Candidate +
+  fires `RequestVote`. **Does not bump `current_term` or
+  write `vote_for` until the quorum gate is passed.** Single-
+  node clusters short-circuit to Leader (1 > 0 self-quorum).
+- **`RaftNode::process_pre_vote_reply`** — per-reply handler
+  that increments the granted counter and triggers the
+  promotion + real-vote fan-out on quorum. Refusal replies
+  are ignored; replies carrying a higher term than the probe
+  step the node back to Follower **without bumping term**
+  (the very property that makes pre-vote safe).
+- **`NodeState::PreCandidate`** — new state enum variant. The
+  timer treats it like Follower for election-timeout purposes
+  (a stuck probe can re-time-out and re-probe). The existing
+  `become_candidate` / `request_votes` paths are unchanged so
+  tests and the simulation harness retain their deterministic
+  "skip the probe" entry point.
+- **Wire surface** — new `proto/raft.proto` oneof tags
+  `request_pre_vote = 7` and `pre_vote_response = 8`, reusing
+  the existing `RequestVoteArgs` / `VoteResponseArgs` message
+  types. Server-side dispatch in
+  `raft::rpc::handle_raft_rpc_inner` routes
+  `RequestPreVote` to `handle_pre_vote` and replies with
+  `PreVoteResponse`. SimTransport dispatch in
+  `raft::sim_transport::dispatch_raft_message` mirrors the
+  same split so the DST harness exercises the probe path.
+- **`run_election_timer`** now calls `become_pre_candidate`
+  instead of `become_candidate`. Tests and the simulation
+  harness still call `become_candidate` directly when they
+  want to skip the probe.
+- **Term-churn ceiling** in `tests/raft_fuzz.rs::run_actions`
+  — fails any scenario where a node's `current_term` exceeds
+  `MAX_TERM_GROWTH_PER_NODE = 20`. Generous enough to
+  tolerate the fuzz distribution's legitimate election /
+  partition-heal churn, tight enough to catch the
+  pre-pre-vote term-storm regression.
+
 ### Added (Deployment guide + systemd unit + bootstrap script)
 - **`README.md` Deployment section**: end-to-end guide for
   internal-network production deployment. Covers hardware /

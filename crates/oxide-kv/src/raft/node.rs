@@ -17,7 +17,15 @@ use std::time::{Duration, Instant};
 pub enum NodeState {
     Follower,
     Candidate,
-    Leader
+    Leader,
+    /// Pre-vote probe phase (Raft §9.6). New in P8 PR 5. The node is
+    /// exploring whether it could win a real election at `current_term + 1`
+    /// without actually bumping `current_term` or persisting a `vote_for`.
+    /// A PreCandidate that collects a quorum of `PreVoteResponse.granted ==
+    /// true` is promoted to `Candidate` by `promote_pre_candidate_to_candidate`;
+    /// a PreCandidate that observes a refusal or timeout reverts to
+    /// `Follower` (still at the original `current_term`).
+    PreCandidate,
 }
 
 pub struct RaftNode {
@@ -287,6 +295,84 @@ impl RaftNode {
     /// Helper to get the last log's index and term
     fn get_last_log_info(&self) -> (u64, u64) {
         self.log.last().map_or((0, 0), |entry| (entry.index as u64, entry.term))
+    }
+
+    /// Handle a pre-vote probe from a follower that is considering a real
+    /// election but hasn't bumped its term yet (Raft §9.6).
+    ///
+    /// **Hard invariant:** this method must NOT mutate `current_term`,
+    /// `vote_for`, `state`, or write to disk. A pre-vote is a *probe*; the
+    /// whole point is to fail safely without disturbing the cluster's
+    /// view of who the leader is. The only state change allowed is
+    /// refreshing `last_heartbeat` so the receiver's own election timer
+    /// doesn't fire while we're answering (the probe demonstrates the
+    /// peer is alive).
+    ///
+    /// Policy (mirrors `handle_request_vote` but with a probe-only term
+    /// admission check):
+    ///   1. If `args.term < self.current_term` the probe is from a
+    ///      stale peer; reject (the requester's claimed `current_term +
+    ///      1` would be one less than ours, so they cannot possibly
+    ///      win).
+    ///   2. If `args.term > self.current_term`, the requester thinks
+    ///      a higher term might win. We **do not** adopt it. We just
+    ///      check whether they would beat our election-restriction
+    ///      check at `args.term` (i.e. their `(last_log_index,
+    ///      last_log_term)` is at least as fresh as ours). If yes, grant
+    ///      the probe; if no, refuse.
+    ///   3. If `args.term == self.current_term`, normal election
+    ///      restriction. Grant iff the probe passes it AND we are not
+    ///      already a leader of this term (a leader of the same term
+    ///      is by definition a quorum winner; the probe can't beat it
+    ///      in a real vote either).
+    ///   4. **No log up-to-date bypass**: even if we'd vote for this
+    ///      candidate in a real election, if `args.term` is more than
+    ///      one ahead of ours (`args.term > self.current_term + 1`)
+    ///      the probe is from a peer that hasn't even observed our
+    ///      term — refuse. This protects against a stale peer
+    ///      repeatedly probing at arbitrarily high terms.
+    ///
+    /// The returned `VoteResponseArgs::term` is always our own
+    /// `current_term` so the caller can detect "I was stale and need
+    /// to step down" without us actually stepping them down for them.
+    pub fn handle_pre_vote(&mut self, args: &RequestVoteArgs) -> VoteResponseArgs {
+        // Refresh our own heartbeat clock — a live peer is good news
+        // for our election timer regardless of the probe outcome.
+        self.last_heartbeat = self.clock.now();
+
+        let my_term = self.current_term;
+
+        // (1) Probe term strictly older → reject, this peer is stale.
+        // (4) Probe term more than one ahead → reject, can't trust a
+        //     peer whose clock / observation is that far behind.
+        if args.term < my_term || args.term > my_term + 1 {
+            return VoteResponseArgs {
+                term: my_term,
+                vote_granted: false,
+            };
+        }
+
+        // (3) Same term, but we're the leader of it. A probe can't
+        //     beat us in a real vote either; refuse without recording
+        //     anything.
+        if args.term == my_term && self.state == NodeState::Leader {
+            return VoteResponseArgs {
+                term: my_term,
+                vote_granted: false,
+            };
+        }
+
+        // (2)(3) Election restriction at `args.term`. Reuse the same
+        //     up-to-date test as the real vote path; no state mutation.
+        let (my_last_log_index, my_last_log_term) = self.get_last_log_info();
+        let probe_log_up_to_date = (args.last_log_term > my_last_log_term)
+            || (args.last_log_term == my_last_log_term
+                && args.last_log_index >= my_last_log_index);
+
+        VoteResponseArgs {
+            term: my_term,
+            vote_granted: probe_log_up_to_date,
+        }
     }
 
     pub fn handle_request_vote(&mut self, args: &RequestVoteArgs) -> VoteResponseArgs {
@@ -772,15 +858,215 @@ impl RaftNode {
 
     pub fn become_candidate(raft_node: Arc<RwLock<Self>>) {
         let mut node = raft_node.write().unwrap();
+        Self::promote_to_candidate_locked(&mut node);
+        println!("🗳️ Node {} candidate for Term {}", node.node_id, node.current_term);
+        let term = node.current_term;
+        let state = node.state.clone();
+        drop(node);
+        debug_assert_eq!(state, NodeState::Candidate);
+        let _ = term; // silence unused if assertions off
+        Self::request_votes(raft_node);
+    }
+
+    /// Promote the current node from PreCandidate to Candidate (Raft
+    /// §9.6). Called from the PreVote reply handler when a quorum
+    /// has granted the probe.
+    ///
+    /// Pre-conditions: caller must hold the write lock and have just
+    /// verified `state == NodeState::PreCandidate && current_term ==
+    /// probed_term`. We bump term by exactly 1 (the term we probed
+    /// at) so the local log's election-restriction view stays
+    /// consistent with what the peers saw in the probe.
+    ///
+    /// Pure term/persistence helper — does **not** call
+    /// `request_votes`. The caller (`process_pre_vote_replies`)
+    /// drives the fan-out so it can carry the same atomic
+    /// `votes_received` counter as the pre-vote round and decide in
+    /// one place whether to drop straight to Candidate or fall back
+    /// to Follower.
+    fn promote_to_candidate_locked(node: &mut Self) {
         node.current_term += 1;
         node.state = NodeState::Candidate;
         node.vote_for = Some(node.node_id.clone());
-        let _ =  node.storage.save_meta(node.current_term.clone(), node.vote_for.clone());
+        let _ = node.storage.save_meta(node.current_term, node.vote_for.clone());
         node.last_heartbeat = node.clock.now();
+    }
 
-        println!("🗳️ Node {} candidate for Term {}", node.node_id, node.current_term);
-        drop(node);
-        Self::request_votes(raft_node);
+    /// Enter the pre-vote phase (Raft §9.6, P8 PR 5). **Does not**
+    /// bump `current_term` or write `vote_for` to disk. Sends a
+    /// `RequestPreVote` to every peer at the **implied** term
+    /// `current_term + 1`; if a quorum grants the probe, the
+    /// reply handler promotes us to a real Candidate via
+    /// `promote_to_candidate_locked` + `request_votes`.
+    ///
+    /// Called from the election timer on the production path.
+    /// Tests and the simulation harness still call
+    /// `become_candidate` directly so they can skip the probe.
+    pub fn become_pre_candidate(raft_node: Arc<RwLock<Self>>) {
+        let (peers, probed_term, candidate_id, last_idx, last_term, transport) = {
+            let node = raft_node.read().unwrap();
+            let (li, lt) = node.get_last_log_info();
+            (
+                node.peers.clone(),
+                node.current_term + 1,
+                node.node_id.clone(),
+                li,
+                lt,
+                node.transport.clone(),
+            )
+        };
+
+        // Move to PreCandidate *before* sending probes so that an
+        // incoming AppendEntries / higher-term vote response
+        // arriving while the fan-out is in flight knows we're in
+        // the probe phase and won't mistake us for a real Candidate.
+        {
+            let mut node = raft_node.write().unwrap();
+            // Someone else (AppendEntries, higher-term vote reply,
+            // install snapshot) may have changed our state between
+            // the timer tick and us grabbing the lock; only enter
+            // PreCandidate if we're still Follower / PreCandidate at
+            // a current term that matches the snapshot we just took.
+            if node.state == NodeState::Follower
+                && node.current_term + 1 == probed_term
+            {
+                node.state = NodeState::PreCandidate;
+            } else {
+                return;
+            }
+        }
+
+        let total_nodes = peers.len() + 1;
+        let votes_received = Arc::new(std::sync::atomic::AtomicUsize::new(1)); // self-vote counts
+
+        println!(
+            "🔎 [PreVote] Node {} probing at Term {} (current {} + 1)",
+            candidate_id, probed_term, probed_term - 1
+        );
+
+        // Single-node cluster: we are already a majority of 1. Skip
+        // the RPC fan-out entirely and promote directly.
+        if total_nodes == 1 {
+            let mut n = raft_node.write().unwrap();
+            if n.state == NodeState::PreCandidate {
+                Self::promote_to_candidate_locked(&mut n);
+                let _ = n.become_leader_checked();
+            }
+            return;
+        }
+
+        for peer_addr in peers {
+            let raft_clone = raft_node.clone();
+            let votes_clone = votes_received.clone();
+            let cid = candidate_id.clone();
+            let transport = transport.clone();
+
+            tokio::spawn(async move {
+                let args = RequestVoteArgs {
+                    term: probed_term,
+                    candidate_id: cid.clone(),
+                    last_log_index: last_idx,
+                    last_log_term: last_term,
+                };
+                match transport
+                    .send_raft(&peer_addr, RaftMessage::RequestPreVote(args))
+                    .await
+                {
+                    Ok(RaftMessage::PreVoteResponse(reply)) => {
+                        Self::process_pre_vote_reply(
+                            raft_clone,
+                            votes_clone,
+                            total_nodes,
+                            probed_term,
+                            cid,
+                            reply,
+                        )
+                        .await;
+                    }
+                    Ok(other) => {
+                        eprintln!(
+                            "[Protocol] PreVote to {} got unexpected reply variant {:?}",
+                            peer_addr,
+                            std::mem::discriminant(&other)
+                        );
+                    }
+                    Err(e) => eprintln!("[Network] PreVote RPC error with {}: {}", peer_addr, e),
+                }
+            });
+        }
+    }
+
+    /// Handle one PreVoteResponse. Increments the granted counter
+    /// and, if a quorum has been reached, promotes the node to
+    /// Candidate and fans out the real RequestVote.
+    async fn process_pre_vote_reply(
+        raft_arc: Arc<RwLock<Self>>,
+        votes_received: Arc<std::sync::atomic::AtomicUsize>,
+        total_nodes: usize,
+        probed_term: u64,
+        candidate_id: String,
+        reply: VoteResponseArgs,
+    ) {
+        // Reject path: peer's current_term > probed_term means the
+        // peer has observed a higher term than we're probing at.
+        // Step down to Follower without touching `current_term`
+        // (the peer's term hasn't been **granted** to us; we just
+        // step down and wait for a real RequestVote at that term
+        // from whoever eventually wins it).
+        if reply.term > probed_term {
+            let mut n = raft_arc.write().unwrap();
+            if n.state == NodeState::PreCandidate {
+                n.state = NodeState::Follower;
+                // Note: we do NOT bump current_term here. Pre-vote
+                // is precisely the mechanism that prevents a
+                // partitioned node from inflating its term
+                // based on a higher-term reply. We stay at our
+                // original current_term and wait for a real
+                // RequestVote at reply.term before adopting it.
+            }
+            return;
+        }
+
+        if !reply.vote_granted {
+            return;
+        }
+
+        let count =
+            votes_received.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        if count <= total_nodes / 2 {
+            return; // not yet a quorum
+        }
+
+        // Quorum reached — promote to real Candidate and fire
+        // RequestVote. Take the write lock once and do the whole
+        // transition atomically.
+        let mut n = raft_arc.write().unwrap();
+        if n.state != NodeState::PreCandidate {
+            return; // raced: we already promoted (single-node fast
+                    // path) or stepped down
+        }
+        Self::promote_to_candidate_locked(&mut n);
+        let new_term = n.current_term;
+        let state_after = n.state.clone();
+        drop(n);
+        debug_assert_eq!(state_after, NodeState::Candidate);
+        debug_assert_eq!(new_term, probed_term);
+        println!(
+            "✅ [PreVote] Node {} got quorum at Term {} → promoted to Candidate",
+            candidate_id, new_term
+        );
+        Self::request_votes(raft_arc);
+    }
+
+    /// Promote to leader if state == Candidate and current_term
+    /// matches the one we probed at. Used as the single-node
+    /// PreCandidate → Leader fast path.
+    fn become_leader_checked(&mut self) -> bool {
+        if self.state != NodeState::Candidate {
+            return false;
+        }
+        self.become_leader();
+        true
     }
 
     pub fn request_votes(raft_arc: Arc<RwLock<Self>>) {
@@ -2333,5 +2619,161 @@ mod tests {
         }));
         assert_eq!(node.log.len(), 2);
         assert_eq!(node.log[1].index, 2, "real propose must follow phantom");
+    }
+
+    // ---------- handle_pre_vote (P8 PR 5, Raft §9.6) ----------
+
+    /// `handle_pre_vote` must NOT bump `current_term`, `vote_for`,
+    /// or `state`, no matter the outcome. This is the core
+    /// invariant that makes pre-vote safe against the disruptive
+    /// server problem.
+    #[test]
+    fn pre_vote_never_mutates_local_state() {
+        let (_d, mut node) = make_node("n1", vec!["n2".into(), "n3".into()]);
+        node.current_term = 5;
+        let term_before = node.current_term;
+        let vote_before = node.vote_for.clone();
+        let state_before = node.state;
+
+        // Probe at term + 1 with a strictly ahead log (would
+        // succeed in a real vote). Should be granted.
+        let reply = node.handle_pre_vote(&vote_args(term_before + 1, "n2", 0, 0));
+        assert!(reply.vote_granted);
+        assert_eq!(reply.term, term_before, "reply term must echo OUR term");
+
+        // Hard invariant: nothing mutated.
+        assert_eq!(node.current_term, term_before, "pre-vote must not bump term");
+        assert_eq!(node.vote_for, vote_before, "pre-vote must not write vote_for");
+        assert_eq!(node.state, state_before, "pre-vote must not change state");
+
+        // Now a refused probe (probe term older). Also no mutation.
+        let reply = node.handle_pre_vote(&vote_args(term_before - 1, "n2", 0, 0));
+        assert!(!reply.vote_granted);
+        assert_eq!(node.current_term, term_before);
+        assert_eq!(node.vote_for, vote_before);
+        assert_eq!(node.state, state_before);
+
+        // And a refused probe (probe term 2 ahead). Also no mutation.
+        let reply = node.handle_pre_vote(&vote_args(term_before + 2, "n2", 0, 0));
+        assert!(!reply.vote_granted);
+        assert_eq!(node.current_term, term_before);
+        assert_eq!(node.vote_for, vote_before);
+        assert_eq!(node.state, state_before);
+    }
+
+    /// Probe at our term + 1 from a peer with a strictly-ahead
+    /// log: grant. This is the happy path of pre-vote.
+    #[test]
+    fn pre_vote_grants_when_probe_log_is_strictly_ahead() {
+        let (_d, mut node) = make_node("n1", vec!["n2".into()]);
+        node.current_term = 3;
+        node.log.push(make_entry(3, 1, "k", "v"));
+
+        // Probe term = 4, last_log_index = 2 (strictly ahead).
+        let reply = node.handle_pre_vote(&vote_args(4, "n2", 2, 3));
+        assert!(reply.vote_granted, "ahead probe must grant");
+        assert_eq!(reply.term, 3, "must echo local term, not the probe term");
+    }
+
+    /// Same-term probe from the leader: refuse. A live leader of
+    /// the same term is by definition a quorum winner; the probe
+    /// can't beat it in a real vote either.
+    #[test]
+    fn pre_vote_refuses_when_we_are_leader_of_same_term() {
+        let (_d, mut node) = make_node("n1", vec!["n2".into()]);
+        node.current_term = 5;
+        node.state = NodeState::Leader;
+        node.log.push(make_entry(5, 1, "k", "v"));
+
+        let reply = node.handle_pre_vote(&vote_args(5, "n2", 1, 5));
+        assert!(!reply.vote_granted);
+        assert_eq!(reply.term, 5);
+    }
+
+    /// Probe term is exactly one ahead of ours but the probe's
+    /// log is stale. Refuse via election restriction.
+    #[test]
+    fn pre_vote_refuses_when_probe_log_is_behind() {
+        let (_d, mut node) = make_node("n1", vec!["n2".into()]);
+        node.current_term = 3;
+        // Local log: two entries at term 3, indices 1..2.
+        node.log.push(make_entry(2, 1, "a", "1"));
+        node.log.push(make_entry(3, 2, "b", "2"));
+
+        // Probe at term 4, but last_log_index = 1 (behind our 2).
+        let reply = node.handle_pre_vote(&vote_args(4, "n2", 1, 2));
+        assert!(!reply.vote_granted, "behind-log probe must be refused");
+
+        // Same term, behind log: also refused.
+        node.state = NodeState::Follower;
+        let reply = node.handle_pre_vote(&vote_args(3, "n2", 1, 2));
+        assert!(!reply.vote_granted);
+    }
+
+    /// Probe term is more than one ahead of ours. Refuse — the
+    /// peer hasn't even observed our term; we can't trust it.
+    /// Regression for the "stale peer probing at arbitrarily
+    /// high terms" failure mode.
+    #[test]
+    fn pre_vote_refuses_probe_more_than_one_term_ahead() {
+        let (_d, mut node) = make_node("n1", vec!["n2".into()]);
+        node.current_term = 5;
+
+        let reply = node.handle_pre_vote(&vote_args(7, "n2", 0, 0));
+        assert!(!reply.vote_granted, "probe 2+ terms ahead must be refused");
+        assert_eq!(node.current_term, 5, "must not bump");
+    }
+
+    /// `become_pre_candidate` on a single-node cluster must skip
+    /// the RPC fan-out and promote straight to Candidate → Leader
+    /// without ever touching the wire. Regression for the
+    /// single-node fast-path through pre-vote.
+    #[test]
+    fn become_pre_candidate_single_node_promotes_without_rpc() {
+        let (_d, node) = make_node("n1", vec![]);
+        let arc = Arc::new(RwLock::new(node));
+        RaftNode::become_pre_candidate(arc.clone());
+        let n = arc.read().unwrap();
+        // Single-node: pre-vote self-quorum (1 > 0) → promote → become_leader.
+        assert_eq!(n.state, NodeState::Leader);
+        assert_eq!(n.current_term, 1, "single-node promotes at term 1");
+    }
+
+    /// `become_pre_candidate` on a multi-node cluster moves state
+    /// to `PreCandidate` without bumping term or persisting
+    /// `vote_for` (until quorum is reached).
+    #[tokio::test(flavor = "current_thread")]
+    async fn become_pre_candidate_does_not_bump_term_or_write_vote() {
+        let (_d, mut node) = make_node("n1", vec!["n2".into(), "n3".into()]);
+        node.current_term = 4;
+        let arc = Arc::new(RwLock::new(node));
+
+        // Snapshot state pre-probe.
+        let term_before = arc.read().unwrap().current_term;
+
+        // Spawn the probe fan-out. The spawned tasks will fail
+        // to connect to nonexistent peers (n2 / n3 not running
+        // here), which is fine — we only assert the synchronous
+        // state transition that happens before any reply.
+        RaftNode::become_pre_candidate(arc.clone());
+
+        // Read state synchronously. The probe is in flight but
+        // neither `vote_for` nor `current_term` may have been
+        // touched yet.
+        let (state, current_term, vote_for) = {
+            let n = arc.read().unwrap();
+            (n.state, n.current_term, n.vote_for.clone())
+        };
+        assert_eq!(state, NodeState::PreCandidate);
+        assert_eq!(current_term, term_before, "pre-vote must not bump term");
+        assert!(
+            vote_for.is_none(),
+            "pre-vote must not write vote_for (only the eventual real vote does)"
+        );
+
+        // Give the (failed) spawned probe tasks a chance to
+        // settle so the runtime exits cleanly. tokio::spawn
+        // tasks that error on connect finish on their own.
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
