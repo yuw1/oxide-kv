@@ -166,6 +166,42 @@ message InstallSnapshotReplyArgs {
 // an inner flag. Wire-level semantics: pre-vote **does not** bump
 // `current_term` on either side (Raft §9.6). See
 // `src/raft/node.rs::handle_pre_vote` for the policy.
+// P8 PR 6a: cold-new-server catch-up. A brand-new server (with no
+// peers configured) cannot be reached via the normal AppendEntries
+// path because no one in the cluster knows its address. The new
+// server therefore initiates contact: it sends `JoinClusterRequest`
+// to a *hint* address it learned out-of-band (e.g. via DNS, systemd
+// environment, or a manual bootstrap). If the hint reaches a leader
+// in the cluster, the leader replies with its own address and the
+// current peer list (minus the new server itself). The new server
+// then calls `set_peers(...)` and waits to be added via the Joint
+// consensus path (P8 PR 6). This is an RPC, not a log entry, so
+// `JoinCluster` does not participate in quorum or replication.
+message JoinClusterRequest {
+  // The candidate's own address (the leader will use this to add
+  // the candidate to the cluster later via `propose_add_node`).
+  // Identical to `ServerId.addr`; we don't send `node_id` because
+  // in v1 node_id == addr.
+  string candidate_addr = 1;
+}
+
+message JoinClusterResponse {
+  bool accepted = 1;
+  // Leader's current term. The candidate uses this to detect that
+  // the hint may have routed to a stale leader; if so, it can fall
+  // back to another hint.
+  uint64 term = 2;
+  // The leader's address (so the candidate can issue `set_peers`
+  // and then await `AddNode`). Same as candidate learned in v1.
+  string leader_addr = 3;
+  // Current peer addresses (excluding the candidate and the leader).
+  // Empty when `accepted=false`.
+  repeated string peer_addrs = 4;
+  // Human-readable reason when `accepted=false`. Empty otherwise.
+  // Not parsed by clients; only surfaced in logs.
+  string reason = 5;
+}
+
 message RaftMessage {
   oneof body {
     RequestVoteArgs request_vote = 1;
@@ -176,5 +212,10 @@ message RaftMessage {
     InstallSnapshotReplyArgs install_snapshot_reply = 6;
     RequestVoteArgs request_pre_vote = 7;
     VoteResponseArgs pre_vote_response = 8;
+    // P8 PR 6a: see JoinClusterRequest / JoinClusterResponse
+    // doc-comments above. The candidate is the caller; the leader
+    // is the responder. Followers reject with `accepted=false`.
+    JoinClusterRequest join_cluster = 9;
+    JoinClusterResponse join_cluster_response = 10;
   }
 }

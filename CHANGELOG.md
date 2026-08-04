@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (JoinCluster RPC — cold-new-server catch-up)
+- **`JoinClusterRequest` / `JoinClusterResponse` wire messages**
+  (proto tags 9 / 10). A brand-new server (with empty `peers`)
+  sends `JoinClusterRequest { candidate_addr }` to a hint address
+  it learned out-of-band (DNS / systemd env / manual bootstrap).
+  The leader replies with the current peer list so the candidate
+  can populate `peers` and wait to be added via the Joint
+  consensus path. RPC, not a log entry — does not participate in
+  quorum or replication.
+- **`RaftNode::handle_join_cluster`** — leader-only handler. Rejects
+  non-leaders, self-addresses (hint landed on candidate itself),
+  and already-member addresses (idempotent retry safety net).
+  Returns `peer_addrs = current_config.all_servers() \ {self, candidate}`
+  along with the current term so the candidate can detect a stale
+  hint if needed.
+- **`RaftNode::transport_handle()`** accessor — exposes the node's
+  outbound `Transport` for integration tests that drive a
+  candidate's JoinCluster RPC through the real wire path.
+- **RPC routing** — `RaftServer::handle_raft_rpc_inner` dispatches
+  `RaftMessage::JoinCluster` to `handle_join_cluster` and echoes
+  the `JoinClusterResponse` back on the same connection.
+- **Bugfix: cold-new-peer `next_index` default** —
+  `sync_logs` previously defaulted `next_index[unknown_peer] =
+  log_len + 1`, which assumes the new peer already has every log
+  entry. That worked for stale-but-known peers (consistent with
+  optimistic next-index) but broke cold-new-server catch-up: the
+  leader sent AEs with `prev_log_index = log_len` to a peer with
+  empty log, the consistency check rejected, and the new peer was
+  never replicated to. Default now `next_index = 1` (start from
+  the beginning of the log).
+- **7 new unit tests** in `raft/node.rs::tests`:
+  - `handle_join_cluster_accepts_candidate_on_leader_and_returns_peer_list`
+  - `handle_join_cluster_rejects_when_not_leader` (×2: Follower + Candidate)
+  - `handle_join_cluster_rejects_candidate_addr_equal_to_leader_addr`
+  - `handle_join_cluster_rejects_candidate_addr_already_member`
+  - `handle_join_cluster_returns_term_even_when_rejected`
+  - `handle_join_cluster_works_under_joint_config_too`
+- **4 new integration tests** in
+  `crates/oxide-kv/tests/join_cluster.rs`:
+  - `cold_new_server_joins_3_node_cluster_via_join_cluster_rpc`
+    — end-to-end: cold-new-server -> JoinCluster -> set_peers ->
+    propose_add_node -> Joint+Simple commit -> 4-node quorum.
+  - `join_cluster_routed_to_follower_is_rejected`
+  - `join_cluster_rejects_self_address`
+  - `join_cluster_rejects_candidate_addr_already_member`
+- **Proto round-trip coverage** — `raft/proto.rs::all_message_variants_roundtrip`
+  now exercises JoinCluster (both accepted and rejected variants).
+
 ### Added (Joint consensus membership change — Raft §6)
 - **`ServerId` / `Configuration` types** in `protocol.rs` —
   `Simple(Vec<ServerId>)` and `Joint { old, new }` model the

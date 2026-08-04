@@ -5,7 +5,7 @@ use crate::raft::clock::{system_clock, Clock};
 use crate::raft::net::{system_transport, Transport};
 use crate::raft::rpc::{
     AppendEntriesArgs, AppendReplyArgs, InstallSnapshotArgs, InstallSnapshotReplyArgs,
-    RaftMessage, RequestVoteArgs, VoteResponseArgs,
+    JoinClusterRequest, JoinClusterResponse, RaftMessage, RequestVoteArgs, VoteResponseArgs,
 };
 use crate::raft::storage::RaftStorage;
 use crate::state_machine::StateMachine;
@@ -286,6 +286,19 @@ impl RaftNode {
         &self.peers
     }
 
+    /// Borrow the node's outbound `Transport` (used to send Raft
+    /// RPCs to peers / candidates). Returns a clone of the
+    /// `Arc<dyn Transport>` so callers can issue requests without
+    /// holding the `RwLock`.
+    ///
+    /// Exposed for integration tests that drive a candidate's
+    /// `JoinCluster` RPC through the real wire path. Production
+    /// code should not need this — the heartbeat / election timer
+    /// paths issue their own RPCs internally.
+    pub fn transport_handle(&self) -> Arc<dyn crate::raft::net::Transport> {
+        self.transport.clone()
+    }
+
     pub fn current_term(&self) -> u64 {
         self.current_term
     }
@@ -447,6 +460,84 @@ impl RaftNode {
         VoteResponseArgs {
             term: my_term,
             vote_granted: probe_log_up_to_date,
+        }
+    }
+
+    /// P8 PR 6a: cold-new-server catch-up.
+    ///
+    /// A brand-new server (with empty `peers`) cannot be reached via
+    /// the normal AppendEntries path because no one in the cluster
+    /// knows its address. The new server therefore initiates contact
+    /// by sending `JoinClusterRequest` to a *hint* address it learned
+    /// out-of-band (DNS / systemd env / manual bootstrap).
+    ///
+    /// This handler is **leader-only**. Non-leaders reject so the
+    /// candidate can re-route to the leader (or fall back to a
+    /// different hint if the cluster has moved on). The leader's
+    /// reply carries the current peer list so the candidate can
+    /// populate its `peers` field before `propose_add_node` runs
+    /// (see P8 PR 6's `propose_add_node`).
+    ///
+    /// Validation:
+    /// - `state != Leader` → reject with `accepted=false` (candidate
+    ///   should re-route).
+    /// - `candidate_addr == self.node_id` → reject (the hint landed
+    ///   on the candidate itself; not a sensible cluster membership).
+    /// - `candidate_addr` already in `current_config.all_servers()`
+    ///   → reject (the candidate is a member of an existing cluster
+    ///   or already joined this one; idempotent retry safety net).
+    /// - Otherwise accept and return `peer_addrs = all_servers \ {self, candidate}`.
+    ///
+    /// This is **not** a log entry. `JoinCluster` does not participate
+    /// in quorum or replication. The actual cluster membership change
+    /// happens later via the Joint consensus path (P8 PR 6).
+    pub fn handle_join_cluster(&self, req: &JoinClusterRequest) -> JoinClusterResponse {
+        let reject = |reason: &str| JoinClusterResponse {
+            accepted: false,
+            term: self.current_term,
+            leader_addr: self.node_id.clone(),
+            peer_addrs: Vec::new(),
+            reason: reason.to_string(),
+        };
+
+        if self.state != NodeState::Leader {
+            return reject("not leader");
+        }
+
+        if req.candidate_addr == self.node_id {
+            return reject("candidate_addr is the leader itself");
+        }
+
+        // Membership check: candidate_addr must NOT already be in
+        // the cluster. `all_servers()` covers Simple (== self.peers
+        // ∪ {self}) and Joint (== union of old ∪ new). Same check
+        // applies regardless of config shape.
+        let already_member = self
+            .current_config
+            .all_servers()
+            .iter()
+            .any(|s| s.addr == req.candidate_addr || s.node_id == req.candidate_addr);
+
+        if already_member {
+            return reject("candidate_addr is already a cluster member");
+        }
+
+        // Build peer_addrs = all_servers \ {self, candidate_addr}.
+        // In v1, server.node_id == server.addr for every server.
+        let peer_addrs: Vec<String> = self
+            .current_config
+            .all_servers()
+            .into_iter()
+            .map(|s| s.addr)
+            .filter(|addr| addr != &self.node_id && addr != &req.candidate_addr)
+            .collect();
+
+        JoinClusterResponse {
+            accepted: true,
+            term: self.current_term,
+            leader_addr: self.node_id.clone(),
+            peer_addrs,
+            reason: String::new(),
         }
     }
 
@@ -858,7 +949,7 @@ impl RaftNode {
 
             let (prev_log_index, prev_log_term, entries) = {
                 let n = raft_node.read().unwrap();
-                let next = *n.next_index.get(&peer_addr_clone).unwrap_or(&(log_len + 1));
+                let next = *n.next_index.get(&peer_addr_clone).unwrap_or(&1);
                 let prev_idx = next - 1;
                 let prev_term = if prev_idx == 0 {
                     0
@@ -3476,5 +3567,155 @@ mod tests {
         // Final config should be Simple (the second entry overwrites the Joint).
         assert_eq!(node.current_config, simple);
         assert_eq!(node.peers, vec!["n2".to_string(), "n3".to_string()]);
+    }
+
+    // -----------------------------------------------------------------
+    // handle_join_cluster tests (P8 PR 6a)
+    // -----------------------------------------------------------------
+
+    /// Helper: build a fresh `RaftNode` with a 3-node Simple config
+    /// (n1=self, n2/n3=peers) and drive it to Leader at term 1.
+    fn make_join_cluster_leader() -> RaftNode {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wal = dir.path().join("n1.wal").to_str().unwrap().to_string();
+        let meta = dir.path().join("n1_meta.json").to_str().unwrap().to_string();
+        let snap = dir.path().join("n1_snapshot.json").to_str().unwrap().to_string();
+        let storage = RaftStorage::new_with_paths(wal, meta, snap);
+        let sm_dir = dir.path().join("n1_sm");
+        let sm_config = crate::state_machine::StateMachineConfig {
+            data_dir: sm_dir,
+            memtable_size_threshold: 1024 * 1024,
+        };
+        let sm = Arc::new(RwLock::new(StateMachine::open(sm_config).unwrap()));
+        let mut node = RaftNode::new_with_storage(
+            "n1".to_string(),
+            vec!["n2".to_string(), "n3".to_string()],
+            sm,
+            storage,
+        );
+        node.state = NodeState::Leader;
+        node.current_term = 1;
+        node
+    }
+
+    #[test]
+    fn handle_join_cluster_accepts_candidate_on_leader_and_returns_peer_list() {
+        let node = make_join_cluster_leader();
+        let resp = node.handle_join_cluster(&JoinClusterRequest {
+            candidate_addr: "n4".into(),
+        });
+        assert!(resp.accepted, "expected accept; reason={}", resp.reason);
+        assert_eq!(resp.term, 1);
+        assert_eq!(resp.leader_addr, "n1");
+        // Peer list should be all_servers \ {self, candidate} =
+        // {n1,n2,n3} \ {n1, n4} = {n2, n3}.
+        let mut got = resp.peer_addrs.clone();
+        got.sort();
+        assert_eq!(got, vec!["n2".to_string(), "n3".to_string()]);
+        assert!(resp.reason.is_empty());
+    }
+
+    #[test]
+    fn handle_join_cluster_rejects_when_not_leader() {
+        let mut node = make_join_cluster_leader();
+        node.state = NodeState::Follower;
+        let resp = node.handle_join_cluster(&JoinClusterRequest {
+            candidate_addr: "n4".into(),
+        });
+        assert!(!resp.accepted);
+        assert_eq!(resp.term, 1);
+        assert_eq!(resp.reason, "not leader");
+        assert!(resp.peer_addrs.is_empty());
+    }
+
+    #[test]
+    fn handle_join_cluster_rejects_when_not_leader_candidate_too() {
+        let mut node = make_join_cluster_leader();
+        node.state = NodeState::Candidate;
+        let resp = node.handle_join_cluster(&JoinClusterRequest {
+            candidate_addr: "n4".into(),
+        });
+        assert!(!resp.accepted);
+        assert_eq!(resp.reason, "not leader");
+    }
+
+    #[test]
+    fn handle_join_cluster_rejects_candidate_addr_equal_to_leader_addr() {
+        let node = make_join_cluster_leader();
+        // Hint landed on the candidate itself (e.g. candidate dialed
+        // its own address via a stale DNS round-robin).
+        let resp = node.handle_join_cluster(&JoinClusterRequest {
+            candidate_addr: "n1".into(),
+        });
+        assert!(!resp.accepted);
+        assert_eq!(resp.reason, "candidate_addr is the leader itself");
+        assert!(resp.peer_addrs.is_empty());
+    }
+
+    #[test]
+    fn handle_join_cluster_rejects_candidate_addr_already_member() {
+        let mut node = make_join_cluster_leader();
+        // Idempotent retry safety net: n2 is already in the cluster.
+        let resp = node.handle_join_cluster(&JoinClusterRequest {
+            candidate_addr: "n2".into(),
+        });
+        assert!(!resp.accepted);
+        assert_eq!(resp.reason, "candidate_addr is already a cluster member");
+        assert!(resp.peer_addrs.is_empty());
+    }
+
+    #[test]
+    fn handle_join_cluster_returns_term_even_when_rejected() {
+        let mut node = make_join_cluster_leader();
+        node.current_term = 7;
+        node.state = NodeState::Follower;
+        let resp = node.handle_join_cluster(&JoinClusterRequest {
+            candidate_addr: "n4".into(),
+        });
+        assert!(!resp.accepted);
+        assert_eq!(resp.term, 7);
+        assert_eq!(resp.leader_addr, "n1");
+    }
+
+    #[test]
+    fn handle_join_cluster_works_under_joint_config_too() {
+        let mut node = make_join_cluster_leader();
+        // Install a Joint { old, new } config that includes n1,n2,n3
+        // as old and n1,n2,n3,n4 as new — i.e. mid-flight AddNode.
+        let joint = Configuration::Joint {
+            old: vec![
+                ServerId { node_id: "n1".into(), addr: "n1".into() },
+                ServerId { node_id: "n2".into(), addr: "n2".into() },
+                ServerId { node_id: "n3".into(), addr: "n3".into() },
+            ],
+            new: vec![
+                ServerId { node_id: "n1".into(), addr: "n1".into() },
+                ServerId { node_id: "n2".into(), addr: "n2".into() },
+                ServerId { node_id: "n3".into(), addr: "n3".into() },
+                ServerId { node_id: "n4".into(), addr: "n4".into() },
+            ],
+        };
+        node.install_configuration(&joint);
+        // n4 is in new, so a fresh JoinCluster for n5 must reject
+        // (n4 is also a member, so a candidate picking n4's addr must
+        // be rejected for that).
+        let resp_reject = node.handle_join_cluster(&JoinClusterRequest {
+            candidate_addr: "n4".into(),
+        });
+        assert!(!resp_reject.accepted);
+        assert_eq!(resp_reject.reason, "candidate_addr is already a cluster member");
+        // A genuinely-new candidate (n5) is accepted; peer list is
+        // all_servers \ {self, candidate} = {n1,n2,n3,n4} \ {n1,n5}
+        // = {n2,n3,n4}.
+        let resp_accept = node.handle_join_cluster(&JoinClusterRequest {
+            candidate_addr: "n5".into(),
+        });
+        assert!(resp_accept.accepted);
+        let mut got = resp_accept.peer_addrs.clone();
+        got.sort();
+        assert_eq!(
+            got,
+            vec!["n2".to_string(), "n3".to_string(), "n4".to_string()]
+        );
     }
 }

@@ -14,6 +14,7 @@ use crate::protocol::{
 use crate::raft::rpc::{
     AppendEntriesArgs as DomainAppendArgs, AppendReplyArgs as DomainAppendReply,
     InstallSnapshotArgs as DomainInstallArgs, InstallSnapshotReplyArgs as DomainInstallReply,
+    JoinClusterRequest as DomainJoinReq, JoinClusterResponse as DomainJoinResp,
     RaftMessage as DomainRaftMessage, RequestVoteArgs as DomainRequestVote,
     VoteResponseArgs as DomainVote,
 };
@@ -248,6 +249,20 @@ pub fn encode_domain(domain: &DomainRaftMessage) -> pb::RaftMessage {
         // them by the RaftMessage.body tag (7 / 8).
         DM::RequestPreVote(a) => pb::raft_message::Body::RequestPreVote(a.into()),
         DM::PreVoteResponse(a) => pb::raft_message::Body::PreVoteResponse(a.into()),
+        // JoinCluster (P8 PR 6a, cold-new-server catch-up): wire
+        // tags 9 / 10. RPC, not a log entry.
+        DM::JoinCluster(req) => pb::raft_message::Body::JoinCluster(pb::JoinClusterRequest {
+            candidate_addr: req.candidate_addr.clone(),
+        }),
+        DM::JoinClusterResponse(resp) => pb::raft_message::Body::JoinClusterResponse(
+            pb::JoinClusterResponse {
+                accepted: resp.accepted,
+                term: resp.term,
+                leader_addr: resp.leader_addr.clone(),
+                peer_addrs: resp.peer_addrs.clone(),
+                reason: resp.reason.clone(),
+            },
+        ),
     };
     pb::RaftMessage { body: Some(body) }
 }
@@ -428,6 +443,19 @@ pub fn decode_domain(p: pb::RaftMessage) -> DomainRaftMessage {
         // Pre-vote decode (P8 PR 5).
         Some(pb::raft_message::Body::RequestPreVote(a)) => DM::RequestPreVote(a.into()),
         Some(pb::raft_message::Body::PreVoteResponse(a)) => DM::PreVoteResponse(a.into()),
+        // JoinCluster decode (P8 PR 6a).
+        Some(pb::raft_message::Body::JoinCluster(req)) => DM::JoinCluster(DomainJoinReq {
+            candidate_addr: req.candidate_addr,
+        }),
+        Some(pb::raft_message::Body::JoinClusterResponse(resp)) => DM::JoinClusterResponse(
+            DomainJoinResp {
+                accepted: resp.accepted,
+                term: resp.term,
+                leader_addr: resp.leader_addr,
+                peer_addrs: resp.peer_addrs,
+                reason: resp.reason,
+            },
+        ),
         None => {
             // A top-level RaftMessage with no payload should never arrive on the
             // wire. Treat as a vote response with term=0 to fail closed.
@@ -500,6 +528,27 @@ mod tests {
                 },
             }),
             DM::InstallSnapshotReply(DomainInstallReply { term: 5 }),
+            // P8 PR 6a: cold-new-server catch-up RPC.
+            DM::JoinCluster(DomainJoinReq {
+                candidate_addr: "n4@host:9003".into(),
+            }),
+            DM::JoinClusterResponse(DomainJoinResp {
+                accepted: true,
+                term: 7,
+                leader_addr: "n1@host:9001".into(),
+                peer_addrs: vec![
+                    "n2@host:9002".into(),
+                    "n3@host:9004".into(),
+                ],
+                reason: String::new(),
+            }),
+            DM::JoinClusterResponse(DomainJoinResp {
+                accepted: false,
+                term: 7,
+                leader_addr: "n1@host:9001".into(),
+                peer_addrs: Vec::new(),
+                reason: "not leader".into(),
+            }),
         ];
 
         for original in cases {
