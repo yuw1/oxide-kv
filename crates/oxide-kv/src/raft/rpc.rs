@@ -22,6 +22,14 @@ pub enum RaftMessage {
     AppendReply(AppendReplyArgs),
     InstallSnapshot(InstallSnapshotArgs),
     InstallSnapshotReply(InstallSnapshotReplyArgs),
+    /// Pre-vote probe (Raft §9.6). Wire-level tag is
+    /// `RaftMessage.body.request_pre_vote = 7`. **Does not**
+    /// bump `current_term` on either side; see
+    /// `RaftNode::handle_pre_vote` for the response policy and
+    /// `RaftNode::become_pre_candidate` for the quorum-gated
+    /// promotion to real Candidate.
+    RequestPreVote(RequestVoteArgs),
+    PreVoteResponse(VoteResponseArgs),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -265,6 +273,24 @@ impl RpcServer {
                 };
                 println!("✅ Responded to vote request from node {}", args.candidate_id);
                 RaftMessage::VoteResponse(reply)
+            }
+            // Pre-vote probe (P8 PR 5, Raft §9.6). Same wire path
+            // as RequestVote but routed to `handle_pre_vote` which
+            // refuses to mutate `current_term` / `vote_for` /
+            // `state`. Reply travels back on the new
+            // `PreVoteResponse` variant so the sender's reply
+            // handler (`process_pre_vote_reply`) can distinguish
+            // it from a real VoteResponse.
+            RaftMessage::RequestPreVote(args) => {
+                let reply = {
+                    let mut node = raft_node.write().unwrap();
+                    node.handle_pre_vote(&args)
+                };
+                println!(
+                    "🔎 Responded to pre-vote probe from node {} at Term {}",
+                    args.candidate_id, args.term
+                );
+                RaftMessage::PreVoteResponse(reply)
             }
             RaftMessage::AppendEntries(args) => {
                 let reply = {

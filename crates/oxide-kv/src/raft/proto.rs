@@ -163,6 +163,11 @@ pub fn encode_domain(domain: &DomainRaftMessage) -> pb::RaftMessage {
         DM::AppendReply(a) => pb::raft_message::Body::AppendReply(a.into()),
         DM::InstallSnapshot(a) => pb::raft_message::Body::InstallSnapshot(a.into()),
         DM::InstallSnapshotReply(a) => pb::raft_message::Body::InstallSnapshotReply(a.into()),
+        // Pre-vote (P8 PR 5, Raft §9.6): reuse the RequestVoteArgs /
+        // VoteResponseArgs wire types; the receiver distinguishes
+        // them by the RaftMessage.body tag (7 / 8).
+        DM::RequestPreVote(a) => pb::raft_message::Body::RequestPreVote(a.into()),
+        DM::PreVoteResponse(a) => pb::raft_message::Body::PreVoteResponse(a.into()),
     };
     pb::RaftMessage { body: Some(body) }
 }
@@ -328,6 +333,9 @@ pub fn decode_domain(p: pb::RaftMessage) -> DomainRaftMessage {
         Some(pb::raft_message::Body::AppendReply(a)) => DM::AppendReply(a.into()),
         Some(pb::raft_message::Body::InstallSnapshot(a)) => DM::InstallSnapshot(a.into()),
         Some(pb::raft_message::Body::InstallSnapshotReply(a)) => DM::InstallSnapshotReply(a.into()),
+        // Pre-vote decode (P8 PR 5).
+        Some(pb::raft_message::Body::RequestPreVote(a)) => DM::RequestPreVote(a.into()),
+        Some(pb::raft_message::Body::PreVoteResponse(a)) => DM::PreVoteResponse(a.into()),
         None => {
             // A top-level RaftMessage with no payload should never arrive on the
             // wire. Treat as a vote response with term=0 to fail closed.

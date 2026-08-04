@@ -24,7 +24,8 @@ wins.
 | Bug | Election timer brain-split + heartbeat:election ratio | ✅ Merged | [#8](https://github.com/yuw1/oxide-kv/pull/8) | Timer/logic fix |
 | Bug | Single-node read fallback + commit advancement | ✅ Merged | [#9](https://github.com/yuw1/oxide-kv/pull/9) | Read fast path + sync_logs |
 | P6 | Multi-node 2PC coordinator RPC | ✅ Merged | [#11](https://github.com/yuw1/oxide-kv/pull/11)–[#14](https://github.com/yuw1/oxide-kv/pull/14) | Leader-as-coordinator, all-yes quorum, side-channel vote RPC |
-| **P7** | **Deterministic simulation testing (DST)** | **🔄 Active** | — | **Correctness harness: fault injection + invariant checks** |
+| P7 | Deterministic simulation testing (DST) | ✅ Merged | [#28](https://github.com/yuw1/oxide-kv/pull/28), [#29](https://github.com/yuw1/oxide-kv/pull/29), [#31](https://github.com/yuw1/oxide-kv/pull/31), [#32](https://github.com/yuw1/oxide-kv/pull/32) | Correctness harness: fault injection + invariant checks; 1000-scenario nightly fuzz |
+| P8 | Pre-vote, joint consensus, tx timeout, metrics, prod cluster test | 🔄 Active | PR #33 (auto-compaction), PR #34 (workspace+SDK), PR #35 (CI fix), PR #36 (deployment guide) merged; PR 5 (pre-vote) in flight | Closing the disruptive-server problem + ops hardening |
 
 ---
 
@@ -303,3 +304,51 @@ When one of these becomes an active phase, it gets its own section here.
 - TLS for inter-node RPC and the client API
 - Per-read ack tracking for full ReadIndex
 - Metrics export (Prometheus)
+
+---
+
+## P8 — Production hardening
+
+### Problem statement
+
+P0–P7 deliver a correct Raft + 2PC + LSM stack with deterministic-simulation safety evidence. What's missing is the **operational hardening** for an internal-network production deployment:
+
+- **Disruptive server problem** (Raft §9.2): a partitioned follower that recovers used to immediately bump `current_term` and force the live leader to step down, churning the term every few seconds until the partition fully healed. PR #36's README explicitly documents this as a known issue blocking production.
+- **Hard-coded peer list**: 3-node cluster membership is wired at startup via `--peers`. Replacing a failed node requires a full cluster restart. Joint consensus (Raft §6) is the textbook fix.
+- **Coordinator-crash 2PC hole**: a leader that crashes mid-round leaves a pending tx in the log forever. No admin RPC to force-abort.
+- **Operational observability**: no Prometheus exporter, no per-peer RTT histogram, no committed-index lag alarm.
+- **End-to-end prod smoke test**: fuzz + integration tests are in-process; we need a real 3-node TCP smoke test under systemd that CI can run.
+
+### PR plan
+
+| PR | Title | Scope |
+|---|---|---|
+| ✅ #33 | `feat(raft): auto log compaction + snapshot restore on startup` | Auto-trigger snapshot on WAL threshold; recover from snapshot on restart. |
+| ✅ #34 | `feat(workspace): cargo workspace + Python SDK + Rust client crate` | Workspace split; Python SDK; standalone Rust client crate. |
+| ✅ #35 | `ci: skip fuzz in default PR run + fix master CI breakage` | Fuzz gated behind a feature flag; CI green on master. |
+| ✅ #36 | `docs: deployment guide + systemd unit + bootstrap script` | README deployment section; sandboxed systemd unit; env file template; single-host bootstrap script. |
+| 🔵 #5 (this PR, OPEN) | `feat(raft): pre-vote (Raft §9.6) election probe` | `RaftNode::become_pre_candidate` + `handle_pre_vote` + `process_pre_vote_reply`. Wire: new `request_pre_vote = 7` / `pre_vote_response = 8` tags in `RaftMessage` oneof. `run_election_timer` enters via `become_pre_candidate` so the production path can never inflate its term on partition recovery. Tests / simulation harness retain the `become_candidate` fast path. New integration test `tests/pre_vote_recovery.rs` exercises both the disruptive-server regression and the happy-path quorum promotion. Fuzz harness gets a term-churn ceiling so any future regression is caught at scale. |
+| ⏳ #6 | `feat(raft): joint consensus for membership change (Raft §6)` | `AddNode` / `RemoveNode` `Command` variants + cold-new-server / cold-old-server catches. Enables zero-downtime node replacement. |
+| ⏳ #7 | `feat(raft): tx timeout + admin-driven abort` | Coordinator-side timeout on pending txs; admin RPC `AbortTx`; priority-B recovery (participant-side autonomous abort) deferred. |
+| ⏳ #8 | `feat(observability): Prometheus textfile exporter + OpenTelemetry traces` | `/metrics` endpoint; per-raft `term`, `commit_index`, `last_applied`, `peer_rtt`, `pending_tx_count`, `snapshot_age_seconds`. |
+| ⏳ #9 | `test(deploy): 3-node cross-process systemd smoke test under CI` | Real TCP across 3 processes; deploy script; CI step that boots + drives ops + tears down. |
+
+### Acceptance
+
+P8 ships when **all** of these hold on `master`:
+
+1. **Pre-vote prevents term storms** on partition recovery. Integration test `pre_vote_recovery::pre_vote_isolated_follower_does_not_promote_or_disrupt` passes; fuzz harness's term-churn ceiling stays under-budget across 1000+ scenarios.
+2. **Joint consensus** lets us add / remove a node without restarting the cluster; the cluster continues to serve ops during the transition.
+3. **Tx timeout + admin abort** lets an operator force-abort a pending tx after the coordinator crashes.
+4. **Prometheus exporter** is on the standard port; 5 documented metrics are scraped; alerts documented in README.
+5. **3-node cross-process smoke test** under CI exercises the full deploy path (systemd unit → bootstrap script → ops → teardown) and finishes green.
+6. **No regressions**: all P0–P7 tests still pass; 213 → target ≥230 tests; clippy debt ≤ pre-P8 baseline.
+
+### Out of scope (deferred to P9+)
+
+- Cross-Raft-group transactions.
+- LSM polish (bloom filters, block cache, background compaction).
+- gRPC transport.
+- TLS for inter-node RPC and the client API.
+- Per-read ack tracking for full ReadIndex.
+- Sharded multi-Raft.

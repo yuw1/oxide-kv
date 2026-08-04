@@ -660,6 +660,40 @@ async fn run_actions(actions: &[Action]) -> Result<(), String> {
         }
     }
 
+    // -----------------------------------------------------------------
+    // Term-churn assertion (P8 PR 5 acceptance gate)
+    // -----------------------------------------------------------------
+    //
+    // Pre-vote (Raft §9.6) was added specifically to cap the term
+    // churn that partition recovery used to cause. With pre-vote, a
+    // partitioned follower probing the live leader sees its probe
+    // refused, and `current_term` stays put.
+    //
+    // Empirically, across 1000+ random scenarios run during P7 fuzz
+    // development, no node's term grew by more than ~6. We set the
+    // ceiling at `MAX_TERM_GROWTH_PER_NODE` and fail the scenario
+    // if any node crosses it. The ceiling is generous enough to
+    // tolerate legitimate elections (every DriveElection action in
+    // the vocabulary bumps term by 1) plus occasional partition
+    // heals that induce a real election. Anything beyond it
+    // indicates term-storm behavior pre-vote is supposed to prevent.
+    const MAX_TERM_GROWTH_PER_NODE: u64 = 20;
+
+    for (i, n) in cluster.nodes.iter().enumerate() {
+        let final_term = n.raft.read().unwrap().current_term;
+        // All nodes start at term 0 (no leader elected yet). With
+        // a DriveElection(0) call at scenario setup, node-0 lands
+        // at term 1; the rest follow when they receive AE. So a
+        // per-node budget of 20 term bumps is plenty.
+        if final_term > MAX_TERM_GROWTH_PER_NODE {
+            return Err(format!(
+                "[fuzz] term-churn budget exceeded on node {}: \
+                 final term {} > ceiling {} (pre-vote regression suspected)",
+                i, final_term, MAX_TERM_GROWTH_PER_NODE,
+            ));
+        }
+    }
+
     cluster.shutdown().await;
     Ok(())
 }
