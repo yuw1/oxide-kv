@@ -16,7 +16,8 @@ pub struct Args {
     pub client_addr: String,
     #[arg(short, long, value_delimiter = ',')]
     pub peers: Vec<String>,
-    pub data_dir: Option<String>
+    #[arg(long)]
+    pub data_dir: Option<String>,
 }
 
 #[tokio::main]
@@ -136,4 +137,41 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: prior to PR #36, `Args::data_dir` had no `#[arg(long)]`
+    /// annotation, so clap parsed it as a positional argument and rejected
+    /// `--data-dir /tmp/x`. This test pins the documented `--data-dir`
+    /// CLI form that the deployment guide (`README.md`) and
+    /// `deploy/systemd/oxide-kv@.service` rely on.
+    #[test]
+    fn args_parses_data_dir_flag() {
+        let args = <Args as clap::Parser>::try_parse_from([
+            "oxide-kv",
+            "--addr", "127.0.0.1:9001",
+            "--client-addr", "127.0.0.1:9101",
+            "--peers", "127.0.0.1:9002,127.0.0.1:9003",
+            "--data-dir", "/var/lib/oxide-kv/node-1",
+        ]).expect("--data-dir should be a valid clap flag");
+        assert_eq!(args.addr, "127.0.0.1:9001");
+        assert_eq!(args.client_addr, "127.0.0.1:9101");
+        assert_eq!(args.peers, vec!["127.0.0.1:9002", "127.0.0.1:9003"]);
+        assert_eq!(args.data_dir.as_deref(), Some("/var/lib/oxide-kv/node-1"));
+    }
+
+    /// Without `--data-dir`, the flag stays `None` and the binary falls
+    /// back to its default data dir (whatever the storage layer picks
+    /// when the field is `None`).
+    #[test]
+    fn args_data_dir_is_optional() {
+        let args = <Args as clap::Parser>::try_parse_from([
+            "oxide-kv",
+            "--addr", "127.0.0.1:9001",
+            "--client-addr", "127.0.0.1:9101",
+        ]).expect("data_dir should be optional");
+        assert!(args.data_dir.is_none());
+    }
 }

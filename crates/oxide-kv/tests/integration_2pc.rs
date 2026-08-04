@@ -493,7 +493,10 @@ async fn no_vote_from_one_peer_aborts_tx_and_isolates_ops() {
     //    machine effect — so it isolates the fault cleanly.
     {
         let mut n = nodes[2].raft.write().unwrap();
-        n.push_log_entry_for_test(5, Command::Compact);
+        // Bumps node 2's last_log_index to 2, so the leader's
+        // BeginTx (index 1) looks stale when the vote RPC arrives.
+        // The phantom Compact is a no-op on apply.
+        n.push_log_entry_for_test(Command::Compact);
     }
 
     // 5. Send BeginTx.

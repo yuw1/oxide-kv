@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (Deployment guide + systemd unit + bootstrap script)
+- **`README.md` Deployment section**: end-to-end guide for
+  internal-network production deployment. Covers hardware /
+  OS requirements, port conventions (9001 Raft / 9101
+  client), firewall rules (iptables / nftables example),
+  bootstrap order (start 2 nodes before the 3rd to form
+  majority), systemd unit install, pre-flight checklist,
+  monitoring metrics (Prometheus-style), backup / restore
+  (data dir layout), and rolling upgrade procedure.
+- **`deploy/systemd/oxide-kv@.service`**: reference systemd
+  template unit. Tight sandbox
+  (`NoNewPrivileges`, `ProtectSystem=strict`,
+  `ReadWritePaths=` whitelisted to data + log dirs,
+  `MemoryDenyWriteExecute`, etc.). Reads bind addresses
+  + peers + data dir from a per-instance env file so the
+  same ExecStart works across all three nodes.
+- **`deploy/systemd/oxide-kv.env.example`**: per-instance
+  env-file template documenting `OXIDE_KV_ADDR`,
+  `OXIDE_KV_CLIENT_ADDR`, `OXIDE_KV_PEERS`,
+  `OXIDE_KV_DATA_DIR`, and the optional
+  `OXIDE_SNAPSHOT_THRESHOLD_BYTES`.
+- **`deploy/scripts/bootstrap-cluster.sh`**: single-host
+  3-node quick-start script for laptop / CI smoke tests.
+  `start` / `stop` / `status` / `clean` subcommands. Logs
+  to `/tmp/oxide-kv-node-{1,2,3}.log`; pidfiles under the
+  same prefix.
+
 ### Fixed (CI workflows: workspace paths + skip fuzz in default PR)
 - `.github/workflows/rust.yml`:
   - Switched default CI to `cargo build --workspace` /

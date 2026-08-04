@@ -1,0 +1,72 @@
+[Unit]
+# Template unit for an Oxide-KV node. The instance name (after `@`)
+# is the short identifier of THIS node within the cluster — typically
+# `node-1`, `node-2`, `node-3`. It's not the listen address; the
+# bind address comes from /etc/oxide-kv/%i.env.
+#
+# Example:
+#   systemctl enable --now oxide-kv@node-1.service
+#   systemctl enable --now oxide-kv@node-2.service
+#   systemctl enable --now oxide-kv@node-3.service
+#
+# The unit reads its listen / peer addresses from an env file so the
+# same ExecStart can be reused across all three nodes; only the env
+# file differs per instance.
+
+Description=Oxide-KV node (%i)
+Documentation=https://github.com/yuw1/oxide-kv
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=oxide-kv
+Group=oxide-kv
+
+# Sandboxing: deny everything except what we actually need.
+# If you need to debug, drop the sandbox lines temporarily.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/oxide-kv /var/log/oxide-kv
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+# Slightly higher open-file limit: each open SSTable is one fd, and a
+# long-running node accumulates SSTables between compactions.
+LimitNOFILE=65536
+
+# Read bind addresses + peers + data dir from a per-instance env file.
+EnvironmentFile=/etc/oxide-kv/%i.env
+
+# The ExecStart uses the env vars loaded above. The flags are:
+#   --addr          : Raft inter-node listen (Protobuf TCP)
+#   --client-addr   : client API listen (JSON over TCP)
+#   --peers         : comma-separated list of OTHER nodes' --addr values
+#   --data-dir      : per-instance data directory (WAL + snapshots)
+ExecStart=/usr/local/bin/oxide-kv \
+    --addr ${OXIDE_KV_ADDR} \
+    --client-addr ${OXIDE_KV_CLIENT_ADDR} \
+    --peers ${OXIDE_KV_PEERS} \
+    --data-dir ${OXIDE_KV_DATA_DIR}
+
+# Auto-restart on crash. Boot delay so the cluster can elect a leader
+# before peers hammer us with heartbeats.
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=10s
+
+# Logging goes to journald; rsyslog or promtail can scrape from there.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=oxide-kv
+
+[Install]
+WantedBy=multi-user.target

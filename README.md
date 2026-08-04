@@ -265,6 +265,236 @@ proto/
 
 ---
 
+## Deployment (internal network)
+
+This section is the "make it run on three Linux boxes and keep it
+up" guide. It assumes an **internal-network** deployment — Oxide-KV
+ships without TLS, auth, or rate limiting, so it's not safe to
+expose to the public internet. Front it with a reverse proxy if
+you need internet access.
+
+### Hardware & OS
+
+| Requirement | Why |
+|---|---|
+| **3 nodes** (VM / container / bare metal) | Raft requires a majority; 2 nodes means zero fault tolerance, 4+ is supported but adds no quorum benefit for 3-of-5. |
+| **Internal network connectivity** between nodes | Raft heartbeats are RPC; partition = leader election churn. |
+| **Clock sync** (chrony / ntp), drift < 100ms | Election timer windows are sensitive to skewed clocks; large drift → spurious elections. |
+| **OS user** `oxide-kv` (non-login, no home) | Service should not run as root; systemd `User=` field needs this user. |
+| **Data directory** `/var/lib/oxide-kv/<node-id>`, mode 0750 | One per node; do NOT share across nodes. |
+| **Log directory** `/var/log/oxide-kv` (journald) | Captures startup / election / shutdown events. |
+
+### Ports
+
+| Port (convention) | Protocol | Purpose | Bound to |
+|---|---|---|---|
+| **9001** (this node) | Protobuf over TCP | Raft inter-node RPC (heartbeats, AppendEntries, RequestVote, InstallSnapshot) | Internal network only |
+| **9101** (this node) | JSON over TCP | Client API (Set/Get/Delete/2PC) | Internal network + reverse proxy |
+| **9002-9003**, **9102-9103** | — | Peers' ports (if you stagger by node-id) | Internal network only |
+
+**Do not expose 9001/9002/9003 to the internet.** Raft has no auth;
+any random client could trigger spurious elections.
+
+### Firewall rules (example: iptables / nftables)
+
+```
+# On each node, allow Raft RPC from the other two:
+-A INPUT -p tcp -s 10.0.0.2 --dport 9001 -j ACCEPT   # allow node-2 -> us
+-A INPUT -p tcp -s 10.0.0.3 --dport 9001 -j ACCEPT   # allow node-3 -> us
+-A INPUT -p tcp --dport 9001 -j DROP                 # deny everyone else
+
+# Allow client API from app hosts / reverse proxy:
+-A INPUT -p tcp -s 10.0.1.0/24 --dport 9101 -j ACCEPT
+-A INPUT -p tcp --dport 9101 -j DROP
+```
+
+### Bootstrap order
+
+The cluster needs a **majority** to elect a leader. On a fresh
+3-node cluster, **start the first two nodes before the third**.
+A single node alone cannot reach a majority with `--peers`
+configured (peers.len() + 1 = 3 nodes total; majority = 2).
+The first node would stay in candidate state forever.
+
+**Safe startup sequence**:
+
+```
+# On node-1:  start with peers = [node-2, node-3]
+# On node-2:  start with peers = [node-1, node-3]
+# Either of these two will form a 2-of-3 majority and elect a leader.
+# On node-3:  start with peers = [node-1, node-2]
+# Node-3 catches up from whichever is leader.
+```
+
+### systemd unit (production)
+
+Reference unit + env-file template live under
+[`deploy/systemd/`](deploy/systemd/):
+
+- [`deploy/systemd/oxide-kv@.service`](deploy/systemd/oxide-kv@.service) —
+  template unit; instance name (after `@`) is the node-id
+  (`node-1`, `node-2`, `node-3`).
+- [`deploy/systemd/oxide-kv.env.example`](deploy/systemd/oxide-kv.env.example) —
+  per-instance env file (`OXIDE_KV_ADDR`, `OXIDE_KV_PEERS`,
+  `OXIDE_KV_DATA_DIR`, optional `OXIDE_SNAPSHOT_THRESHOLD_BYTES`).
+
+Install steps (run on each node):
+
+```bash
+# 1. Create the user + dirs (one-time per host)
+useradd --system --no-create-home --shell /usr/sbin/nologin oxide-kv
+mkdir -p /var/lib/oxide-kv/node-X /var/log/oxide-kv /etc/oxide-kv
+chown -R oxide-kv:oxide-kv /var/lib/oxide-kv /var/log/oxide-kv
+chmod 0750 /var/lib/oxide-kv /var/log/oxide-kv
+
+# 2. Install the binary (build on one host, scp the binary)
+install -m 0755 target/release/oxide-kv /usr/local/bin/oxide-kv
+
+# 3. Install the unit + env file
+install -m 0644 deploy/systemd/oxide-kv@.service /etc/systemd/system/
+cp deploy/systemd/oxide-kv.env.example /etc/oxide-kv/node-1.env
+# Edit /etc/oxide-kv/node-1.env to set this host's IP / peers
+chmod 0640 /etc/oxide-kv/node-1.env
+
+# 4. Enable + start
+systemctl daemon-reload
+systemctl enable --now oxide-kv@node-1.service
+
+# 5. Verify
+systemctl status oxide-kv@node-1.service
+journalctl -u oxide-kv@node-1 -f
+```
+
+The unit applies a tight sandbox (`NoNewPrivileges`,
+`ProtectSystem=strict`, `ReadWritePaths=` whitelisted to
+`/var/lib/oxide-kv` + `/var/log/oxide-kv`, etc.) so a
+vulnerability in the binary can't trivially escalate.
+
+### Local development / quick-start
+
+For a single-host 3-node cluster (laptop, CI smoke test),
+use [`deploy/scripts/bootstrap-cluster.sh`](deploy/scripts/bootstrap-cluster.sh):
+
+```bash
+cargo build --release
+./deploy/scripts/bootstrap-cluster.sh start
+# Logs: /tmp/oxide-kv-node-{1,2,3}.log
+./deploy/scripts/bootstrap-cluster.sh status
+
+# Talk to the cluster:
+python3 examples/oxide_kv_demo.py
+# Or via the Rust CLI:
+cargo run --release --example oxide_kv_cli -- set hello world
+
+./deploy/scripts/bootstrap-cluster.sh stop     # shut down
+./deploy/scripts/bootstrap-cluster.sh clean    # nuke data dirs
+```
+
+### Pre-flight checklist
+
+Before going to production, verify each box:
+
+```
+[ ] 3 hosts with internal network connectivity between them
+[ ] OS user `oxide-kv` created, no shell, no home
+[ ] /var/lib/oxide-kv/<node-id> created, owned oxide-kv:oxide-kv, mode 0750
+[ ] /var/log/oxide-kv exists, owned oxide-kv:oxide-kv
+[ ] /etc/oxide-kv/<node-id>.env exists, mode 0640, with correct IP / peers
+[ ] Firewall: 9001/9101 reachable from cluster + app hosts, dropped elsewhere
+[ ] chrony / ntpd running, drift < 100ms across all 3 hosts
+[ ] systemd unit installed, enabled, started
+[ ] Bootstrap order: first 2 nodes started before the 3rd
+[ ] Verification: 30s after startup, one node is leader, term stable, no election churn
+```
+
+### Monitoring
+
+Minimum health checks (Prometheus or your equivalent):
+
+| Metric | Source | Why it matters |
+|---|---|---|
+| `oxide_kv_up{node=...}` | `pgrep -f oxide-kv` or systemd `Active=` | Process died |
+| `oxide_kv_raft_port_listening{node=...}` | `ss -lnt 'sport = :9001'` | Stuck startup, port collision |
+| `oxide_kv_client_port_listening{node=...}` | `ss -lnt 'sport = :9101'` | Stuck startup, port collision |
+| `oxide_kv_last_log_index{node=...}` | log scrape / journald | Replica falling behind |
+| `oxide_kv_data_dir_size_bytes{node=...}` | `du -sb /var/lib/oxide-kv/<node-id>` | Snapshot compaction healthy |
+
+Alert on:
+
+- Any node down > 30s.
+- `last_log_index` lag > 100 between leader and a follower
+  (suggests a stuck peer).
+- `data_dir_size_bytes` growing unbounded (> 1 GiB without a
+  recent snapshot) suggests `OXIDE_SNAPSHOT_THRESHOLD_BYTES` is
+  too high or auto-compaction broke.
+
+### Backup & restore
+
+The on-disk format is:
+
+```
+/var/lib/oxide-kv/<node-id>/
+├── wal/         # append-only log; rewritten on snapshot
+├── snapshots/   # snap-<last_index>-<term>.bin
+└── meta         # term + voted-for; atomic rename
+```
+
+To restore onto a fresh node: copy the **entire** data dir from
+any peer that has been continuously in the cluster. The new node
+will replay from `wal/` + apply the latest `snapshots/` file on
+startup (auto log compaction makes this O(snapshot_interval) not
+O(total_writes)).
+
+### Upgrade procedure
+
+Oxide-KV doesn't have rolling-restart semantics yet (that's on
+the roadmap under §6 membership change). For now:
+
+1. Stop one follower (`systemctl stop oxide-kv@node-X.service`).
+2. Replace its binary at `/usr/local/bin/oxide-kv`.
+3. Start it (`systemctl start oxide-kv@node-X.service`).
+4. Wait ~5s for it to catch up (check `last_log_index`).
+5. Repeat for the second follower, then **finally** the leader
+   (the leader is the last to be replaced; stopping it triggers
+   an election on the other two, the new leader is chosen, and
+   the upgraded binary joins as a follower).
+
+Verify after each step: term is stable across the cluster for
+30s with no spurious elections in the journal.
+
+### Known issue: 3-node clusters can churn through terms on startup (P8 PR 5 will fix)
+
+Until **Raft thesis §9.6 pre-vote** lands (planned as P8 PR 5),
+a fresh 3-node cluster can briefly oscillate through term
+values on startup: two followers wake up within the same
+election-timeout window, both call an election, the loser
+steps down, a third node races a fresh election, etc. The
+cluster **does converge** (term monotonically increases
+until a stable leader wins), but it can take 3-5 term
+flips before stabilizing on a fresh bootstrap.
+
+What this means in practice:
+
+- Reads / writes during the first ~10 seconds after bootstrap
+  may be rejected with `"Not a leader"`. Just retry.
+- For low-QPS internal-network use this is a cosmetic problem
+  (clients should retry anyway; the Python SDK and Rust
+  client both bubble up `NotLeaderError` for the caller to
+  decide).
+- For deployments where this matters (e.g., a tight health
+  check), upgrade to the `pre-vote`-enabled build once P8
+  PR 5 lands.
+
+The nightly fuzz sweep (`crates/oxide-kv/tests/raft_fuzz.rs`)
+uses a `DriveElection` action that injects elections directly,
+so it does **not** cover this timer-collision scenario. A
+follow-up test using the real timer loop would have caught
+this; adding it is on the P8 backlog.
+
+---
+
+---
+
 ## Running the simulation (P7 DST)
 
 The fuzz harness in `tests/raft_fuzz.rs` runs the real RaftNode code
@@ -381,8 +611,9 @@ code; fixes don't belong inside the harness PRs.
 The active roadmap lives in [ROADMAP.md](./ROADMAP.md). That file is
 the single source of truth for phase status, in-progress work, and
 acceptance criteria. The current phase is **P8 — Auto log
-compaction** (PRs #25–#32 ship DST; P8 closes the remaining
-production gap so the WAL doesn't grow unbounded on a 7×24 node).
+compaction + Deployment + Clients** (PR #33 ships auto log
+compaction; PRs #34–#35 add the Python SDK, Rust client
+crate, and a deployment guide for internal-network use).
 
 ### Phase summary
 
@@ -398,12 +629,16 @@ production gap so the WAL doesn't grow unbounded on a 7×24 node).
 | Bug | Single-node read fallback + commit advancement | ✅ | [#9](https://github.com/yuw1/oxide-kv/pull/9) |
 | P6 | Multi-node 2PC coordinator RPC | ✅ | [#11](https://github.com/yuw1/oxide-kv/pull/11)–[#14](https://github.com/yuw1/oxide-kv/pull/14) |
 | **P7** | **Deterministic simulation testing (DST)** | **✅** | [#25](https://github.com/yuw1/oxide-kv/pull/25)–[#31](https://github.com/yuw1/oxide-kv/pull/31) |
-| **P8** | **Auto log compaction + WAL truncation** | **🔄 In progress** | — |
+| **P8** | **Auto log compaction + WAL truncation** | **✅** | [#33](https://github.com/yuw1/oxide-kv/pull/33) |
+| **P8** | **Cargo workspace + Python SDK + Rust client** | **✅** | [#34](https://github.com/yuw1/oxide-kv/pull/34), [#35](https://github.com/yuw1/oxide-kv/pull/35) |
+| **P8** | **Deployment guide + systemd unit** | **🔄 In progress** | — |
 
 ### Candidate future directions (see ROADMAP.md for full list)
 
 - Deterministic simulation testing (P7) — fault injection + invariant proofs
-- Auto log compaction + WAL truncation (P8, active) — bound the on-disk WAL size
+- Auto log compaction + WAL truncation (P8) — bound the on-disk WAL size
+- Cargo workspace + Python SDK + Rust client crate (P8) — usable from script / service
+- Deployment guide + systemd unit (P8, active) — runnable in production
 - Sharded multi-Raft
 - Joint consensus for membership change (Raft §6)
 - Tx timeout + admin-driven abort
