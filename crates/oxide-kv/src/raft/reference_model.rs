@@ -164,6 +164,21 @@ impl ReferenceModel {
             // we see one, ignore it — the production
             // client never writes Get to the log.
             Command::Get { .. } => {}
+            // `AddNode` / `RemoveNode`: client-facing
+            // membership commands. The leader replaces them
+            // with `Configuration` log entries before
+            // replication, so the reference model never sees
+            // them either. If it does, treat as no-op (the
+            // reference model only needs to agree with the
+            // state-machine on observable effects; membership
+            // is in `Configuration`).
+            Command::AddNode { .. } | Command::RemoveNode { .. } => {}
+            // `InstallConfiguration`: leader-internal log
+            // entry. The reference model doesn't model
+            // membership state (the state machine doesn't
+            // care), so this is a no-op for the model. The
+            // invariants layer checks membership separately.
+            Command::InstallConfiguration { .. } => {}
         }
         true
     }

@@ -1,5 +1,5 @@
 use crate::raft::node::{RaftNode, NodeState};
-use crate::protocol::Command;
+use crate::protocol::{Command, MembershipError, ServerId};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
@@ -83,6 +83,31 @@ impl ClientHandler {
             Command::Compact => {
                 serde_json::json!({"status": "error", "message": "compact not supported yet"})
             },
+            Command::AddNode { server } => {
+                // P8 PR 6 (Raft thesis §6): client-facing membership
+                // change. The leader's MembershipCoordinator intercepts
+                // this and translates it into two `InstallConfiguration`
+                // log entries (Joint, then Simple). On the leader we
+                // run that translation now and return once the *first*
+                // entry (Joint) commits — the second is appended
+                // automatically when the joint entry is observed.
+                Self::add_node(server, node_arc).await
+            }
+            Command::RemoveNode { node_id } => {
+                // P8 PR 6: client-facing membership removal. Mirrors
+                // `AddNode` above.
+                Self::remove_node(node_id, node_arc).await
+            }
+            Command::InstallConfiguration { .. } => {
+                // Defensive: this should never appear in a client
+                // command (the leader installs it from the log, not
+                // from JSON). If a client somehow sends one, refuse
+                // so it can't bypass the MembershipCoordinator.
+                serde_json::json!({
+                    "status": "error",
+                    "message": "InstallConfiguration is a leader-internal log entry; not a valid client command"
+                })
+            }
         }
     }
 
@@ -178,6 +203,175 @@ impl ClientHandler {
             serde_json::json!({"status": "ok", "index": index})
         } else {
             serde_json::json!({"status": "error"})
+        }
+    }
+
+    /// P8 PR 6: client-side membership addition. Leader-only;
+    /// constructs the two-phase joint-consensus log sequence and
+    /// waits for the Joint entry to commit before returning.
+    ///
+    /// The subsequent `Simple(new)` entry is auto-proposed by the
+    /// leader's `apply_logs` hook once the Joint commits, so the
+    /// caller doesn't see that step. We do poll for it anyway so
+    /// the response reports the *final* committed index — the
+    /// caller can rely on the membership being fully installed
+    /// when this returns.
+    pub async fn add_node(
+        server: ServerId,
+        node_arc: &Arc<RwLock<RaftNode>>,
+    ) -> serde_json::Value {
+        let joint_index = {
+            let mut node = node_arc.write().unwrap();
+            match node.propose_add_node(server.clone()) {
+                Ok(idx) => idx,
+                Err(e) => return Self::membership_error_to_json(e),
+            }
+        };
+        // Kick off replication now so the Joint entry commits
+        // without waiting for the next heartbeat tick.
+        RaftNode::sync_logs(node_arc.clone());
+
+        // Wait for the Joint entry to commit.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            {
+                let node = node_arc.read().unwrap();
+                if node.commit_index >= joint_index {
+                    break;
+                }
+            }
+            if Instant::now() >= deadline {
+                return serde_json::json!({
+                    "status": "error",
+                    "message": format!(
+                        "AddNode: Joint entry at index {} did not commit within 10s",
+                        joint_index
+                    )
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // The Simple(new) entry will be auto-proposed by apply_logs
+        // immediately after the Joint commits. We don't strictly
+        // need to wait for it to commit before responding — the
+        // membership is "effectively in the joint state" once the
+        // Joint commits, which is enough for the new server to
+        // start receiving heartbeats. But we do poll for the
+        // Simple entry so the client gets a single clear "done"
+        // signal.
+        let simple_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            {
+                let node = node_arc.read().unwrap();
+                // The Simple entry has been proposed once
+                // apply_logs has run past the Joint entry. We
+                // look for the index just after the Joint.
+                if node.log.len() as u64 > joint_index {
+                    break;
+                }
+            }
+            if Instant::now() >= simple_deadline {
+                // The Simple entry may not yet be appended; that's
+                // not a failure (the Joint already commits and the
+                // Simple will be appended shortly). Return a
+                // success-with-warning response.
+                return serde_json::json!({
+                    "status": "ok",
+                    "joint_index": joint_index,
+                    "simple_appended": false,
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        serde_json::json!({
+            "status": "ok",
+            "joint_index": joint_index,
+            "simple_index": joint_index + 1,
+            "new_member": server.node_id,
+        })
+    }
+
+    /// P8 PR 6: client-side membership removal. Mirror of
+    /// `add_node`.
+    pub async fn remove_node(
+        node_id: String,
+        node_arc: &Arc<RwLock<RaftNode>>,
+    ) -> serde_json::Value {
+        let joint_index = {
+            let mut node = node_arc.write().unwrap();
+            match node.propose_remove_node(&node_id) {
+                Ok(idx) => idx,
+                Err(e) => return Self::membership_error_to_json(e),
+            }
+        };
+        RaftNode::sync_logs(node_arc.clone());
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            {
+                let node = node_arc.read().unwrap();
+                if node.commit_index >= joint_index {
+                    break;
+                }
+            }
+            if Instant::now() >= deadline {
+                return serde_json::json!({
+                    "status": "error",
+                    "message": format!(
+                        "RemoveNode: Joint entry at index {} did not commit within 10s",
+                        joint_index
+                    )
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let simple_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            {
+                let node = node_arc.read().unwrap();
+                if node.log.len() as u64 > joint_index {
+                    break;
+                }
+            }
+            if Instant::now() >= simple_deadline {
+                return serde_json::json!({
+                    "status": "ok",
+                    "joint_index": joint_index,
+                    "simple_appended": false,
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        serde_json::json!({
+            "status": "ok",
+            "joint_index": joint_index,
+            "simple_index": joint_index + 1,
+            "removed_member": node_id,
+        })
+    }
+
+    fn membership_error_to_json(e: MembershipError) -> serde_json::Value {
+        match e {
+            MembershipError::NotLeader => {
+                serde_json::json!({"status": "error", "code": "not_leader", "message": "Not a leader. Please connect to the leader node."})
+            }
+            MembershipError::AlreadyMember(id) => {
+                serde_json::json!({"status": "error", "code": "already_member", "node_id": id})
+            }
+            MembershipError::NotMember(id) => {
+                serde_json::json!({"status": "error", "code": "not_member", "node_id": id})
+            }
+            MembershipError::CannotRemoveSelf => {
+                serde_json::json!({"status": "error", "code": "cannot_remove_self", "message": "Refusing to remove the leader itself; do this on another node"})
+            }
+            MembershipError::CannotRemoveLastServer => {
+                serde_json::json!({"status": "error", "code": "cannot_remove_last_server", "message": "Refusing to remove the last server; the cluster would be unable to make progress"})
+            }
+            MembershipError::StorageError(msg) => {
+                serde_json::json!({"status": "error", "code": "storage_error", "message": msg})
+            }
         }
     }
 

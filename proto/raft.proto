@@ -35,7 +35,40 @@ message Command {
     // cannot be declared inside a `oneof`; instead we simply omit the
     // variant and rely on the absence to discourage reuse.
     DecideTx decide_tx = 7;
+    // P8 PR 6 (Raft thesis §6): client-facing membership commands.
+    // The leader intercepts these in `MembershipCoordinator` and
+    // replaces them with `ConfigurationEntry` log entries before
+    // replication. They exist on the wire for completeness so the
+    // type is closed, but in normal operation they never appear in a
+    // log entry that another server observes. See
+    // `src/raft/node.rs::MembershipCoordinator` for the policy.
+    ServerId add_node = 8;          // AddNode { server }
+    string remove_node = 9;         // RemoveNode { node_id }
+    ConfigurationEntry install_configuration = 10; // InstallConfiguration
   }
+}
+
+message ServerId {
+  string node_id = 1;
+  string addr = 2;
+}
+
+// Committed membership configuration (Raft thesis §6).
+//
+// `Simple(servers)` is the steady state; `Joint { old, new }` is the
+// transitional state during a single-server membership change. Once
+// the Joint entry commits, the subsequent Simple entry commits via
+// a quorum of `new` alone. Both phases are log entries, not RPCs,
+// so they ride on the existing AppendEntries path.
+message ConfigurationEntry {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_SIMPLE = 1;
+    KIND_JOINT = 2;
+  }
+  Kind kind = 1;
+  repeated ServerId old_servers = 2;
+  repeated ServerId new_servers = 3;
 }
 
 message Set {
