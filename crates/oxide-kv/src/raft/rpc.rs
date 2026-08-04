@@ -30,6 +30,36 @@ pub enum RaftMessage {
     /// promotion to real Candidate.
     RequestPreVote(RequestVoteArgs),
     PreVoteResponse(VoteResponseArgs),
+    /// Cold-new-server catch-up (P8 PR 6a). Wire-level tag is
+    /// `RaftMessage.body.join_cluster = 9`. A brand-new server
+    /// (with empty `peers`) sends this to a hint address learned
+    /// out-of-band (DNS / systemd env / manual bootstrap). The
+    /// leader replies with `JoinClusterResponse` carrying the
+    /// current peer list. Not a log entry, does not participate
+    /// in quorum or replication. See
+    /// `RaftNode::handle_join_cluster` for the policy.
+    JoinCluster(JoinClusterRequest),
+    JoinClusterResponse(JoinClusterResponse),
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct JoinClusterRequest {
+    /// Address of the candidate server (in v1, the candidate's
+    /// `node_id` is identical to this). The leader uses this to
+    /// later call `propose_add_node(ServerId { node_id, addr })`.
+    pub candidate_addr: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct JoinClusterResponse {
+    pub accepted: bool,
+    pub term: u64,
+    pub leader_addr: String,
+    /// Current peer addresses (excluding the candidate and the leader).
+    /// Empty when `accepted=false`.
+    pub peer_addrs: Vec<String>,
+    /// Human-readable reason when `accepted=false`. Empty otherwise.
+    pub reason: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -307,6 +337,20 @@ impl RpcServer {
                 };
                 println!("📦 Responded to InstallSnapshot from Leader {} (Term {})", args.leader_id, args.term);
                 RaftMessage::InstallSnapshotReply(reply)
+            }
+            // Cold-new-server catch-up (P8 PR 6a). The handler
+            // returns `JoinClusterResponse`; we echo it back to the
+            // candidate on the same connection.
+            RaftMessage::JoinCluster(req) => {
+                let reply = {
+                    let node = raft_node.read().unwrap();
+                    node.handle_join_cluster(&req)
+                };
+                println!(
+                    "🆕 Responded to JoinCluster from candidate {} (accepted={})",
+                    req.candidate_addr, reply.accepted
+                );
+                RaftMessage::JoinClusterResponse(reply)
             }
             other => {
                 println!("⚠️ Received unexpected RPC message type: {:?}", other);

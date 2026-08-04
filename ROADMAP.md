@@ -329,6 +329,7 @@ P0–P7 deliver a correct Raft + 2PC + LSM stack with deterministic-simulation s
 | ✅ #36 | `docs: deployment guide + systemd unit + bootstrap script` | README deployment section; sandboxed systemd unit; env file template; single-host bootstrap script. |
 | 🔵 #5 (this PR, OPEN) | `feat(raft): pre-vote (Raft §9.6) election probe` | `RaftNode::become_pre_candidate` + `handle_pre_vote` + `process_pre_vote_reply`. Wire: new `request_pre_vote = 7` / `pre_vote_response = 8` tags in `RaftMessage` oneof. `run_election_timer` enters via `become_pre_candidate` so the production path can never inflate its term on partition recovery. Tests / simulation harness retain the `become_candidate` fast path. New integration test `tests/pre_vote_recovery.rs` exercises both the disruptive-server regression and the happy-path quorum promotion. Fuzz harness gets a term-churn ceiling so any future regression is caught at scale. |
 | ✅ #6 | `feat(raft): joint consensus for membership change (Raft §6)` | `ServerId` / `Configuration::Simple|Joint` + dual-majority `maybe_commit`. `propose_add_node` / `propose_remove_node` (leader-internal) → `InstallConfiguration` log entry. `pending_post_joint_simple` auto-proposes the follow-up `Simple(new)` entry. 27 new unit tests + 4 new integration tests in `joint_consensus.rs`. Cold-new-server catch-up is delegated to the test harness (see "Out of scope" below for production follow-up). |
+| ✅ #6a | `feat(raft): JoinCluster RPC for cold-new-server catch-up` | `JoinClusterRequest`/`JoinClusterResponse` wire messages (proto tags 9/10) + `RaftNode::handle_join_cluster` (leader-only). Candidate sends `JoinCluster(candidate_addr)` to a hint address; leader replies with the current peer list; candidate calls `set_peers` and waits to be added via Joint consensus. Bugfix: `next_index` default for unknown peer changed from `log_len + 1` to `1` so cold-new-server catch-up works. 7 new unit tests + 4 new integration tests in `tests/join_cluster.rs`. |
 | ⏳ #7 | `feat(raft): tx timeout + admin-driven abort` | Coordinator-side timeout on pending txs; admin RPC `AbortTx`; priority-B recovery (participant-side autonomous abort) deferred. |
 | ⏳ #7 | `feat(raft): tx timeout + admin-driven abort` | Coordinator-side timeout on pending txs; admin RPC `AbortTx`; priority-B recovery (participant-side autonomous abort) deferred. |
 | ⏳ #8 | `feat(observability): Prometheus textfile exporter + OpenTelemetry traces` | `/metrics` endpoint; per-raft `term`, `commit_index`, `last_applied`, `peer_rtt`, `pending_tx_count`, `snapshot_age_seconds`. |
@@ -339,7 +340,7 @@ P0–P7 deliver a correct Raft + 2PC + LSM stack with deterministic-simulation s
 P8 ships when **all** of these hold on `master`:
 
 1. **Pre-vote prevents term storms** on partition recovery. Integration test `pre_vote_recovery::pre_vote_isolated_follower_does_not_promote_or_disrupt` passes; fuzz harness's term-churn ceiling stays under-budget across 1000+ scenarios.
-2. **Joint consensus** lets us add / remove a node without restarting the cluster; the cluster continues to serve ops during the transition. *(PR #6 implemented: dual-majority `maybe_commit`, leader intercepts `AddNode`/`RemoveNode` and writes `InstallConfiguration` log entry, two-phase Joint→Simple transition. Cold-new-server catch-up is delegated to test harness; see "Out of scope" for production follow-up #6a.)*
+2. **Joint consensus** lets us add / remove a node without restarting the cluster; the cluster continues to serve ops during the transition. *(PR #6 implemented: dual-majority `maybe_commit`, leader intercepts `AddNode`/`RemoveNode` and writes `InstallConfiguration` log entry, two-phase Joint→Simple transition. PR #6a implemented: cold-new-server catch-up via `JoinCluster` RPC so a brand-new server can join without being preconfigured by an operator.)*
 3. **Tx timeout + admin abort** lets an operator force-abort a pending tx after the coordinator crashes.
 4. **Prometheus exporter** is on the standard port; 5 documented metrics are scraped; alerts documented in README.
 5. **3-node cross-process smoke test** under CI exercises the full deploy path (systemd unit → bootstrap script → ops → teardown) and finishes green.
@@ -347,14 +348,6 @@ P8 ships when **all** of these hold on `master`:
 
 ### Out of scope (deferred to P9+)
 
-- **PR #6a — `feat(raft): JoinCluster RPC for cold-new-server catch-up`**.
-  PR #6's `propose_add_node` assumes the new server already
-  knows the leader's address (set via `set_peers` in the test
-  harness). In production a brand-new node has empty peers.
-  Required: new RPC `JoinClusterRequest { leader_addr_hint }`
-  that the new server calls *before* the leader runs
-  `propose_add_node`, so the new server is on the leader's
-  heartbeat path by the time Joint commits.
 - Cross-Raft-group transactions.
 - LSM polish (bloom filters, block cache, background compaction).
 - gRPC transport.
