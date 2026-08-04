@@ -185,6 +185,32 @@ fn fmt_command(cmd: &Command) -> String {
         Command::DecideTx { tx_id, decision } => {
             format!("DecideTx({},{:?})", tx_id, decision)
         }
+        // `AddNode` / `RemoveNode` are user-facing membership commands
+        // (P8 PR 6, Raft thesis §6). The leader replaces them with
+        // `Configuration` log entries before replication, so they
+        // should never appear in a log entry we observe. If we see
+        // one here, something bypassed the membership coordinator.
+        Command::AddNode { server } => {
+            format!("AddNode({},{})", server.node_id, server.addr)
+        }
+        Command::RemoveNode { node_id } => {
+            format!("RemoveNode({})", node_id)
+        }
+        // `InstallConfiguration` is the leader's internal log
+        // entry. If we observe one (which we should), summarize the
+        // kind.
+        Command::InstallConfiguration { config } => match config {
+            crate::protocol::Configuration::Simple(s) => {
+                format!("InstallConfiguration(Simple,{} servers)", s.len())
+            }
+            crate::protocol::Configuration::Joint { old, new } => {
+                format!(
+                    "InstallConfiguration(Joint, old:{} new:{})",
+                    old.len(),
+                    new.len()
+                )
+            }
+        },
     }
 }
 

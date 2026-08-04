@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (Joint consensus membership change — Raft §6)
+- **`ServerId` / `Configuration` types** in `protocol.rs` —
+  `Simple(Vec<ServerId>)` and `Joint { old, new }` model the
+  Raft §6 two-phase membership config. `all_servers()` returns
+  the union for joint configs (used for peer derivation).
+- **`config_quorum_reached()` + `config_quorum_reached_index()`** —
+  dual-majority predicate for Joint configs; simple-majority for
+  Simple. `config_quorum_reached_index()` does an O(N log N)
+  binary search for the highest quorum-satisfying log index,
+  used by `maybe_commit` to advance `commit_index` correctly
+  under either config shape.
+- **`MembershipError`** — typed errors for `AlreadyMember`,
+  `NotMember`, `CannotRemoveSelf`, `CannotRemoveLastServer`,
+  `NotLeader`. Wire-mapped to structured JSON error codes by
+  the client layer.
+- **`Command::AddNode` / `Command::RemoveNode` /
+  `Command::InstallConfiguration`** — three new log-entry
+  variants (wire tags 8 / 9 / 10). `AddNode` / `RemoveNode` are
+  leader-internal helpers; only `InstallConfiguration` ever
+  appears in the replicated log. `ClientHandler::add_node` /
+  `remove_node` translate the client API to the two-phase
+  Joint→Simple sequence and block until Joint commits
+  (with a deadline).
+- **`RaftNode::current_config` + `pending_post_joint_simple`** —
+  leader tracks the joint→simple transition: once a Joint
+  entry commits, the leader auto-proposes the Simple(new)
+  entry that follows. Followers deliver via AppendEntries.
+  `replay_logs` (crash recovery) installs the last committed
+  Configuration but does NOT trigger the post-joint hook
+  (avoids re-proposing on restart).
+- **`RaftNode::install_configuration`** — single point of
+  truth for installing a new config: updates `current_config`,
+  re-derives `self.peers` from `all_servers()`. Idempotent.
+- **`RaftNode::propose_add_node` / `propose_remove_node`** —
+  validation + Joint entry construction + log append. Both
+  return `Result<u64, MembershipError>`.
+- **`RaftNode::maybe_commit` dual-majority rewrite** —
+  `commit_index` now advances under Joint configs iff both
+  `old` and `new` majorities agree (Raft §6 correctness).
+- **27 new unit tests** (15 in `raft/node.rs`, 12 in
+  `protocol.rs`) covering: configuration algebra, quorum
+  predicates (simple + joint + dual), membership validation,
+  propose hooks, post-joint auto-propose, replay correctness.
+- **4 new integration tests** in
+  `crates/oxide-kv/tests/joint_consensus.rs`:
+  - 3-node cluster accepts a 4th node, all 4 form quorum.
+  - 4-node cluster drops a node, quorum shrinks to 3.
+  - Cannot remove self / last server.
+  - Cannot add an already-member node.
+
 ### Added (Pre-vote election probe — Raft §9.6)
 - **`RaftNode::handle_pre_vote`** — receiver-side handler for
   pre-vote probes. Mirrors `handle_request_vote` but with

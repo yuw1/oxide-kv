@@ -7,7 +7,8 @@
 //! the inter-node TCP socket use this protobuf encoding.
 
 use crate::protocol::{
-    Command as DomainCommand, LogEntry as DomainLogEntry, Snapshot as DomainSnapshot,
+    Command as DomainCommand, Configuration as DomainConfiguration, LogEntry as DomainLogEntry,
+    ServerId as DomainServerId, Snapshot as DomainSnapshot,
     TxDecision as DomainTxDecision, TxOp as DomainTxOp,
 };
 use crate::raft::rpc::{
@@ -54,8 +55,87 @@ impl From<&DomainCommand> for pb::Command {
                     commit: matches!(decision, DomainTxDecision::Commit),
                 })
             }
+            // P8 PR 6: client-facing membership commands.
+            // The leader's MembershipCoordinator intercepts these and
+            // replaces them with `InstallConfiguration` log entries
+            // before replication. In normal operation these never
+            // appear on the wire, but the encoding exists so the
+            // type is closed and the proto schema matches the
+            // Rust enum.
+            DomainCommand::AddNode { server } => {
+                pb::command::Body::AddNode(server.into())
+            }
+            DomainCommand::RemoveNode { node_id } => {
+                pb::command::Body::RemoveNode(node_id.clone())
+            }
+            DomainCommand::InstallConfiguration { config } => {
+                pb::command::Body::InstallConfiguration(config.into())
+            }
         };
         pb::Command { body: Some(body) }
+    }
+}
+
+impl From<&DomainServerId> for pb::ServerId {
+    fn from(s: &DomainServerId) -> Self {
+        pb::ServerId {
+            node_id: s.node_id.clone(),
+            addr: s.addr.clone(),
+        }
+    }
+}
+
+impl From<pb::ServerId> for DomainServerId {
+    fn from(s: pb::ServerId) -> Self {
+        DomainServerId {
+            node_id: s.node_id,
+            addr: s.addr,
+        }
+    }
+}
+
+impl From<&DomainConfiguration> for pb::ConfigurationEntry {
+    fn from(c: &DomainConfiguration) -> Self {
+        let (kind, old_servers, new_servers) = match c {
+            DomainConfiguration::Simple(servers) => {
+                (pb::configuration_entry::Kind::Simple, vec![], servers.iter().map(|s| s.into()).collect())
+            }
+            DomainConfiguration::Joint { old, new } => (
+                pb::configuration_entry::Kind::Joint,
+                old.iter().map(|s| s.into()).collect(),
+                new.iter().map(|s| s.into()).collect(),
+            ),
+        };
+        pb::ConfigurationEntry {
+            kind: kind as i32,
+            old_servers,
+            new_servers,
+        }
+    }
+}
+
+impl From<pb::ConfigurationEntry> for DomainConfiguration {
+    fn from(c: pb::ConfigurationEntry) -> Self {
+        // Read `kind` first, then consume the server lists. Reading
+        // `c.kind()` after `into_iter` on the server fields would be
+        // a partial-move error.
+        let kind = c.kind();
+        let old: Vec<DomainServerId> = c.old_servers.into_iter().map(|s| s.into()).collect();
+        let new: Vec<DomainServerId> = c.new_servers.into_iter().map(|s| s.into()).collect();
+        match kind {
+            pb::configuration_entry::Kind::Simple => {
+                // Defensive: a Simple entry with no servers is degenerate
+                // (no quorum possible). Treat as empty Simple so the
+                // cluster can't make progress rather than panicking.
+                DomainConfiguration::Simple(new)
+            }
+            pb::configuration_entry::Kind::Joint => DomainConfiguration::Joint { old, new },
+            pb::configuration_entry::Kind::Unspecified => {
+                // Forward-compat: unknown kind defaults to Simple(new),
+                // same as a Simple entry.
+                DomainConfiguration::Simple(new)
+            }
+        }
     }
 }
 
@@ -222,6 +302,18 @@ impl From<pb::Command> for DomainCommand {
                     DomainTxDecision::Abort
                 };
                 DomainCommand::DecideTx { tx_id: d.tx_id, decision }
+            }
+            // P8 PR 6 inverse. AddNode/RemoveNode on the wire
+            // only happens when a client tries to send one to a
+            // Follower (the leader intercepts AddNode/RemoveNode
+            // before they ever leave the source process in normal
+            // operation). Treat as Compact (no-op) to keep the
+            // cluster safe; the leader returns a "not the leader"
+            // response at the JSON layer.
+            Some(pb::command::Body::AddNode(_)) => DomainCommand::Compact,
+            Some(pb::command::Body::RemoveNode(_)) => DomainCommand::Compact,
+            Some(pb::command::Body::InstallConfiguration(c)) => {
+                DomainCommand::InstallConfiguration { config: c.into() }
             }
             None => DomainCommand::Compact, // No payload → treat as no-op
         }

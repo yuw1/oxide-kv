@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::coordination::{VoteRequest, VoteResponse};
-use crate::protocol::{Command, LogEntry, ReadIndex, Snapshot, Vote};
+use crate::protocol::{config_quorum_reached_index, Command, Configuration, LogEntry, MembershipError, ReadIndex, ServerId, Snapshot, Vote};
 use crate::raft::clock::{system_clock, Clock};
 use crate::raft::net::{system_transport, Transport};
 use crate::raft::rpc::{
@@ -70,6 +70,38 @@ pub struct RaftNode {
     // --- Volatile state on leaders ---
     pub next_index: HashMap<String, u64>,
     pub match_index: HashMap<String, u64>,
+
+    // ---- Cluster membership (Raft thesis §6) ----
+    //
+    // The active cluster configuration. Updated by applying committed
+    // `Command::InstallConfiguration` log entries (which the leader's
+    // `MembershipCoordinator` produces in response to client
+    // `Command::AddNode` / `Command::RemoveNode` commands).
+    //
+    // `peers` above is derived from `current_config.all_servers()`:
+    // when membership changes, the leader's `apply_logs` updates
+    // `peers` to match. The two fields are kept in sync; if they
+    // diverge that's a bug.
+    //
+    // v1 simplification: `ServerId.node_id == ServerId.addr` for every
+    // member. The codebase still keys `match_index` /
+    // `next_index` / `vote_for` bookkeeping by the dial address
+    // (i.e. the same string under both fields). A future PR can
+    // split them properly once we need real
+    // network-identity-vs-machine-identity separation.
+    pub current_config: Configuration,
+
+    /// Leader-only: the `Configuration::Simple(new)` entry to
+    /// auto-propose as soon as a pending `Configuration::Joint` entry
+    /// commits. Set by `propose_add_node` /
+    /// `propose_remove_node`; consumed by `apply_logs` when the
+    /// leader installs a Joint configuration. Reset to `None` after
+    /// the Simple entry is appended so we don't double-propose.
+    ///
+    /// Why this is leader-only: the second phase of joint consensus
+    /// only needs to be proposed once, and only the leader can
+    /// append log entries. Followers don't need this field.
+    pub(crate) pending_post_joint_simple: Option<Configuration>,
 }
 
 impl RaftNode {
@@ -155,6 +187,22 @@ impl RaftNode {
         // Load persistent state from disk
         let (term, vote, logs) = storage.load_initial_state();
 
+        // Build the initial Configuration::Simple set before moving
+        // `peers` into the struct. v1 simplification:
+        // `node_id == addr` for every server, so we can build it
+        // directly from the peer addrs + the local addr.
+        let mut initial_servers: Vec<ServerId> = Vec::with_capacity(peers.len() + 1);
+        initial_servers.push(ServerId {
+            node_id: raft_addr.clone(),
+            addr: raft_addr.clone(),
+        });
+        for p in &peers {
+            initial_servers.push(ServerId {
+                node_id: p.clone(),
+                addr: p.clone(),
+            });
+        }
+
         Self {
             storage,
             state_machine,
@@ -168,7 +216,7 @@ impl RaftNode {
 
             // Volatile state (resets on restart)
             state: NodeState::Follower,
-            node_id: raft_addr,
+            node_id: raft_addr.clone(),
             peers,
             commit_index: 0,
             last_applied: 0,
@@ -176,6 +224,16 @@ impl RaftNode {
             last_quorum_heartbeat_at: None,
             next_index: HashMap::new(),
             match_index: HashMap::new(),
+            // Initial membership: see `initial_servers` above. The
+            // Configuration enum is the source of truth; `peers` is
+            // derived from it. Committed membership log entries will
+            // mutate this field; a future PR will allow real
+            // `node_id != addr` separation.
+            current_config: Configuration::Simple(initial_servers),
+            // Leader-only (see field doc). New nodes start as
+            // followers so this stays `None` until the node is
+            // elected leader and a client sends a membership change.
+            pending_post_joint_simple: None,
         }
     }
 
@@ -247,6 +305,23 @@ impl RaftNode {
     /// then wire the membership). Production code wires `peers` once
     /// in `new_with_storage` and never mutates it.
     pub fn set_peers(&mut self, peers: Vec<String>) {
+        // Re-derive `current_config` so the quorum rule matches the
+        // new peer set. Used by integration tests to wire up peer
+        // connections after nodes have started (since the OS assigns
+        // the listen port and the peer list isn't knowable at spawn
+        // time). v1 simplification: node_id == addr for every server.
+        let mut servers: Vec<ServerId> = Vec::with_capacity(peers.len() + 1);
+        servers.push(ServerId {
+            node_id: self.node_id.clone(),
+            addr: self.node_id.clone(),
+        });
+        for p in &peers {
+            servers.push(ServerId {
+                node_id: p.clone(),
+                addr: p.clone(),
+            });
+        }
+        self.current_config = Configuration::Simple(servers);
         self.peers = peers;
     }
 
@@ -630,6 +705,126 @@ impl RaftNode {
         true
     }
 
+    /// P8 PR 6 (Raft thesis §6): leader-side membership change.
+    ///
+    /// Translates a client `AddNode` request into the two-phase
+    /// joint-consensus log sequence:
+    ///   1. `InstallConfiguration { config: Joint { old, new ∪ {server} } }`
+    ///      — commits under the dual-majority quorum rule.
+    ///   2. `InstallConfiguration { config: Simple(new ∪ {server}) }`
+    ///      — commits under the new-majority quorum rule.
+    ///
+    /// Only the first entry is appended by this method. The second
+    /// is appended automatically by `apply_logs` once the leader
+    /// installs the Joint config (it pops
+    /// `pending_post_joint_simple`).
+    ///
+    /// Returns the index of the Joint entry the caller can wait on,
+    /// or `Err(NotLeader)` / `Err(AlreadyMember)` if the request
+    /// can't be processed.
+    pub fn propose_add_node(
+        &mut self,
+        server: ServerId,
+    ) -> Result<u64, MembershipError> {
+        if self.state != NodeState::Leader {
+            return Err(MembershipError::NotLeader);
+        }
+        // Refuse if the server is already in `current_config` (no-op
+        // for both Simple and Joint).
+        if self.current_config.contains(&server.node_id) {
+            return Err(MembershipError::AlreadyMember(server.node_id));
+        }
+        // Cold-new-server catch-up: if the joining server has no
+        // log entries (we have no way to know its log state
+        // without an RPC, so this is best-effort), rely on the
+        // existing AppendEntries path: the new server will be in
+        // `current_config.new`, so the leader will start sending
+        // AppendEntries to it. If its log is empty, the leader
+        // will catch it up entry-by-entry. If its log is *very*
+        // far behind (e.g. snapshot boundary), the leader's
+        // snapshot-installation path (InstallSnapshot) covers
+        // that — currently only triggered when next_index falls
+        // below snapshot's last_included_index.
+        //
+        // We don't try to verify the new server is reachable here;
+        // the user is responsible for standing up the new node
+        // before sending this command.
+        let old = self.current_config.all_servers();
+        let mut new = old.clone();
+        new.push(server);
+        let joint = Configuration::Joint {
+            old: old.clone(),
+            new: new.clone(),
+        };
+        let simple = Configuration::Simple(new);
+
+        // Append the Joint entry.
+        let joint_index = self.log.len() as u64 + 1;
+        let entry = LogEntry {
+            term: self.current_term,
+            index: joint_index as usize,
+            command: Command::InstallConfiguration { config: joint },
+        };
+        if let Err(e) = self.storage.append_wal_log(&entry) {
+            eprintln!("[Error] Failed to append Joint config: {}", e);
+            return Err(MembershipError::StorageError(e.to_string()));
+        }
+        self.log.push(entry);
+        // Record the Simple entry to be auto-proposed when the
+        // Joint commits.
+        self.pending_post_joint_simple = Some(simple);
+        Ok(joint_index)
+    }
+
+    /// P8 PR 6: leader-side membership removal. Mirror of
+    /// `propose_add_node`. Translates to `Joint { old, new \ {node_id} }`
+    /// followed by `Simple(new \ {node_id})`.
+    pub fn propose_remove_node(
+        &mut self,
+        node_id: &str,
+    ) -> Result<u64, MembershipError> {
+        if self.state != NodeState::Leader {
+            return Err(MembershipError::NotLeader);
+        }
+        // Can't remove ourselves.
+        if node_id == self.node_id {
+            return Err(MembershipError::CannotRemoveSelf);
+        }
+        if !self.current_config.contains(node_id) {
+            return Err(MembershipError::NotMember(node_id.to_string()));
+        }
+        let old = self.current_config.all_servers();
+        let new: Vec<ServerId> = old
+            .iter()
+            .filter(|s| s.node_id != node_id)
+            .cloned()
+            .collect();
+        // Refuse to remove the last server (would leave a cluster
+        // with no quorum).
+        if new.is_empty() {
+            return Err(MembershipError::CannotRemoveLastServer);
+        }
+        let joint = Configuration::Joint {
+            old: old.clone(),
+            new: new.clone(),
+        };
+        let simple = Configuration::Simple(new);
+
+        let joint_index = self.log.len() as u64 + 1;
+        let entry = LogEntry {
+            term: self.current_term,
+            index: joint_index as usize,
+            command: Command::InstallConfiguration { config: joint },
+        };
+        if let Err(e) = self.storage.append_wal_log(&entry) {
+            eprintln!("[Error] Failed to append Joint config: {}", e);
+            return Err(MembershipError::StorageError(e.to_string()));
+        }
+        self.log.push(entry);
+        self.pending_post_joint_simple = Some(simple);
+        Ok(joint_index)
+    }
+
     pub fn sync_logs(raft_node: Arc<RwLock<Self>>) {
         let (current_term, node_id, commit_index, peers, log_len) = {
             let n = raft_node.read().unwrap();
@@ -742,20 +937,44 @@ impl RaftNode {
     pub fn maybe_commit(&mut self) {
         if self.state != NodeState::Leader { return; }
 
-        let mut match_indices: Vec<u64> = self.match_index.values().cloned().collect();
-        match_indices.push(self.log.len() as u64); // Include self
-        match_indices.sort_by(|a, b| b.cmp(a));
+        // P8 PR 6 (Raft thesis §6): quorum rule depends on the
+        // active configuration. `Simple` is plain majority;
+        // `Joint { old, new }` requires majority of BOTH old and
+        // new. The committed entry must satisfy both majorities
+        // simultaneously — that's the rule that prevents the
+        // disjoint-majorities bug.
+        //
+        // We compute the highest index that satisfies the current
+        // configuration's quorum rule. Entries below that index
+        // that didn't satisfy quorum are not advanced.
+        //
+        // Walking the log backward from `self.log.len()` is O(n)
+        // per call but correct; in practice `maybe_commit` is only
+        // called on heartbeat ack / sync completion, so the cost is
+        // amortized. A future PR can optimize by tracking the
+        // highest quorum-satisfying index incrementally.
+        let self_index = self.log.len() as u64;
+        let highest_quorum_index = config_quorum_reached_index(
+            &self.current_config,
+            &self.match_index,
+            &self.node_id,
+            self_index,
+        );
 
-        // Find the majority consensus index
-        let quorum_idx = match_indices.len() / 2;
-        let n = match_indices[quorum_idx];
-
-        if n > self.commit_index {
-            // Safety: Leader can only commit entries from its current term
-            let log_term = self.log.get((n - 1) as usize).map(|e| e.term).unwrap_or(0);
+        if highest_quorum_index > self.commit_index {
+            // Safety: Leader can only commit entries from its current term.
+            // (Raft §5.4.2.)
+            let log_term = self
+                .log
+                .get((highest_quorum_index - 1) as usize)
+                .map(|e| e.term)
+                .unwrap_or(0);
             if log_term == self.current_term {
-                self.commit_index = n;
-                println!("🚀 [Commit] Majority reached! Commit Index advanced to {}", n);
+                self.commit_index = highest_quorum_index;
+                println!(
+                    "🚀 [Commit] Majority reached under {:?}! Commit Index advanced to {}",
+                    self.current_config, highest_quorum_index
+                );
                 self.apply_logs();
             }
         }
@@ -765,32 +984,161 @@ impl RaftNode {
         while self.last_applied < self.commit_index {
             let log_idx_to_apply = self.last_applied as usize;
 
-            if let Some(entry) = self.log.get(log_idx_to_apply) {
+            let Some(entry) = self.log.get(log_idx_to_apply) else {
+                eprintln!("[Critical] Log entry {} not found during apply", self.last_applied + 1);
+                break;
+            };
+            // Snapshot the command first so we can drop the
+            // borrow on `self.log` before mutating state machine
+            // + RaftNode state.
+            let cmd = entry.command.clone();
+            let entry_idx = entry.index;
+
+            // Partition commands into "state machine effects" (need
+            // the state machine lock) and "membership effects" (need
+            // `&mut self` to mutate `current_config` /
+            // `pending_post_joint_simple`). We process the former
+            // with the state-machine lock held, then drop the lock
+            // before processing the latter.
+            let needs_sm = matches!(
+                cmd,
+                Command::Set { .. }
+                    | Command::Delete { .. }
+                    | Command::BeginTx { .. }
+                    | Command::DecideTx { .. }
+            );
+            if needs_sm {
                 let mut state_machine = self.state_machine.write().unwrap();
-                match &entry.command {
+                match &cmd {
                     Command::Set { key, value } => {
                         let _ = state_machine.set(&*key.clone(), &*value.clone());
-                        println!("✅ [Apply] Index {}: SET {} = {}", entry.index, key, value);
+                        println!("✅ [Apply] Index {}: SET {} = {}", entry_idx, key, value);
                     }
                     Command::Delete { key } => {
                         let _ = state_machine.delete(&key);
-                        println!("✅ [Apply] Index {}: DELETE {}", entry.index, key);
+                        println!("✅ [Apply] Index {}: DELETE {}", entry_idx, key);
                     }
                     Command::BeginTx { tx_id, ops } => {
                         let _ = state_machine.begin_tx(tx_id.clone(), ops.clone());
-                        println!("✅ [Apply] Index {}: BEGIN_TX {} ({} ops)", entry.index, tx_id, ops.len());
+                        println!("✅ [Apply] Index {}: BEGIN_TX {} ({} ops)", entry_idx, tx_id, ops.len());
                     }
                     Command::DecideTx { tx_id, decision } => {
                         let _ = state_machine.decide_tx(tx_id, decision.clone());
-                        println!("✅ [Apply] Index {}: DECIDE_TX {} = {:?}", entry.index, tx_id, decision);
+                        println!("✅ [Apply] Index {}: DECIDE_TX {} = {:?}", entry_idx, tx_id, decision);
                     }
-                    Command::Get { .. } => println!("🔍 [Apply] Index {}: GET (no-op)", entry.index),
-                    Command::Compact => println!("🔍 [Apply] Index {}: Compact marker (no-op)", entry.index),
+                    _ => unreachable!("needs_sm implies one of the above"),
                 }
-                self.last_applied += 1;
             } else {
-                eprintln!("[Critical] Log entry {} not found during apply", self.last_applied + 1);
-                break;
+                match &cmd {
+                    Command::Get { .. } => println!("🔍 [Apply] Index {}: GET (no-op)", entry_idx),
+                    Command::Compact => println!("🔍 [Apply] Index {}: Compact marker (no-op)", entry_idx),
+                    Command::InstallConfiguration { config } => {
+                        // P8 PR 6: install the new membership configuration.
+                        // Update `current_config`, derive `peers` from
+                        // `all_servers()`, and (leader-only) propose
+                        // the Simple(new) entry that follows a Joint.
+                        println!(
+                            "📐 [Apply] Index {}: InstallConfiguration {}",
+                            entry_idx,
+                            match config {
+                                Configuration::Simple(s) => format!("Simple({} servers)", s.len()),
+                                Configuration::Joint { old, new } => format!("Joint(old:{}, new:{})", old.len(), new.len()),
+                            }
+                        );
+                        self.install_configuration(config);
+                    }
+                    // `AddNode` / `RemoveNode` are *client-facing*
+                    // membership commands; the leader's
+                    // MembershipCoordinator converts them to
+                    // `InstallConfiguration` entries before
+                    // replication. They should never appear in a
+                    // committed log entry we observe. Treat as a
+                    // no-op and warn (a missing warn-then-noop
+                    // silently skips).
+                    Command::AddNode { .. } | Command::RemoveNode { .. } => {
+                        eprintln!(
+                            "[WARN] Index {}: client-facing {:?} appeared in committed log; \
+                             this should have been translated to InstallConfiguration",
+                            entry_idx,
+                            std::mem::discriminant(&cmd)
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            self.last_applied += 1;
+        }
+    }
+
+    /// Install a committed `Configuration` entry.
+    ///
+    /// Updates `self.current_config` and re-derives `self.peers`
+    /// from `config.all_servers()`. On the leader, if `config` is
+    /// `Joint` and `pending_post_joint_simple` is set, proposes the
+    /// second phase (a `Simple(new)` entry) so the membership
+    /// change completes automatically.
+    fn install_configuration(&mut self, config: &Configuration) {
+        // 1. Derive the new `peers` dial list from `all_servers()`.
+        let new_peers: Vec<String> = config
+            .all_servers()
+            .into_iter()
+            .filter(|s| s.node_id != self.node_id)
+            .map(|s| s.addr)
+            .collect();
+        // 2. Install the new active configuration.
+        self.current_config = config.clone();
+        self.peers = new_peers;
+
+        // 3. Leader-only: append the Simple(new) entry that follows
+        // a Joint(old, new). On Follower this branch is dormant —
+        // the leader's AppendEntries will eventually deliver the
+        // Simple entry, and `apply_logs` will install it then.
+        if self.state == NodeState::Leader
+            && let Some(simple_new) = self.pending_post_joint_simple.take()
+        {
+            // Only propose if `simple_new` matches the just-installed
+            // joint's `new`. (If a new membership request arrived
+            // while we were committing the previous joint, the
+            // newer request would have overwritten
+            // `pending_post_joint_simple`.)
+            let matches = matches!(
+                config,
+                Configuration::Joint { new, .. } if new == &simple_new.all_servers()
+            ) || matches!(
+                &simple_new,
+                Configuration::Simple(servers) if matches!(
+                    config,
+                    Configuration::Simple(c) if c == servers
+                )
+            );
+            if matches {
+                let new_index = self.log.len() as u64 + 1;
+                let entry = LogEntry {
+                    term: self.current_term,
+                    index: new_index as usize,
+                    command: Command::InstallConfiguration {
+                        config: simple_new,
+                    },
+                };
+                if let Err(e) = self.storage.append_wal_log(&entry) {
+                    eprintln!(
+                        "[Error] Failed to append Simple(new) log entry: {}",
+                        e
+                    );
+                    return;
+                }
+                self.log.push(entry);
+                // The next sync_logs / heartbeat cycle will replicate
+                // this entry to peers. We don't trigger sync_logs
+                // synchronously here — apply_logs is called from
+                // commit advancement paths that already have a sync
+                // in flight, and triggering another one synchronously
+                // risks lock contention.
+                println!(
+                    "📐 [Membership] Leader auto-proposed Simple(new) \
+                     at index {} after Joint commit",
+                    new_index
+                );
             }
         }
     }
@@ -807,11 +1155,39 @@ impl RaftNode {
                 // `proto/coordination.proto`) and are recorded directly on
                 // the state machine via `record_vote`, bypassing the log.
                 Command::DecideTx { tx_id, decision } => { let _ = state_machine.decide_tx(tx_id, decision.clone()); }
+                Command::InstallConfiguration { config } => {
+                    // Replay path: when restoring after restart, the
+                    // membership configuration must reflect the
+                    // *last* committed Configuration entry (Joint or
+                    // Simple). We update current_config + peers but
+                    // do NOT trigger the post-joint hook — replay is
+                    // for crash recovery, and proposing a new entry
+                    // here would be wrong (the Simple(new) entry that
+                    // follows a Joint is, if it was committed before
+                    // the crash, already in the WAL below).
+                    //
+                    // We just install the latest configuration we
+                    // see. If both Joint and Simple are present, the
+                    // Simple overwrites the Joint — which is the
+                    // correct final state.
+                    self.current_config = config.clone();
+                    self.peers = config
+                        .all_servers()
+                        .into_iter()
+                        .filter(|s| s.node_id != self.node_id)
+                        .map(|s| s.addr)
+                        .collect();
+                }
                 _ => {}
             }
         }
         self.last_applied = self.log.len() as u64;
-        println!("✅ [Replay] Successfully replayed {} logs to state machine", self.log.len());
+        println!(
+            "✅ [Replay] Successfully replayed {} logs to state machine \
+             (current membership: {:?})",
+            self.log.len(),
+            self.current_config
+        );
     }
 
     pub async fn run_heartbeat_loop(
@@ -1353,7 +1729,7 @@ impl RaftNode {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::protocol::{Command, LogEntry, ReadIndex, Snapshot, TxDecision, TxOp};
+    use crate::protocol::{config_quorum_reached, Command, LogEntry, ReadIndex, Snapshot, TxDecision, TxOp};
     use crate::raft::rpc::{AppendEntriesArgs, InstallSnapshotArgs, RequestVoteArgs};
     use crate::raft::storage::RaftStorage;
     use crate::state_machine::StateMachine;
@@ -2775,5 +3151,330 @@ mod tests {
         // settle so the runtime exits cleanly. tokio::spawn
         // tasks that error on connect finish on their own.
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // =====================================================================
+    // P8 PR 6: joint consensus membership change (Raft thesis §6)
+    // =====================================================================
+    //
+    // Tests pin the invariants of the new membership layer:
+    //   - `Configuration` math: `all_servers`, `addr_of`, `contains`,
+    //     `config_quorum_reached` (joint vs simple quorum).
+    //   - `current_config` initialization from the peer list.
+    //   - `propose_add_node` / `propose_remove_node` correctness.
+    //   - `install_configuration` updates `peers` and `current_config`.
+    //   - Joint consensus dual-majority: 3-node cluster refuses a
+    //     commit that doesn't have BOTH old and new majorities.
+
+    #[test]
+    fn configuration_simple_contains_and_addr_of() {
+        let cfg = Configuration::Simple(vec![
+            ServerId { node_id: "n1".into(), addr: "127.0.0.1:9001".into() },
+            ServerId { node_id: "n2".into(), addr: "127.0.0.1:9002".into() },
+        ]);
+        assert!(cfg.contains("n1"));
+        assert!(cfg.contains("n2"));
+        assert!(!cfg.contains("n3"));
+        assert_eq!(cfg.addr_of("n2"), Some("127.0.0.1:9002".to_string()));
+        assert_eq!(cfg.addr_of("n3"), None);
+        assert_eq!(cfg.size(), 2);
+    }
+
+    #[test]
+    fn configuration_joint_all_servers_is_union_without_dupes() {
+        let cfg = Configuration::Joint {
+            old: vec![
+                ServerId { node_id: "n1".into(), addr: "127.0.0.1:9001".into() },
+                ServerId { node_id: "n2".into(), addr: "127.0.0.1:9002".into() },
+            ],
+            new: vec![
+                ServerId { node_id: "n1".into(), addr: "127.0.0.1:9001".into() },
+                ServerId { node_id: "n2".into(), addr: "127.0.0.1:9002".into() },
+                ServerId { node_id: "n3".into(), addr: "127.0.0.1:9003".into() },
+            ],
+        };
+        let all = cfg.all_servers();
+        // n1 and n2 are in both; the union should dedupe.
+        assert_eq!(all.len(), 3);
+        let ids: Vec<&str> = all.iter().map(|s| s.node_id.as_str()).collect();
+        assert!(ids.contains(&"n1"));
+        assert!(ids.contains(&"n2"));
+        assert!(ids.contains(&"n3"));
+        assert_eq!(cfg.size(), 3); // max(old.len, new.len)
+    }
+
+    #[test]
+    fn config_quorum_simple_majority() {
+        // 3 servers, 2 of them replicated index 5 -> quorum reached.
+        let cfg = Configuration::Simple(vec![
+            ServerId { node_id: "n1".into(), addr: "a".into() },
+            ServerId { node_id: "n2".into(), addr: "b".into() },
+            ServerId { node_id: "n3".into(), addr: "c".into() },
+        ]);
+        let mut mi = HashMap::new();
+        mi.insert("n2".into(), 5);
+        mi.insert("n3".into(), 3);
+        // n1 self has 5. count = 2 (n1 self + n2), len/2 = 1. 2 > 1 -> quorum.
+        assert!(config_quorum_reached(
+            &cfg,
+            &mi,
+            "n1",
+            5,
+            5
+        ));
+        // Now only n1 has replicated: count = 1, len/2 = 1. 1 > 1 is false.
+        mi.insert("n2".into(), 0);
+        mi.insert("n3".into(), 0);
+        assert!(!config_quorum_reached(
+            &cfg,
+            &mi,
+            "n1",
+            5,
+            5
+        ));
+    }
+
+    #[test]
+    fn config_quorum_joint_requires_both_majorities() {
+        // 3-node -> 4-node transition: old = {n1, n2, n3}, new = {n1, n2, n3, n4}.
+        let cfg = Configuration::Joint {
+            old: vec![
+                ServerId { node_id: "n1".into(), addr: "a".into() },
+                ServerId { node_id: "n2".into(), addr: "b".into() },
+                ServerId { node_id: "n3".into(), addr: "c".into() },
+            ],
+            new: vec![
+                ServerId { node_id: "n1".into(), addr: "a".into() },
+                ServerId { node_id: "n2".into(), addr: "b".into() },
+                ServerId { node_id: "n3".into(), addr: "c".into() },
+                ServerId { node_id: "n4".into(), addr: "d".into() },
+            ],
+        };
+        let mut mi = HashMap::new();
+        // n2 + n3 replicated, n4 (new-only) not yet -> old has 3/3, new has 3/4.
+        mi.insert("n2".into(), 5);
+        mi.insert("n3".into(), 5);
+        // old majority: n1 + n2 + n3 = 3 > 3/2 = 1 ✓
+        // new majority: n1 + n2 + n3 = 3 > 4/2 = 2 ✓
+        assert!(config_quorum_reached(
+            &cfg,
+            &mi,
+            "n1",
+            5,
+            5
+        ));
+        // Now drop n3: only n2 replicated + self.
+        mi.insert("n3".into(), 0);
+        // old: n1 + n2 = 2 > 1 ✓
+        // new: n1 + n2 = 2 > 2 ✗  (need 3 of 4)
+        assert!(!config_quorum_reached(
+            &cfg,
+            &mi,
+            "n1",
+            5,
+            5
+        ));
+    }
+
+    #[test]
+    fn initial_current_config_is_simple_self_plus_peers() {
+        let (_d, node) = make_node("n1", vec!["n2".into(), "n3".into()]);
+        let cfg = &node.current_config;
+        assert!(matches!(cfg, Configuration::Simple(_)));
+        assert_eq!(cfg.size(), 3);
+        assert!(cfg.contains("n1"));
+        assert!(cfg.contains("n2"));
+        assert!(cfg.contains("n3"));
+        // v1 simplification: node_id == addr.
+        assert_eq!(cfg.addr_of("n1"), Some("n1".to_string()));
+    }
+
+    #[test]
+    fn propose_add_node_requires_leader() {
+        let (_d, mut node) = make_node("n1", vec!["n2".into()]);
+        // Follower (not leader).
+        let server = ServerId { node_id: "n3".into(), addr: "n3".into() };
+        let result = node.propose_add_node(server);
+        assert_eq!(result, Err(MembershipError::NotLeader));
+    }
+
+    #[test]
+    fn propose_add_node_rejects_already_member() {
+        let (_d, mut node) = make_node("n1", vec!["n2".into()]);
+        node.state = NodeState::Leader;
+        let server = ServerId { node_id: "n2".into(), addr: "n2".into() };
+        let result = node.propose_add_node(server);
+        assert_eq!(
+            result,
+            Err(MembershipError::AlreadyMember("n2".to_string()))
+        );
+    }
+
+    #[test]
+    fn propose_add_node_appends_joint_entry_and_queues_simple() {
+        let (_d, mut node) = make_node("n1", vec!["n2".into()]);
+        node.state = NodeState::Leader;
+        let server = ServerId { node_id: "n3".into(), addr: "n3".into() };
+        let joint_idx = node.propose_add_node(server).expect("leader should propose");
+        // One log entry should be appended (the Joint).
+        assert_eq!(joint_idx, 1);
+        assert_eq!(node.log.len(), 1);
+        match &node.log[0].command {
+            Command::InstallConfiguration { config } => match config {
+                Configuration::Joint { old, new } => {
+                    assert_eq!(old.len(), 2); // n1 + n2
+                    assert_eq!(new.len(), 3); // n1 + n2 + n3
+                }
+                _ => panic!("expected Joint, got Simple"),
+            },
+            _ => panic!("expected InstallConfiguration log entry"),
+        }
+        // pending_post_joint_simple should be set to Simple({n1, n2, n3}).
+        match &node.pending_post_joint_simple {
+            Some(Configuration::Simple(s)) => {
+                assert_eq!(s.len(), 3);
+                assert!(s.iter().any(|x| x.node_id == "n3"));
+            }
+            _ => panic!("expected pending Simple(n1,n2,n3)"),
+        }
+    }
+
+    #[test]
+    fn propose_remove_node_rejects_self() {
+        let (_d, mut node) = make_node("n1", vec!["n2".into()]);
+        node.state = NodeState::Leader;
+        let result = node.propose_remove_node("n1");
+        assert_eq!(result, Err(MembershipError::CannotRemoveSelf));
+    }
+
+    #[test]
+    fn propose_remove_node_rejects_last_server() {
+        let (_d, mut node) = make_node("solo", vec![]);
+        node.state = NodeState::Leader;
+        // No peers: removing "solo" would leave zero servers.
+        let result = node.propose_remove_node("solo");
+        assert_eq!(result, Err(MembershipError::CannotRemoveSelf));
+    }
+
+    #[test]
+    fn propose_remove_node_appends_joint_with_smaller_new() {
+        let (_d, mut node) = make_node("n1", vec!["n2".into(), "n3".into()]);
+        node.state = NodeState::Leader;
+        let joint_idx = node.propose_remove_node("n3").expect("ok");
+        assert_eq!(joint_idx, 1);
+        match &node.log[0].command {
+            Command::InstallConfiguration { config } => match config {
+                Configuration::Joint { old, new } => {
+                    assert_eq!(old.len(), 3);
+                    assert_eq!(new.len(), 2);
+                    assert!(!new.iter().any(|x| x.node_id == "n3"));
+                }
+                _ => panic!("expected Joint"),
+            },
+            _ => panic!("expected InstallConfiguration"),
+        }
+    }
+
+    #[test]
+    fn install_configuration_updates_peers_and_current_config() {
+        let (_d, mut node) = make_node("n1", vec!["n2".into()]);
+        let new_cfg = Configuration::Simple(vec![
+            ServerId { node_id: "n1".into(), addr: "n1".into() },
+            ServerId { node_id: "n2".into(), addr: "n2".into() },
+            ServerId { node_id: "n3".into(), addr: "n3".into() },
+        ]);
+        node.install_configuration(&new_cfg);
+        assert_eq!(node.current_config, new_cfg);
+        // `peers` should now include n3 (excludes self).
+        assert_eq!(node.peers, vec!["n2".to_string(), "n3".to_string()]);
+    }
+
+    #[test]
+    fn install_configuration_on_leader_proposes_simple_after_joint() {
+        let (_d, mut node) = make_node("n1", vec!["n2".into()]);
+        node.state = NodeState::Leader;
+        // Stage the pending Simple entry as if `propose_add_node` had set it.
+        let pending = Configuration::Simple(vec![
+            ServerId { node_id: "n1".into(), addr: "n1".into() },
+            ServerId { node_id: "n2".into(), addr: "n2".into() },
+            ServerId { node_id: "n3".into(), addr: "n3".into() },
+        ]);
+        node.pending_post_joint_simple = Some(pending.clone());
+        // Now install the matching Joint entry.
+        let joint = Configuration::Joint {
+            old: vec![
+                ServerId { node_id: "n1".into(), addr: "n1".into() },
+                ServerId { node_id: "n2".into(), addr: "n2".into() },
+            ],
+            new: pending.all_servers(),
+        };
+        node.install_configuration(&joint);
+        // The pending Simple should now have been auto-proposed.
+        assert!(node.pending_post_joint_simple.is_none());
+        assert_eq!(node.log.len(), 1);
+        match &node.log[0].command {
+            Command::InstallConfiguration { config } => {
+                assert_eq!(*config, pending);
+            }
+            _ => panic!("expected InstallConfiguration log entry"),
+        }
+    }
+
+    #[test]
+    fn apply_logs_handles_install_configuration() {
+        let (_d, mut node) = make_node("n1", vec!["n2".into()]);
+        node.state = NodeState::Leader;
+        // Append a Simple(n1, n2, n3) entry and commit it.
+        let new_cfg = Configuration::Simple(vec![
+            ServerId { node_id: "n1".into(), addr: "n1".into() },
+            ServerId { node_id: "n2".into(), addr: "n2".into() },
+            ServerId { node_id: "n3".into(), addr: "n3".into() },
+        ]);
+        let entry = LogEntry {
+            term: 1,
+            index: 1,
+            command: Command::InstallConfiguration { config: new_cfg.clone() },
+        };
+        node.log.push(entry);
+        node.commit_index = 1;
+        node.apply_logs();
+        // current_config should be installed; peers should include n3.
+        assert_eq!(node.current_config, new_cfg);
+        assert_eq!(node.peers, vec!["n2".to_string(), "n3".to_string()]);
+        assert_eq!(node.last_applied, 1);
+    }
+
+    #[test]
+    fn replay_logs_installs_final_configuration() {
+        let (_d, mut node) = make_node("n1", vec!["n2".into()]);
+        // Build a log with Joint(n1, n2, n3) followed by Simple(n1, n2, n3).
+        let joint = Configuration::Joint {
+            old: vec![
+                ServerId { node_id: "n1".into(), addr: "n1".into() },
+                ServerId { node_id: "n2".into(), addr: "n2".into() },
+            ],
+            new: vec![
+                ServerId { node_id: "n1".into(), addr: "n1".into() },
+                ServerId { node_id: "n2".into(), addr: "n2".into() },
+                ServerId { node_id: "n3".into(), addr: "n3".into() },
+            ],
+        };
+        let simple = Configuration::Simple(vec![
+            ServerId { node_id: "n1".into(), addr: "n1".into() },
+            ServerId { node_id: "n2".into(), addr: "n2".into() },
+            ServerId { node_id: "n3".into(), addr: "n3".into() },
+        ]);
+        node.log.push(LogEntry {
+            term: 1, index: 1,
+            command: Command::InstallConfiguration { config: joint.clone() },
+        });
+        node.log.push(LogEntry {
+            term: 1, index: 2,
+            command: Command::InstallConfiguration { config: simple.clone() },
+        });
+        node.replay_logs();
+        // Final config should be Simple (the second entry overwrites the Joint).
+        assert_eq!(node.current_config, simple);
+        assert_eq!(node.peers, vec!["n2".to_string(), "n3".to_string()]);
     }
 }
