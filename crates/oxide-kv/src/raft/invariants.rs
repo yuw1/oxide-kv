@@ -211,6 +211,12 @@ fn fmt_command(cmd: &Command) -> String {
                 )
             }
         },
+        // P8 PR 7: admin-driven abort. Like AddNode/RemoveNode, this
+        // is a client-facing command that the leader intercepts and
+        // translates into a `DecideTx(Abort)` log entry before
+        // replication. Seeing one here means something bypassed the
+        // translation; render tersely.
+        Command::AbortTx { tx_id } => format!("AbortTx({})", tx_id),
     }
 }
 

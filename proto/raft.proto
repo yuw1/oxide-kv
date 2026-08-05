@@ -45,6 +45,14 @@ message Command {
     ServerId add_node = 8;          // AddNode { server }
     string remove_node = 9;         // RemoveNode { node_id }
     ConfigurationEntry install_configuration = 10; // InstallConfiguration
+    // P8 PR 7: admin RPC. Client-facing force-abort for a stuck
+    // 2PC transaction by tx_id. The leader intercepts this in
+    // `RaftNode::propose_abort_tx` and translates it into a
+    // `DecideTx{decision: Abort}` log entry (the same kind a
+    // timeout sweep would emit). Followers reject AbortTx at the
+    // JSON layer. Wire tag 11 is the next free slot after
+    // InstallConfiguration.
+    string abort_tx = 11;            // AbortTx { tx_id }
   }
 }
 

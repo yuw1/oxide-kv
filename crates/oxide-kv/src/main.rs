@@ -5,6 +5,7 @@ use oxide_kv::client::ClientHandler;
 use oxide_kv::config::Config;
 use oxide_kv::state_machine::{StateMachine, StateMachineConfig};
 use oxide_kv::raft::node::{NodeState, RaftNode};
+use oxide_kv::raft::coordinator;
 use oxide_kv::raft::net::{StopSignal, TcpTransport, Transport};
 use oxide_kv::raft::timer::run_election_timer;
 
@@ -105,6 +106,18 @@ async fn main() -> anyhow::Result<()> {
     let heartbeat_stop = raft_stop.clone();
     tokio::spawn(async move {
         RaftNode::run_heartbeat_loop(heartbeat_node, heartbeat_stop).await;
+    });
+
+    // 8b. Start Tx Timeout Sweep Loop (P8 PR 7)
+    // Periodically scans `pending_txs` on the leader and
+    // force-aborts transactions older than `OXIDE_TX_TIMEOUT_MS`.
+    // Closes the coordinator-crash hole: a leader that dies mid-2PC
+    // leaves a BeginTx entry in every follower's `pending_txs`
+    // table forever; this loop is the new leader's recovery path.
+    let sweep_node = raft_node.clone();
+    let sweep_stop = raft_stop.clone();
+    tokio::spawn(async move {
+        coordinator::run_tx_timeout_loop(sweep_node, sweep_stop).await;
     });
 
     // 9. Graceful shutdown handling
