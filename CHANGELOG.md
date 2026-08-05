@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (P8 PR 8: Prometheus exporter + OpenTelemetry no-op)
+- **`/metrics` HTTP endpoint** (P8 PR 8). Each node serves a
+  standard Prometheus text-format exposition on
+  `OXIDE_METRICS_PORT` / `--metrics-addr` (default `127.0.0.1:9100`).
+  Hand-rolled minimal HTTP/1.1 reader — no extra dependency
+  beyond `prometheus` (which is already transitively in our
+  graph via `tokio`). Set `--metrics-addr disabled` to skip the
+  server (used by tests that don't want a port).
+- **13 pre-registered metrics**:
+  - `oxide_raft_term` (gauge)
+  - `oxide_raft_commit_index` (gauge)
+  - `oxide_raft_last_applied` (gauge)
+  - `oxide_raft_log_length` (gauge)
+  - `oxide_raft_role` (gauge; 0=Follower, 1=Candidate, 2=Leader,
+    3=PreCandidate)
+  - `oxide_raft_snapshot_age_seconds` (gauge; -1 if no
+    snapshot yet)
+  - `oxide_raft_snapshot_bytes` (gauge; -1 if no snapshot yet)
+  - `oxide_peer_match_index{peer=...}` (gauge vector)
+  - `oxide_peer_next_index{peer=...}` (gauge vector)
+  - `oxide_tx_pending_count` (gauge)
+  - `oxide_tx_timeout_aborted_total` (counter)
+  - `oxide_tx_admin_aborted_total` (counter)
+  - Plus a `/health` endpoint that returns 200 + "ok" for cheap
+    liveness probes.
+- **Raft core hooks** — `RaftNode::set_metrics` + `refresh_metrics`
+  fire from every transition (`become_leader`,
+  `become_candidate` / `become_pre_candidate`, `apply_logs`,
+  `propose`, `propose_batch`, `propose_abort_tx`, the
+  AppendEntries reply handler, `maybe_snapshot`,
+  `install_snapshot`). 2PC-related counters are bumped in
+  `raft::coordinator::run_tx_timeout_loop` (sweep aborts) and
+  `client::ClientHandler::abort_tx` (admin aborts). `apply_mutation`
+  refreshes `tx_pending_count` after every client command so the
+  gauge tracks the in-memory map size.
+- **OpenTelemetry no-op** — `tracing::span!` events now wrap the
+  election-timeout / heartbeat / append-entries paths so a future
+  OTel exporter can layer on without code changes. This PR ships
+  the no-op scaffolding only; the actual OTel exporter
+  configuration is deferred to ops-time (the `opentelemetry`
+  crate is **not** yet pulled in — `tracing` is the recommended
+  Rust idiom and avoids forcing every operator to pay for an
+  OTel collector they don't run).
+- **Tests** — 13 new lib unit tests (5 in `observability::registry`
+  + 5 in `observability::server` + 3 in `observability::tracer`)
+  + 4 new integration tests in `tests/metrics_endpoint.rs`
+  (200 OK on `/metrics`, 200 OK on `/health`, 404 on
+  `/not-metrics`, 404 on `POST /metrics`). Total:
+  **255 → 268 lib tests, +4 integration tests.**
+
 ### Added (P8 PR 7: tx timeout + admin-driven abort)
 - **Coordinator-side timeout sweep** — `raft::coordinator::run_tx_timeout_loop`
   spawned in `main.rs`. Periodically scans `pending_txs` on the

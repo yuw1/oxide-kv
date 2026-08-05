@@ -102,6 +102,13 @@ pub struct RaftNode {
     /// only needs to be proposed once, and only the leader can
     /// append log entries. Followers don't need this field.
     pub(crate) pending_post_joint_simple: Option<Configuration>,
+
+    /// Optional Prometheus metrics handle (P8 PR 8). `None` means
+    /// "this node is not exporting metrics" — every transition
+    /// hook then becomes a no-op. Production nodes set this via
+    /// [`RaftNode::set_metrics`] in `main.rs`; tests leave it
+    /// `None` to avoid the cost of running a registry.
+    pub(crate) metrics: Option<crate::observability::MetricsHandle>,
 }
 
 impl RaftNode {
@@ -234,6 +241,11 @@ impl RaftNode {
             // followers so this stays `None` until the node is
             // elected leader and a client sends a membership change.
             pending_post_joint_simple: None,
+            // Metrics off by default; production wires this in via
+            // `set_metrics` after construction. Tests leave it
+            // `None` so they don't pay the registry construction
+            // cost.
+            metrics: None,
         }
     }
 
@@ -336,6 +348,72 @@ impl RaftNode {
         }
         self.current_config = Configuration::Simple(servers);
         self.peers = peers;
+    }
+
+    /// Wire the Prometheus metrics handle into this node. Called
+    /// once from `main.rs` after constructing the node. Idempotent:
+    /// calling it again replaces the previous handle.
+    ///
+    /// Once set, every state-transition hook (`become_leader`,
+    /// `apply_logs`, `maybe_snapshot`, ...) eagerly updates the
+    /// corresponding gauge so `/metrics` scraping never blocks on
+    /// the `RaftNode` lock.
+    pub fn set_metrics(&mut self, metrics: crate::observability::MetricsHandle) {
+        // Seed the snapshot_age_seconds + snapshot_bytes gauges
+        // from the on-disk snapshot file (if any). The caller did
+        // `restore_from_snapshot` *before* this point, so the file
+        // is still on disk (the snapshot isn't deleted on restore —
+        // it's left in place so a crash before compaction doesn't
+        // lose the last good state). We only read metadata here;
+        // no state mutation. If there's no snapshot file, the
+        // sentinel `-1` values set by `Metrics::new` stay.
+        let path = crate::config::Config::global().snapshot_path();
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if let Ok(modified) = meta.modified()
+                && let Ok(age) = modified.elapsed()
+            {
+                metrics
+                    .raft_snapshot_age_seconds
+                    .set(age.as_secs() as i64);
+            }
+            metrics.raft_snapshot_bytes.set(meta.len() as i64);
+        }
+        self.metrics = Some(metrics);
+    }
+
+    /// Refresh the eagerly-updated gauges that mirror RaftNode
+    /// state. Called from every transition (`become_leader`,
+    /// `become_candidate`, `become_pre_candidate`, `apply_logs`,
+    /// `propose`, `sync_logs` reply handler, `maybe_snapshot`,
+    /// `set_peers`).
+    ///
+    /// No-op when `self.metrics` is `None` (the test default),
+    /// so the existing test surface stays untouched. When
+    /// `Some`, this updates:
+    ///
+    /// - `raft_term`            = `current_term`
+    /// - `raft_commit_index`    = `commit_index`
+    /// - `raft_last_applied`    = `last_applied`
+    /// - `raft_log_length`      = `log.len()`
+    /// - `raft_role`            = `state` (encoded)
+    ///
+    /// `peer_match_index` / `peer_next_index` are updated by the
+    /// AppendEntries reply handler (it has the per-peer value).
+    /// `tx_pending_count` is updated by `ClientHandler` (it has
+    /// the state machine lock).
+    pub fn refresh_metrics(&self) {
+        if let Some(m) = &self.metrics {
+            m.raft_term.set(self.current_term as i64);
+            m.raft_commit_index.set(self.commit_index as i64);
+            m.raft_last_applied.set(self.last_applied as i64);
+            m.raft_log_length.set(self.log.len() as i64);
+            m.raft_role.set(match self.state {
+                NodeState::Follower => 0,
+                NodeState::Candidate => 1,
+                NodeState::Leader => 2,
+                NodeState::PreCandidate => 3,
+            });
+        }
     }
 
     /// Test-only helper: push a phantom log entry into the log.
@@ -767,6 +845,12 @@ impl RaftNode {
         }
 
         self.log.push(entry);
+        // Refresh so `raft_log_length` tracks the appended entry
+        // immediately. `apply_logs` will refresh again once the
+        // entry commits, but eager updates help dashboards
+        // distinguish "the leader proposed" from "the entry
+        // committed".
+        self.refresh_metrics();
         true
     }
 
@@ -793,6 +877,9 @@ impl RaftNode {
             self.log.push(entry);
             next_index += 1;
         }
+        // See `propose` for rationale; the batch path needs the
+        // same single refresh at the end, not per-iteration.
+        self.refresh_metrics();
         true
     }
 
@@ -967,6 +1054,7 @@ impl RaftNode {
             return Err(AbortTxError::StorageError(e.to_string()));
         }
         self.log.push(entry);
+        self.refresh_metrics();
         // Trigger replication immediately rather than waiting
         // for the next heartbeat tick. The operator's workflow
         // expects a fast ack ("aborted at log index N").
@@ -1059,17 +1147,29 @@ impl RaftNode {
                             // Refresh the leader's ReadIndex lease: at least one peer
                             // has acknowledged our leadership recently.
                             n.last_quorum_heartbeat_at = Some(n.clock.now());
+                            // Per-peer metric refresh — both gauges
+                            // update together because they're
+                            // coupled (match_index + 1 == next_index
+                            // in steady state, see `apply_logs`).
+                            if let Some(m) = &n.metrics {
+                                m.set_peer_match_index(&peer_addr_clone, last_idx as i64);
+                                m.set_peer_next_index(&peer_addr_clone, (last_idx + 1) as i64);
+                            }
                             n.maybe_commit();
                         } else if reply.term > n.current_term {
                             n.current_term = reply.term;
                             n.state = NodeState::Follower;
                             n.vote_for = None;
                             let _ = n.storage.save_meta(n.current_term.clone(), n.vote_for.clone());
+                            n.refresh_metrics();
                         } else {
                             // Log inconsistency: decrement next_index and retry
                             let next = n.next_index.get(&peer_addr_clone).cloned().unwrap_or(1);
                             if next > 1 {
-                                n.next_index.insert(peer_addr_clone, next - 1);
+                                n.next_index.insert(peer_addr_clone.clone(), next - 1);
+                                if let Some(m) = &n.metrics {
+                                    m.set_peer_next_index(&peer_addr_clone, (next - 1) as i64);
+                                }
                             }
                         }
                     }
@@ -1227,6 +1327,10 @@ impl RaftNode {
             }
             self.last_applied += 1;
         }
+        // Refresh gauges after the apply loop. Either nothing
+        // happened (`commit_index == last_applied`, no-op below)
+        // or `last_applied` / `log.len()` advanced.
+        self.refresh_metrics();
     }
 
     /// Install a committed `Configuration` entry.
@@ -1425,6 +1529,7 @@ impl RaftNode {
         node.vote_for = Some(node.node_id.clone());
         let _ = node.storage.save_meta(node.current_term, node.vote_for.clone());
         node.last_heartbeat = node.clock.now();
+        node.refresh_metrics();
     }
 
     /// Enter the pre-vote phase (Raft §9.6, P8 PR 5). **Does not**
@@ -1466,6 +1571,7 @@ impl RaftNode {
                 && node.current_term + 1 == probed_term
             {
                 node.state = NodeState::PreCandidate;
+                node.refresh_metrics();
             } else {
                 return;
             }
@@ -1685,6 +1791,7 @@ impl RaftNode {
         let next_idx = self.log.len() as u64 + 1;
         self.next_index = self.peers.iter().map(|p| (p.clone(), next_idx)).collect();
         self.last_heartbeat = self.clock.now();
+        self.refresh_metrics();
     }
 
     pub fn handle_append_entries(&mut self, args: &AppendEntriesArgs) -> AppendReplyArgs {
@@ -1777,6 +1884,17 @@ impl RaftNode {
         if last_included > self.last_applied {
             self.last_applied = last_included;
         }
+        // Refresh snapshot_age_seconds / snapshot_bytes (follower
+        // received this snapshot from the leader). Same pattern
+        // as `maybe_snapshot`.
+        if let Some(m) = &self.metrics {
+            m.raft_snapshot_age_seconds.set(0);
+            let path = crate::config::Config::global().snapshot_path();
+            if let Ok(meta) = std::fs::metadata(&path) {
+                m.raft_snapshot_bytes.set(meta.len() as i64);
+            }
+        }
+        self.refresh_metrics();
 
         InstallSnapshotReplyArgs { term: self.current_term }
     }
@@ -1829,6 +1947,17 @@ impl RaftNode {
             return false;
         }
         let _ = self.storage.rewrite_wal_after_snapshot(snapshot_index);
+        // Refresh snapshot_age_seconds / snapshot_bytes. The
+        // metrics handle is best-effort — if `set_metrics` was
+        // never called (e.g. unit tests), `self.metrics` is
+        // `None` and we silently skip the update.
+        if let Some(m) = &self.metrics {
+            m.raft_snapshot_age_seconds.set(0);
+            let path = crate::config::Config::global().snapshot_path();
+            if let Ok(meta) = std::fs::metadata(&path) {
+                m.raft_snapshot_bytes.set(meta.len() as i64);
+            }
+        }
         // Local in-memory log is preserved (other peers may still need entries
         // in the snapshot range via AppendEntries), but the disk WAL is freed.
         true

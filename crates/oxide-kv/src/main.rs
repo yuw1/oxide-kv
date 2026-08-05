@@ -8,6 +8,7 @@ use oxide_kv::raft::node::{NodeState, RaftNode};
 use oxide_kv::raft::coordinator;
 use oxide_kv::raft::net::{StopSignal, TcpTransport, Transport};
 use oxide_kv::raft::timer::run_election_timer;
+use oxide_kv::observability::{run_metrics_server, Metrics};
 
 #[derive(Parser, Debug)]
 pub struct Args {
@@ -19,6 +20,12 @@ pub struct Args {
     pub peers: Vec<String>,
     #[arg(long)]
     pub data_dir: Option<String>,
+    /// Address for the Prometheus `/metrics` HTTP endpoint.
+    /// Default `127.0.0.1:9100` (private loopback; bind to a
+    /// routable address if scraping from another host). Set to
+    /// `disabled` to skip starting the server.
+    #[arg(long, default_value = "127.0.0.1:9100")]
+    pub metrics_addr: String,
 }
 
 #[tokio::main]
@@ -73,6 +80,27 @@ async fn main() -> anyhow::Result<()> {
         node.replay_logs();
     }
 
+    // 5b. Wire Prometheus metrics (P8 PR 8). The handle is shared
+    //     with the metrics HTTP server spawned in step 8c below.
+    //     Pre-register the configured peer list so per-peer
+    //     gauges (`peer_match_index` / `peer_next_index`) appear
+    //     in the first scrape rather than only after the first
+    //     AppendEntries reply.
+    let metrics = Metrics::with_peers(&args.peers)
+        .expect("Failed to construct metrics registry");
+    {
+        let mut node = raft_node.write().unwrap();
+        node.set_metrics(metrics.clone());
+        // Seed the initial gauges so the first scrape returns
+        // real values, not pre-seed defaults. This is a single
+        //     `refresh_metrics()` call (covers term /
+        //     commit_index / last_applied / log_length / role).
+        node.refresh_metrics();
+    }
+    if args.metrics_addr != "disabled" {
+        println!("📊 Metrics will be served at http://{}/metrics", args.metrics_addr);
+    }
+
     // 6. Start Raft RPC listener (Handles internal voting and heartbeats).
     //    Route through the abstracted `Transport` trait so the future
     //    P7 simulation harness can replace this with an in-memory
@@ -119,6 +147,22 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move {
         coordinator::run_tx_timeout_loop(sweep_node, sweep_stop).await;
     });
+
+    // 8c. Start Prometheus `/metrics` HTTP server (P8 PR 8).
+    //     Hand-rolled minimal HTTP/1.1 reader; serves the typed
+    //     `Metrics` registry. Disabled by passing
+    //     `--metrics-addr disabled` (used by tests that don't
+    //     want to bind a port).
+    if args.metrics_addr != "disabled" {
+        let metrics_for_server = metrics.clone();
+        let metrics_addr = args.metrics_addr.clone();
+        let metrics_stop = raft_stop.clone();
+        tokio::spawn(async move {
+            if let Err(e) = run_metrics_server(metrics_for_server, metrics_addr, metrics_stop).await {
+                eprintln!("[metrics] server stopped: {}", e);
+            }
+        });
+    }
 
     // 9. Graceful shutdown handling
     // TODO: Persist final state and cleanly drain in-flight RPCs before exit.
@@ -186,5 +230,30 @@ mod tests {
             "--client-addr", "127.0.0.1:9101",
         ]).expect("data_dir should be optional");
         assert!(args.data_dir.is_none());
+    }
+
+    /// P8 PR 8: `--metrics-addr` defaults to `127.0.0.1:9100` and
+    /// accepts the sentinel `disabled` to skip the metrics
+    /// server. Pinning the default + sentinel in tests prevents
+    /// accidental breaking changes to the documented ops surface.
+    #[test]
+    fn args_metrics_addr_defaults_to_loopback_9100() {
+        let args = <Args as clap::Parser>::try_parse_from([
+            "oxide-kv",
+            "--addr", "127.0.0.1:9001",
+            "--client-addr", "127.0.0.1:9101",
+        ]).expect("metrics_addr should have a default");
+        assert_eq!(args.metrics_addr, "127.0.0.1:9100");
+    }
+
+    #[test]
+    fn args_metrics_addr_disabled_sentinel() {
+        let args = <Args as clap::Parser>::try_parse_from([
+            "oxide-kv",
+            "--addr", "127.0.0.1:9001",
+            "--client-addr", "127.0.0.1:9101",
+            "--metrics-addr", "disabled",
+        ]).expect("disabled sentinel should parse");
+        assert_eq!(args.metrics_addr, "disabled");
     }
 }

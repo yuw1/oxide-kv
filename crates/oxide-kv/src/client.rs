@@ -207,9 +207,33 @@ impl ClientHandler {
         if success {
             // Trigger log synchronization to followers immediately
             RaftNode::sync_logs(node_arc.clone());
+            // Refresh tx_pending_count so the metric tracks the
+            // state-machine's `pending_txs` map size. Reading the
+            // state machine inside `apply_mutation` (rather than
+            // in `apply_logs`) gives us a snapshot *after* the
+            // leader has appended the entry but *before* the
+            // followers have applied it. For the single-node
+            // case both paths happen on the same thread, so
+            // the metric is consistent. Multi-node scrape will
+            // see a brief lag as followers catch up, which is
+            // the right signal for ops.
+            Self::refresh_tx_pending(node_arc);
             serde_json::json!({"status": "ok", "index": index})
         } else {
             serde_json::json!({"status": "error"})
+        }
+    }
+
+    /// Snapshot `StateMachine::pending_tx_count()` into the
+    /// `tx_pending_count` gauge. Cheap — one read lock + one i64
+    /// store. Called after every client command that mutates the
+    /// state machine, so `/metrics` is up-to-date by the time the
+    /// client gets a response.
+    fn refresh_tx_pending(node_arc: &Arc<RwLock<RaftNode>>) {
+        let n = node_arc.read().unwrap();
+        if let Some(m) = n.metrics.as_ref() {
+            let sm = n.state_machine.read().unwrap();
+            m.tx_pending_count.set(sm.pending_tx_count() as i64);
         }
     }
 
@@ -472,12 +496,30 @@ impl ClientHandler {
             node.propose_abort_tx(&tx_id)
         };
         match result {
-            Ok(decide_index) => serde_json::json!({
-                "status": "ok",
-                "tx_id": tx_id,
-                "decision": "abort",
-                "decide_index": decide_index,
-            }),
+            Ok(decide_index) => {
+                // Bump the admin-aborted counter. Mirrors the
+                // `tx_timeout_aborted_total` counter that
+                // `coordinator::run_tx_timeout_loop` increments
+                // for sweep-driven aborts.
+                {
+                    let n = node_arc.read().unwrap();
+                    if let Some(m) = n.metrics.as_ref() {
+                        m.tx_admin_aborted_total.inc();
+                    }
+                }
+                // The AbortTx log entry has been appended but
+                // not yet applied — refresh the gauge so the
+                // next scrape shows the pending count post-purge.
+                // The apply path will also refresh; this just
+                // makes the gauge tight with the response.
+                Self::refresh_tx_pending(node_arc);
+                serde_json::json!({
+                    "status": "ok",
+                    "tx_id": tx_id,
+                    "decision": "abort",
+                    "decide_index": decide_index,
+                })
+            }
             Err(e) => {
                 let mut resp = Self::abort_tx_error_to_json(e);
                 // Merge the original `tx_id` field into the error
