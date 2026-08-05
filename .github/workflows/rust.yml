@@ -36,6 +36,13 @@ jobs:
       # The shrink property tests (`shrink_algorithm_*`) live in the same
       # file but are not skipped — they're millisecond-scale unit tests,
       # not scenarios, and gate the shrinker itself.
+      #
+      # The cross-process smoke test binary
+      # (`tests/cross_process_smoke.rs`) is gated behind the
+      # `cross-process-smoke` feature (see `crates/oxide-kv/Cargo.toml`),
+      # so it's not built or run by this default sweep. The dedicated
+      # smoke step below enables that feature and runs the suite
+      # end-to-end with `--test-threads=1` and a release binary.
       run: cargo test --workspace --verbose -- --skip fuzz_
     - name: Run examples (workspace)
       # `--examples` is part of `--all-targets`, but call it explicitly so
@@ -43,3 +50,28 @@ jobs:
       # `crates/oxide-kv/examples/oxide_kv_cli.rs` exercises the new
       # `oxide-kv-client` crate end-to-end at build time.
       run: cargo build --workspace --examples --verbose
+    - name: Cross-process 3-node smoke test (P8 PR 9)
+      # Drives the real `oxide-kv` binary on three TCP ports (9001/9002/9003
+      # for Raft RPC, 9101/9102/9103 for the JSON client protocol,
+      # 9100/9200/9300 for `/metrics`). The test boots the cluster via
+      # `deploy/scripts/bootstrap-cluster.sh`, verifies the metrics
+      # endpoint + JSON client protocol, and tears down. See the
+      # module docstring in `tests/cross_process_smoke.rs` for the
+      # split-brain / commit-advance bugs this test currently
+      # *surfaces* but does not gate on.
+      #
+      # The test binary is gated behind the `cross-process-smoke`
+      # cargo feature (see `crates/oxide-kv/Cargo.toml` [[test]]
+      # block: `required-features = ["cross-process-smoke"]`). This
+      # stops the default CI test sweep from compiling + running
+      # the heavy suite in parallel with the other test binaries,
+      # which would collide on the fixed bootstrap ports.
+      #
+      # Serialized with `--test-threads=1` because each test case
+      # spins up its own 3-node cluster; running them in parallel
+      # would collide on the bootstrap ports.
+      run: |
+        set -euo pipefail
+        cargo build --release --bin oxide-kv --verbose
+        cargo test --release --test cross_process_smoke --features cross-process-smoke --verbose -- \
+          --test-threads=1 --nocapture

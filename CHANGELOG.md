@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (P8 PR 9: cross-process 3-node smoke test under CI)
+- **`tests/cross_process_smoke.rs`** — boots 3 real
+  `oxide-kv` processes on TCP ports 9001/9002/9003 (Raft RPC)
+  + 9101/9102/9103 (JSON client protocol) + 9100/9200/9300
+  (Prometheus `/metrics`) via
+  `deploy/scripts/bootstrap-cluster.sh`. Verifies the deploy
+  path: every node's `/metrics` serves the expected metric
+  names; every node's JSON client port responds to a probe
+  command with a valid JSON envelope; the per-node logs show
+  election machinery running within 10s. Tears down via the
+  bootstrap script + a `pkill` belt-and-suspenders.
+- **`bootstrap-cluster.sh` enhancements**:
+  - Per-node metrics port offset
+    (`OXIDE_METRICS_PORT_OFFSET=100` → node-1=9100, node-2=9200,
+    node-3=9300). Without this, the second `oxide-kv` would
+    fail to bind the metrics endpoint with `EADDRINUSE`.
+  - New `<BASE>/cluster.jsonl` (NDJSON, one record per node)
+    so the smoke test can discover each node's `raft` /
+    `client` / `metrics` ports without scraping logs.
+  - `clean` now removes `cluster.jsonl`; `start` truncates it
+    before spawning so re-runs start clean.
+- **Three active integration tests** gate the deploy path:
+  - `metrics_endpoint_on_all_three_nodes_responds_200`
+  - `client_port_serves_json_protocol`
+  - `logs_show_election_completed_within_timeout`
+- **Three gated tests** (opt-in once the consensus bugs are
+  fixed):
+  - `single_leader_converges_within_15_seconds`
+  - `set_then_get_on_leader_returns_written_value`
+  - `commit_index_advances_after_set_on_cluster`
+- **CI integration** — `.github/workflows/rust.yml` gets a
+  new `Cross-process 3-node smoke test` step that runs after
+  `cargo build --release --bin oxide-kv`, with
+  `--test-threads=1` so the three serial cluster boots don't
+  collide on ports.
+
+### Bugs surfaced (out of scope, fixed in follow-up PRs)
+
+This PR **intentionally does not fix** the bugs it found.
+Each gated test has a comment block naming the follow-up.
+
+- **Pre-vote tie / split-brain.** Two nodes entering pre-vote
+  ~simultaneously each get 2 of 3 votes (self + the other),
+  both promote to Candidate, both win the real vote round,
+  both become Leader. The cluster fails to self-heal within
+  15s; `find_leader` observes 30+ split-brain iterations in
+  a single `cargo test` run. Workaround: randomize the
+  pre-vote timeout; or move the term bump out of pre-vote
+  (Raft §9.6 says pre-vote should not bump term).
+- **Multi-node `commit_index` stuck at 0.** The leader's
+  `sync_logs` only calls `maybe_commit` from the per-peer
+  AppendEntries-success reply handler. When the leader's own
+  log advances (e.g., a Set the leader appends itself), no
+  per-peer handler fires until the next round of AE, so
+  `commit_index` stays at 0. Follow-up: call `maybe_commit`
+  unconditionally inside `sync_logs` once at least one peer's
+  match index has been updated.
+- **Leader churn / fast hand-off.** Even without split-brain,
+  the leader rotates every 3-5s. Driven by the pre-vote
+  timeout being too close to the heartbeat interval;
+  follow-up to the same PR as the pre-vote fix.
+
 ### Added (P8 PR 8: Prometheus exporter + OpenTelemetry no-op)
 - **`/metrics` HTTP endpoint** (P8 PR 8). Each node serves a
   standard Prometheus text-format exposition on
