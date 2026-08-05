@@ -14,6 +14,10 @@
 #
 # Logs go to /tmp/oxide-kv-node-{1,2,3}.log. Each node gets its own
 # data dir under /tmp/oxide-kv-node-{1,2,3}. Override with $BASE.
+# Metrics ports: by default, node-N binds 127.0.0.1:(9100 + N*100)
+# (i.e. 9100, 9200, 9300). Override with OXIDE_METRICS_PORT_OFFSET
+# or set `--metrics-addr disabled` via the wrapper script if you
+# only want one node scraping the leader.
 
 set -euo pipefail
 
@@ -32,6 +36,14 @@ start_one() {
     local data_dir="$BASE/oxide-kv-$id"
     local raft_port=$((9000 + idx))
     local client_port=$((9100 + idx))
+    # Metrics port offset: P8 PR #8 ships the `/metrics` endpoint
+    # and defaults to `127.0.0.1:9100`. Three nodes would collide on
+    # that port, so use `9000 + 100*idx` (node-1=9100, node-2=9200,
+    # node-3=9300). Set `OXIDE_METRICS_PORT_OFFSET=0` (or set
+    # `--metrics-addr disabled` via env override) to revert to a
+    # single-port binding for debugging.
+    local metrics_offset="${OXIDE_METRICS_PORT_OFFSET:-100}"
+    local metrics_port=$((9000 + metrics_offset * idx))
     local peers=""
     for ((n=0; n<${#NODES[@]}; n++)); do
         [[ "$n" -eq "$idx" ]] && continue
@@ -46,9 +58,20 @@ start_one() {
         --client-addr "127.0.0.1:$client_port" \
         --peers "$peers" \
         --data-dir "$data_dir" \
+        --metrics-addr "127.0.0.1:$metrics_port" \
         > "$BASE/oxide-kv-$id.log" 2>&1 &
-    echo $! > "$BASE/oxide-kv-$id.pid"
-    echo "started $id (raft=$raft_port client=$client_port pid=$(cat "$BASE/oxide-kv-$id.pid"))"
+    local pid=$!
+    echo $pid > "$BASE/oxide-kv-$id.pid"
+    echo "started $id (raft=$raft_port client=$client_port metrics=$metrics_port pid=$pid)"
+
+    # Append a JSON record so test / ops scripts can discover
+    # each node's full port triplet without scraping logs. P8 PR #9
+    # uses this to find the leader's client port after
+    # `bootstrap-cluster.sh status` reports the cluster is up.
+    # Format: one JSON object per line, newline-delimited (NDJSON).
+    cat >> "$BASE/cluster.jsonl" <<EOF
+{"node":"$id","raft":$raft_port,"client":$client_port,"metrics":$metrics_port,"pid":$pid,"data_dir":"$data_dir","log":"$BASE/oxide-kv-$id.log"}
+EOF
 }
 
 stop_all() {
@@ -82,6 +105,7 @@ clean_all() {
     for n in "${NODES[@]}"; do
         rm -rf "$BASE/oxide-kv-$n" "$BASE/oxide-kv-$n.log" "$BASE/oxide-kv-$n.pid"
     done
+    rm -f "$BASE/cluster.jsonl"
     echo "cleaned all data dirs under $BASE/"
 }
 
@@ -89,11 +113,13 @@ case "$cmd" in
     start)
         is_built
         stop_all || true
+        rm -f "$BASE/cluster.jsonl"
         for idx in "${!NODES[@]}"; do
             start_one "${NODES[$idx]}" "$((idx + 1))"
         done
         echo "3 nodes started; logs: $BASE/oxide-kv-node-*.log"
         echo "wait ~2s for leader election, then check status"
+        echo "node discovery: $BASE/cluster.jsonl (NDJSON, one record per node)"
         ;;
     stop)
         stop_all

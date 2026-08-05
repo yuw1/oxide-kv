@@ -6,6 +6,17 @@ license.workspace = true
 repository.workspace = true
 description = "A lightweight distributed key-value store built in Rust, implementing the Raft Consensus Algorithm."
 
+[features]
+# `cross-process-smoke` enables the heavy integration test binary
+# `tests/cross_process_smoke.rs`, which spawns three real
+# `oxide-kv` processes and exercises the deploy path. It is gated
+# behind a feature so the default CI test sweep (which runs the
+# test binary in debug mode and parallels multiple test binaries)
+# skips it. The dedicated CI smoke step enables this feature
+# plus `--release` to run the suite end-to-end.
+cross-process-smoke = []
+
+
 [dependencies]
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
@@ -41,3 +52,13 @@ prost-build = "0.13"
 # the SimClock determinism tests rely on. Feature is only pulled in
 # for dev builds (test compilation), not for the release binary.
 tokio = { version = "1.0", features = ["full", "test-util"] }
+# Heavy cross-process smoke test gated behind the
+# `cross-process-smoke` feature so the default CI test sweep
+# (which runs the test binary in debug mode and parallels
+# multiple test binaries) skips it. The dedicated CI smoke
+# step enables this feature with `--release` to run the
+# suite end-to-end.
+[[test]]
+name = "cross_process_smoke"
+path = "tests/cross_process_smoke.rs"
+required-features = ["cross-process-smoke"]
