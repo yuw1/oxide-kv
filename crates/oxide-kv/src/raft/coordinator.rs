@@ -77,6 +77,95 @@ const TX_VOTE_TIMEOUT_MS: u64 = 2_000;
 /// vote fan-out + DecideTx commit).
 const COORDINATE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Background loop: periodically scan `pending_txs` on the leader and
+/// force-abort any transaction older than `Config::tx_timeout_ms()`.
+///
+/// P8 PR 7 — closes the coordinator-crash hole. Without this loop, a
+/// leader that crashes mid-2PC leaves a BeginTx entry in every
+/// follower's `pending_txs` table forever (no DecideTx is ever
+/// proposed because the leader process is gone). The new leader
+/// inherits the sweep duty on election.
+///
+/// Loop semantics:
+///   - **Leader-only.** On a Follower / Candidate, the sweep is a
+///     no-op (the follower never sees DecideTx log entries until the
+///     leader replicates them, and only the leader can propose new
+///     log entries).
+///   - **Bounded log spam.** Each sweep emits one DecideTx(Abort)
+///     log entry per timed-out tx. If a tx is reaped by a concurrent
+///     DecideTx(Commit) between the scan and the propose, the
+///     `propose_abort_tx` `NotFound` check is the safety net.
+///   - **Observable.** Each force-abort is logged at INFO so an
+///     operator can correlate with the application that started the
+///     tx.
+pub async fn run_tx_timeout_loop(
+    node_arc: Arc<RwLock<RaftNode>>,
+    stop: super::net::StopSignal,
+) {
+    use crate::config::Config;
+    let clock = node_arc.read().unwrap().clock.clone();
+    let timeout_duration =
+        Duration::from_millis(Config::tx_timeout_ms());
+    let sweep_period =
+        Duration::from_millis(Config::tx_timeout_sweep_interval_ms());
+    loop {
+        tokio::select! {
+            biased;
+            _ = stop.0.notified() => return,
+            _ = clock.sleep(sweep_period) => {}
+        }
+        // Single sweep pass: snapshot the timed-out txs, then for
+        // each one call `propose_abort_tx` (leader-checked inside).
+        // We re-check leader state on every pass because leadership
+        // can flip between sweeps without waking us.
+        let is_leader = {
+            let n = node_arc.read().unwrap();
+            n.state == NodeState::Leader
+        };
+        if !is_leader {
+            continue;
+        }
+        let stale = {
+            let n = node_arc.read().unwrap();
+            n.pending_txs_older_than(timeout_duration)
+        };
+        if stale.is_empty() {
+            continue;
+        }
+        for tx_id in stale {
+            let result = {
+                let mut n = node_arc.write().unwrap();
+                n.propose_abort_tx(&tx_id)
+            };
+            match result {
+                Ok(decide_index) => {
+                    println!(
+                        "📤 [TxTimeout] Force-aborted stuck tx_id={} via DecideTx(Abort) at log index {}",
+                        tx_id, decide_index
+                    );
+                }
+                Err(crate::protocol::AbortTxError::NotFound(_)) => {
+                    // Lost the race: a concurrent DecideTx(Commit)
+                    // or DecideTx(Abort) already purged the entry
+                    // between the scan and the propose. Not an
+                    // error — just a successful no-op.
+                }
+                Err(crate::protocol::AbortTxError::NotLeader) => {
+                    // Lost leadership between the leader-check
+                    // above and the propose below. The new leader
+                    // will pick this up on its next sweep tick.
+                }
+                Err(crate::protocol::AbortTxError::StorageError(msg)) => {
+                    eprintln!(
+                        "⚠️ [TxTimeout] Storage error force-aborting tx_id={}: {}",
+                        tx_id, msg
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Drive a 2PC transaction to completion on the leader.
 ///
 /// This is the entry point called by `client.rs::begin_tx` after the
@@ -751,5 +840,217 @@ mod tests {
         assert_ne!(a, c);
         assert!(format!("{:?}", a).contains("Committed"));
         assert!(format!("{:?}", c).contains("Aborted"));
+    }
+
+    // ---- P8 PR 7: tx timeout sweep loop tests ----
+
+    use crate::raft::net::StopSignal as NetStopSignal;
+
+    /// Drive `run_tx_timeout_loop` for one sweep pass by hand:
+    ///   1. Sleep one sweep period.
+    ///   2. Stop the loop.
+    ///   3. Verify a DecideTx(Abort) entry was appended for the
+    ///      stuck tx.
+    ///
+    /// Uses a 50 ms sweep period and 10 ms tx timeout so the test
+    /// completes in well under a second. The env vars
+    /// `OXIDE_TX_TIMEOUT_MS` and `OXIDE_TX_TIMEOUT_SWEEP_INTERVAL_MS`
+    /// are read fresh each tick by `Config::*` so the test can set
+    /// them before spawning the loop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_tx_timeout_loop_force_aborts_stuck_tx_on_single_node() {
+        // Tight sweep + tx timeouts so the test runs fast.
+        unsafe { std::env::set_var("OXIDE_TX_TIMEOUT_MS", "10"); }
+        unsafe { std::env::set_var("OXIDE_TX_TIMEOUT_SWEEP_INTERVAL_MS", "20"); }
+
+        let (_d, node_arc) = make_single_node("sweep-solo");
+
+        // Seed a "stuck" tx by hand-injecting a BeginTx entry and
+        // backdating its begin_unix_ms via begin_tx_at.
+        {
+            let mut node = node_arc.write().unwrap();
+            node.log.push(crate::protocol::LogEntry {
+                term: 1,
+                index: 1,
+                command: Command::BeginTx {
+                    tx_id: "stuck".into(),
+                    ops: vec![crate::protocol::TxOp::Put {
+                        key: "k".into(),
+                        value: "v".into(),
+                    }],
+                },
+            });
+            node.commit_index = 1;
+            drop(node);
+        }
+        // Overwrite the entry's begin_unix_ms via re-insert through
+        // begin_tx_at. We need to first purge the existing entry
+        // because begin_tx_at overwrites by tx_id (same as
+        // begin_tx). The cleanest path is: call apply_logs to
+        // populate pending_txs, then back-date by re-running
+        // begin_tx_at with the same ops.
+        {
+            let mut node = node_arc.write().unwrap();
+            node.apply_logs();
+            let sm = node.state_machine.clone();
+            let now = crate::state_machine::now_unix_ms();
+            // Purge via decide_tx(Abort) (synthetic), then re-insert
+            // with an old timestamp so the sweep sees it as stuck.
+            sm.write()
+                .unwrap()
+                .decide_tx("stuck", TxDecision::Abort)
+                .unwrap();
+            sm.write()
+                .unwrap()
+                .begin_tx_at(
+                    "stuck".into(),
+                    vec![crate::protocol::TxOp::Put {
+                        key: "k".into(),
+                        value: "v".into(),
+                    }],
+                    now.saturating_sub(60_000),
+                )
+                .unwrap();
+        }
+        assert!(node_arc
+            .read()
+            .unwrap()
+            .state_machine
+            .read()
+            .unwrap()
+            .is_tx_pending("stuck"));
+
+        // Spawn the sweep loop and let it run for a couple of
+        // sweep periods, then stop it.
+        let stop = NetStopSignal::new();
+        let stop_clone = stop.clone();
+        let node_for_loop = node_arc.clone();
+        let handle = tokio::spawn(async move {
+            run_tx_timeout_loop(node_for_loop, stop_clone).await;
+        });
+        // 80 ms is 4 sweep periods at 20 ms each — plenty for the
+        // 10 ms timeout to fire.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        stop.stop();
+        // Give the loop a chance to observe the stop.
+        let _ = tokio::time::timeout(Duration::from_millis(100), handle).await;
+
+        // The sweep should have appended a DecideTx(Abort) log
+        // entry on top of the original BeginTx.
+        let node = node_arc.read().unwrap();
+        let last = node.log.last().expect("log must have entries");
+        match &last.command {
+            Command::DecideTx { tx_id, decision } => {
+                assert_eq!(tx_id, "stuck");
+                assert_eq!(*decision, TxDecision::Abort);
+            }
+            other => panic!(
+                "expected DecideTx(Abort) appended by sweep, got {:?}",
+                other
+            ),
+        }
+
+        // Restore defaults so other tests aren't affected.
+        unsafe { std::env::remove_var("OXIDE_TX_TIMEOUT_MS"); }
+        unsafe { std::env::remove_var("OXIDE_TX_TIMEOUT_SWEEP_INTERVAL_MS"); }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_tx_timeout_loop_skips_non_leader() {
+        // On a Follower the sweep must do nothing — the leader is
+        // the only one allowed to propose log entries. This guards
+        // against a future refactor accidentally sweeping from
+        // every node.
+        unsafe { std::env::set_var("OXIDE_TX_TIMEOUT_MS", "5"); }
+        unsafe { std::env::set_var("OXIDE_TX_TIMEOUT_SWEEP_INTERVAL_MS", "10"); }
+
+        let (_d, node_arc) = make_single_node("sweep-follower");
+        // Demote to Follower.
+        {
+            let mut n = node_arc.write().unwrap();
+            n.state = NodeState::Follower;
+        }
+        // Seed a stuck tx.
+        {
+            let n = node_arc.read().unwrap();
+            let now = crate::state_machine::now_unix_ms();
+            n.state_machine
+                .write()
+                .unwrap()
+                .begin_tx_at(
+                    "follower-stuck".into(),
+                    vec![],
+                    now.saturating_sub(60_000),
+                )
+                .unwrap();
+        }
+        let log_len_before = node_arc.read().unwrap().log.len();
+
+        let stop = NetStopSignal::new();
+        let stop_clone = stop.clone();
+        let node_for_loop = node_arc.clone();
+        let handle = tokio::spawn(async move {
+            run_tx_timeout_loop(node_for_loop, stop_clone).await;
+        });
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        stop.stop();
+        let _ = tokio::time::timeout(Duration::from_millis(100), handle).await;
+
+        // Log unchanged — follower didn't propose anything.
+        let log_len_after = node_arc.read().unwrap().log.len();
+        assert_eq!(
+            log_len_before, log_len_after,
+            "follower must not append DecideTx(Abort) entries"
+        );
+        // The stuck tx is still pending (no decision happened).
+        assert!(node_arc
+            .read()
+            .unwrap()
+            .state_machine
+            .read()
+            .unwrap()
+            .is_tx_pending("follower-stuck"));
+
+        unsafe { std::env::remove_var("OXIDE_TX_TIMEOUT_MS"); }
+        unsafe { std::env::remove_var("OXIDE_TX_TIMEOUT_SWEEP_INTERVAL_MS"); }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_tx_timeout_loop_skips_fresh_txs() {
+        // Sanity: a tx that just began should NOT be swept.
+        unsafe { std::env::set_var("OXIDE_TX_TIMEOUT_MS", "60_000"); }
+        unsafe { std::env::set_var("OXIDE_TX_TIMEOUT_SWEEP_INTERVAL_MS", "10"); }
+
+        let (_d, node_arc) = make_single_node("sweep-fresh");
+        node_arc
+            .read()
+            .unwrap()
+            .state_machine
+            .write()
+            .unwrap()
+            .begin_tx("fresh".into(), vec![])
+            .unwrap();
+
+        let stop = NetStopSignal::new();
+        let stop_clone = stop.clone();
+        let node_for_loop = node_arc.clone();
+        let handle = tokio::spawn(async move {
+            run_tx_timeout_loop(node_for_loop, stop_clone).await;
+        });
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        stop.stop();
+        let _ = tokio::time::timeout(Duration::from_millis(100), handle).await;
+
+        // Fresh tx still pending — sweep correctly skipped it.
+        assert!(node_arc
+            .read()
+            .unwrap()
+            .state_machine
+            .read()
+            .unwrap()
+            .is_tx_pending("fresh"));
+
+        unsafe { std::env::remove_var("OXIDE_TX_TIMEOUT_MS"); }
+        unsafe { std::env::remove_var("OXIDE_TX_TIMEOUT_SWEEP_INTERVAL_MS"); }
     }
 }

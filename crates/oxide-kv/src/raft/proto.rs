@@ -72,6 +72,15 @@ impl From<&DomainCommand> for pb::Command {
             DomainCommand::InstallConfiguration { config } => {
                 pb::command::Body::InstallConfiguration(config.into())
             }
+            // P8 PR 7: admin-driven abort. Same pattern as
+            // AddNode/RemoveNode — the leader intercepts before
+            // replication, so this only appears on the wire when a
+            // client tries to send AbortTx to a Follower (or a stale
+            // peer replays an old log). Encode as a plain string
+            // field so the type is closed.
+            DomainCommand::AbortTx { tx_id } => {
+                pb::command::Body::AbortTx(tx_id.clone())
+            }
         };
         pb::Command { body: Some(body) }
     }
@@ -330,6 +339,14 @@ impl From<pb::Command> for DomainCommand {
             Some(pb::command::Body::InstallConfiguration(c)) => {
                 DomainCommand::InstallConfiguration { config: c.into() }
             }
+            // P8 PR 7 inverse. AbortTx on the wire only happens
+            // when a client tries to send one to a Follower or a
+            // stale peer replays an old log. The leader intercepts
+            // AbortTx at the JSON layer; followers receive a
+            // translated `DecideTx{Abort}` log entry instead. Treat
+            // an out-of-band AbortTx as Compact (no-op) so the
+            // cluster stays safe.
+            Some(pb::command::Body::AbortTx(_)) => DomainCommand::Compact,
             None => DomainCommand::Compact, // No payload → treat as no-op
         }
     }

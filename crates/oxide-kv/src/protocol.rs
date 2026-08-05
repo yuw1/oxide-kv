@@ -8,6 +8,24 @@ pub enum Command {
     Get { key: String },
     Delete { key: String },
     Compact,
+    /// Admin RPC: force-abort a stuck 2PC transaction by tx_id.
+    ///
+    /// P8 PR 7 closes the coordinator-crash hole — without this, a
+    /// leader that crashed mid-2PC leaves the BeginTx entry in
+    /// every follower's `pending_txs` table forever. The leader
+    /// intercepts `AbortTx` and proposes a `DecideTx(Abort)` log
+    /// entry for the same `tx_id`, which then propagates through the
+    /// normal replication path and gets applied on every follower.
+    ///
+    /// Behavior on a follower (defensive — leader-only via the JSON
+    /// dispatch): rejected at the JSON layer with "not a leader".
+    /// Behavior when `tx_id` is not in `pending_txs`: leader
+    /// returns an error (no log entry written — aborting a
+    /// non-existent tx is a client bug, not a recovery action).
+    ///
+    /// Wire tag is the next free slot after `InstallConfiguration`
+    /// (see `proto/raft.proto::Command.Body`).
+    AbortTx { tx_id: String },
     // ---- Two-phase commit lifecycle (Raft thesis §6.4, simplified) ----
     //
     // As of P6 (see `ROADMAP.md`), the coordinator is the leader and votes
@@ -312,6 +330,23 @@ pub enum MembershipError {
     /// Refusing to remove the last remaining server, which would
     /// leave the cluster unable to make progress.
     CannotRemoveLastServer,
+    /// Storage layer error (WAL append failed).
+    StorageError(String),
+}
+
+/// P8 PR 7: errors returned by `propose_abort_tx` so the JSON
+/// client layer can translate them to a structured response.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AbortTxError {
+    /// The local node is not the leader. The operator should
+    /// retry on the current leader (or wait for a new leader to
+    /// be elected if the cluster is mid-election).
+    NotLeader,
+    /// The given `tx_id` is not in `pending_txs` — either the tx
+    /// already committed, already aborted, or never existed. The
+    /// operator can verify with `pending_tx_view` / metrics
+    /// before retrying.
+    NotFound(String),
     /// Storage layer error (WAL append failed).
     StorageError(String),
 }

@@ -179,6 +179,14 @@ impl ReferenceModel {
             // care), so this is a no-op for the model. The
             // invariants layer checks membership separately.
             Command::InstallConfiguration { .. } => {}
+            // P8 PR 7: admin-driven abort. Like
+            // AddNode/RemoveNode, the leader intercepts and
+            // translates to `DecideTx(Abort)` before
+            // replication. The reference model never sees
+            // an AbortTx entry on the wire; treat as
+            // no-op for the same reason as the membership
+            // commands above.
+            Command::AbortTx { .. } => {}
         }
         true
     }

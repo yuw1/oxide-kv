@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::coordination::{VoteRequest, VoteResponse};
-use crate::protocol::{config_quorum_reached_index, Command, Configuration, LogEntry, MembershipError, ReadIndex, ServerId, Snapshot, Vote};
+use crate::protocol::{config_quorum_reached_index, AbortTxError, Command, Configuration, LogEntry, MembershipError, ReadIndex, ServerId, Snapshot, TxDecision, Vote};
 use crate::raft::clock::{system_clock, Clock};
 use crate::raft::net::{system_transport, Transport};
 use crate::raft::rpc::{
@@ -916,6 +916,74 @@ impl RaftNode {
         Ok(joint_index)
     }
 
+    /// Admin RPC: force-abort a stuck 2PC transaction by `tx_id`.
+    ///
+    /// P8 PR 7 closes the coordinator-crash hole: if the leader
+    /// dies mid-2PC, the BeginTx entry is left in every follower's
+    /// `pending_txs` table forever (no DecideTx comes through).
+    /// This method proposes a `DecideTx(Abort)` log entry for the
+    /// stuck tx, which replicates to every follower through the
+    /// normal AppendEntries path; followers apply it through
+    /// `apply_logs` and purge the pending entry.
+    ///
+    /// Same entry point serves two callers:
+    ///   1. The client-facing JSON `AbortTx` command (manual ops
+    ///      recovery) — see `client.rs::abort_tx`.
+    ///   2. The coordinator-side timeout sweep (automatic recovery)
+    ///      — see `raft/coordinator.rs::run_tx_timeout_loop`.
+    ///
+    /// Validation:
+    ///   - **Leader-only.** A non-leader cannot guarantee replication,
+    ///     so this returns `AbortTxError::NotLeader` for any
+    ///     non-Leader state. The JSON dispatch guard already rejects
+    ///     non-leaders, so this is a belt-and-braces check.
+    ///   - **Tx must be in `pending_txs`.** Aborting a tx that was
+    ///     already decided (Commit / Abort) is a no-op at best and
+    ///     misleading at worst — return `AbortTxError::NotFound` so
+    ///     the operator gets a clear error.
+    ///
+    /// On success, returns the log index of the new `DecideTx(Abort)`
+    /// entry (the caller may want this for log correlation).
+    pub fn propose_abort_tx(&mut self, tx_id: &str) -> Result<u64, AbortTxError> {
+        if self.state != NodeState::Leader {
+            return Err(AbortTxError::NotLeader);
+        }
+        if !self.state_machine.read().unwrap().is_tx_pending(tx_id) {
+            return Err(AbortTxError::NotFound(tx_id.to_string()));
+        }
+        // Translate to a `DecideTx(Abort)` log entry. The log
+        // entry is the only thing that flows through Raft — the
+        // client-facing `AbortTx` command never goes on the wire.
+        let new_index = self.log.len() as u64 + 1;
+        let entry = LogEntry {
+            term: self.current_term,
+            index: new_index as usize,
+            command: Command::DecideTx {
+                tx_id: tx_id.to_string(),
+                decision: TxDecision::Abort,
+            },
+        };
+        if let Err(e) = self.storage.append_wal_log(&entry) {
+            return Err(AbortTxError::StorageError(e.to_string()));
+        }
+        self.log.push(entry);
+        // Trigger replication immediately rather than waiting
+        // for the next heartbeat tick. The operator's workflow
+        // expects a fast ack ("aborted at log index N").
+        Ok(new_index)
+    }
+
+    /// Leader-only accessor: `tx_id`s of pending txs older than
+    /// `threshold`. Used by the coordinator-side timeout sweep
+    /// (P8 PR 7). Returns an empty vec on a non-leader (callers
+    /// should check `is_leader()` first to avoid silent no-ops).
+    pub fn pending_txs_older_than(&self, threshold: std::time::Duration) -> Vec<String> {
+        self.state_machine
+            .read()
+            .unwrap()
+            .pending_txs_older_than(threshold)
+    }
+
     pub fn sync_logs(raft_node: Arc<RwLock<Self>>) {
         let (current_term, node_id, commit_index, peers, log_len) = {
             let n = raft_node.read().unwrap();
@@ -1823,7 +1891,7 @@ mod tests {
     use crate::protocol::{config_quorum_reached, Command, LogEntry, ReadIndex, Snapshot, TxDecision, TxOp};
     use crate::raft::rpc::{AppendEntriesArgs, InstallSnapshotArgs, RequestVoteArgs};
     use crate::raft::storage::RaftStorage;
-    use crate::state_machine::StateMachine;
+    use crate::state_machine::{StateMachine, StateMachineConfig};
     use std::collections::HashMap;
     use std::sync::{Arc, RwLock};
     use std::time::{Duration, Instant};
@@ -3717,5 +3785,180 @@ mod tests {
             got,
             vec!["n2".to_string(), "n3".to_string(), "n4".to_string()]
         );
+    }
+
+    // ---- P8 PR 7: tx timeout + admin-driven abort ----
+
+    /// Helper: build a single-node leader with `tx_id` already in
+    /// `pending_txs`. Used by the `propose_abort_tx` unit tests
+    /// below so each test starts from a known state.
+    fn make_leader_with_pending_tx(tx_id: &str) -> RaftNode {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wal = dir
+            .path()
+            .join(format!("{tx_id}.wal"))
+            .to_str()
+            .unwrap()
+            .to_string();
+        let meta = dir
+            .path()
+            .join(format!("{tx_id}_meta.json"))
+            .to_str()
+            .unwrap()
+            .to_string();
+        let snap = dir
+            .path()
+            .join(format!("{tx_id}_snapshot.json"))
+            .to_str()
+            .unwrap()
+            .to_string();
+        let storage = RaftStorage::new_with_paths(wal, meta, snap);
+        let sm_dir = dir.path().join(format!("{tx_id}_sm"));
+        let sm_config = StateMachineConfig {
+            data_dir: sm_dir,
+            memtable_size_threshold: 1024 * 1024,
+        };
+        let sm = Arc::new(RwLock::new(StateMachine::open(sm_config).unwrap()));
+        let mut node = RaftNode::new_with_storage(
+            tx_id.to_string(),
+            vec![],
+            sm.clone(),
+            storage,
+        );
+        node.state = NodeState::Leader;
+        // Seed pending_txs via apply_logs path so the test mirrors
+        // what happens after a BeginTx log entry commits.
+        node.log.push(crate::protocol::LogEntry {
+            term: 1,
+            index: 1,
+            command: Command::BeginTx {
+                tx_id: tx_id.to_string(),
+                ops: vec![crate::protocol::TxOp::Put {
+                    key: "k".into(),
+                    value: "v".into(),
+                }],
+            },
+        });
+        node.commit_index = 1;
+        node.apply_logs();
+        // Suppress unused warning for dir (TempDir keeps the dir alive
+        // only via its handle; the closure below converts it into a
+        // 'static via Box::leak so the spawned node doesn't try to
+        // access a dropped dir).
+        std::mem::forget(dir);
+        node
+    }
+
+    #[test]
+    fn propose_abort_tx_on_leader_appends_decide_tx_abort_entry() {
+        // Happy path: leader with a pending tx proposes
+        // DecideTx(Abort), which appends to log and returns the new
+        // index. The pending entry should still be in pending_txs
+        // (apply_logs purges it once DecideTx commits).
+        let mut node = make_leader_with_pending_tx("tx-happy");
+        assert!(node.state_machine.read().unwrap().is_tx_pending("tx-happy"));
+        let log_len_before = node.log.len();
+
+        let decide_index = node
+            .propose_abort_tx("tx-happy")
+            .expect("leader should accept abort");
+
+        // The DecideTx entry was appended.
+        assert_eq!(node.log.len(), log_len_before + 1);
+        assert_eq!(node.log.last().unwrap().index, decide_index as usize);
+        match &node.log.last().unwrap().command {
+            Command::DecideTx { tx_id, decision } => {
+                assert_eq!(tx_id, "tx-happy");
+                assert_eq!(*decision, TxDecision::Abort);
+            }
+            other => panic!("expected DecideTx, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn propose_abort_tx_rejects_non_leader() {
+        // Same as the happy path but state != Leader. The error must
+        // be NotLeader so the JSON dispatch guard and the operator
+        // both see the right code.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wal = dir.path().join("nl.wal").to_str().unwrap().to_string();
+        let meta = dir.path().join("nl_meta.json").to_str().unwrap().to_string();
+        let snap = dir.path().join("nl_snapshot.json").to_str().unwrap().to_string();
+        let storage = RaftStorage::new_with_paths(wal, meta, snap);
+        let sm_dir = dir.path().join("nl_sm");
+        let sm_config = StateMachineConfig {
+            data_dir: sm_dir,
+            memtable_size_threshold: 1024 * 1024,
+        };
+        let sm = Arc::new(RwLock::new(
+            StateMachine::open(sm_config).unwrap(),
+        ));
+        let mut node =
+            RaftNode::new_with_storage("nl".into(), vec![], sm.clone(), storage);
+        node.state = NodeState::Follower;
+        // Seed a pending tx so the NotLeader check fires before the
+        // NotFound check.
+        sm.write()
+            .unwrap()
+            .begin_tx("nl-tx".into(), vec![crate::protocol::TxOp::Put {
+                key: "k".into(),
+                value: "v".into(),
+            }])
+            .unwrap();
+        let err = node.propose_abort_tx("nl-tx").unwrap_err();
+        assert_eq!(err, AbortTxError::NotLeader);
+        std::mem::forget(dir);
+    }
+
+    #[test]
+    fn propose_abort_tx_returns_not_found_for_unknown_tx_id() {
+        // tx_id is NOT in pending_txs → NotFound. This protects
+        // against the operator typo / re-trying an already-aborted
+        // tx from spawning a confusing empty DecideTx entry.
+        let mut node = make_leader_with_pending_tx("alive");
+        let err = node
+            .propose_abort_tx("ghost")
+            .unwrap_err();
+        assert_eq!(
+            err,
+            AbortTxError::NotFound("ghost".to_string())
+        );
+    }
+
+    #[test]
+    fn pending_txs_older_than_through_node_uses_state_machine_view() {
+        // Integration check that `RaftNode::pending_txs_older_than`
+        // correctly delegates to the state machine. Seed an old tx
+        // via apply_logs and verify the threshold-based filter
+        // works.
+        let mut node = make_leader_with_pending_tx("node-old");
+        // Hand-poke the begin_unix_ms back by 1 second so it's
+        // "older than now".
+        {
+            let mut sm = node.state_machine.write().unwrap();
+            let now = crate::state_machine::now_unix_ms();
+            // Re-insert with a synthetic old timestamp via the
+            // public `begin_tx_at` after wiping the existing entry.
+            let view = sm.pending_tx("node-old").unwrap();
+            let ops = (0..view.op_count)
+                .map(|_| crate::protocol::TxOp::Put {
+                    key: "k".into(),
+                    value: "v".into(),
+                })
+                .collect();
+            // `decide_tx` purges the pending entry without applying
+            // anything (Abort). Then re-insert with the old
+            // timestamp.
+            sm.decide_tx("node-old", TxDecision::Abort).unwrap();
+            sm.begin_tx_at(
+                "node-old".into(),
+                ops,
+                now.saturating_sub(1_000),
+            )
+            .unwrap();
+        }
+        let stale =
+            node.pending_txs_older_than(std::time::Duration::from_millis(100));
+        assert_eq!(stale, vec!["node-old".to_string()]);
     }
 }

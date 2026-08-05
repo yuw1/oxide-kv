@@ -4,7 +4,7 @@ pub mod storage;
 pub mod rpc;
 pub mod proto;
 pub(crate) mod transport;
-pub(crate) mod coordinator;
+pub mod coordinator;
 pub mod clock;
 pub mod fault_scheduler;
 pub mod net;

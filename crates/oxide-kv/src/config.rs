@@ -91,4 +91,32 @@ impl Config {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(64 * 1024 * 1024)
     }
+
+    /// How long an in-flight 2PC transaction can stay in `pending_txs`
+    /// before the coordinator (leader) is allowed to force-abort it
+    /// via the timeout sweep (P8 PR 7). Default 30 s is generous
+    /// relative to a healthy multi-node round (typically < 1 s end
+    /// to end) but bounded so a coordinator crash leaves at most
+    /// ~30 s of stuck-tx exposure.
+    ///
+    /// Override via the `OXIDE_TX_TIMEOUT_MS` env var so tests can
+    /// run with sub-second timeouts.
+    pub fn tx_timeout_ms() -> u64 {
+        std::env::var("OXIDE_TX_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30_000)
+    }
+
+    /// Cadence at which the leader sweeps `pending_txs` for stuck
+    /// transactions. Default 1 s so a tx that times out is aborted
+    /// within `tx_timeout + tx_timeout_sweep_interval` of its
+    /// `begin_at`. Followers don't sweep — the leader inherits
+    /// the duty on election.
+    pub fn tx_timeout_sweep_interval_ms() -> u64 {
+        std::env::var("OXIDE_TX_TIMEOUT_SWEEP_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(1_000)
+    }
 }

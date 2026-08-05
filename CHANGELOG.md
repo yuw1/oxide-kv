@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (P8 PR 7: tx timeout + admin-driven abort)
+- **Coordinator-side timeout sweep** — `raft::coordinator::run_tx_timeout_loop`
+  spawned in `main.rs`. Periodically scans `pending_txs` on the
+  leader and force-aborts any tx whose `begin_unix_ms` is older than
+  `OXIDE_TX_TIMEOUT_MS` (default 30 s, swept every
+  `OXIDE_TX_TIMEOUT_SWEEP_INTERVAL_MS` = 1 s). Closes the
+  coordinator-crash hole: a leader that dies mid-2PC used to leave
+  the `BeginTx` entry stuck in every follower's `pending_txs`
+  forever. New leader inherits the sweep duty on election.
+- **Admin `AbortTx` JSON RPC** — client-facing force-abort for a
+  stuck tx. The leader intercepts and translates to a
+  `DecideTx(Abort)` log entry, which replicates through the normal
+  AppendEntries path so every follower purges the pending entry on
+  apply. Returns the new `decide_index` on success; structured error
+  codes (`not_leader` / `tx_not_found` / `storage_error`) on failure.
+- **`StateMachine::PendingTx::begin_unix_ms`** — UNIX epoch ms
+  field with `serde(default)` for forward-compat. New
+  `begin_tx_at(tx_id, ops, ts)` / `pending_txs_older_than(threshold)`
+  / `is_tx_pending(tx_id)` accessors.
+- **Wire schema** — `proto/raft.proto::Command.Body::abort_tx = 11`
+  (next free slot after `InstallConfiguration`).
+- **Tests** — 6 new lib unit tests (3 in `raft/node.rs` for
+  `propose_abort_tx`, 3 in `raft/coordinator.rs` for the sweep loop)
+  + 4 new state-machine tests + 3 new integration tests in
+  `tests/tx_timeout_abort.rs`. Total: **249 → 255 lib tests,
+  +3 integration tests.**
+
 ### Added (JoinCluster RPC — cold-new-server catch-up)
 - **`JoinClusterRequest` / `JoinClusterResponse` wire messages**
   (proto tags 9 / 10). A brand-new server (with empty `peers`)

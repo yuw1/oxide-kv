@@ -1,5 +1,5 @@
 use crate::raft::node::{RaftNode, NodeState};
-use crate::protocol::{Command, MembershipError, ServerId};
+use crate::protocol::{AbortTxError, Command, MembershipError, ServerId};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
@@ -107,6 +107,13 @@ impl ClientHandler {
                     "status": "error",
                     "message": "InstallConfiguration is a leader-internal log entry; not a valid client command"
                 })
+            }
+            // P8 PR 7: admin-driven force-abort. Leader-only;
+            // forwarded to `propose_abort_tx` which validates
+            // `tx_id` is in `pending_txs` and proposes a
+            // `DecideTx(Abort)` log entry.
+            Command::AbortTx { tx_id } => {
+                Self::abort_tx(tx_id, node_arc).await
             }
         }
     }
@@ -375,6 +382,23 @@ impl ClientHandler {
         }
     }
 
+    /// P8 PR 7: translate an `AbortTxError` to a structured JSON
+    /// response. Mirrors `membership_error_to_json` so the operator
+    /// gets a clear `code` field for log correlation / alerting.
+    fn abort_tx_error_to_json(e: AbortTxError) -> serde_json::Value {
+        match e {
+            AbortTxError::NotLeader => {
+                serde_json::json!({"status": "error", "code": "not_leader", "message": "Not a leader. Please connect to the leader node."})
+            }
+            AbortTxError::NotFound(tx_id) => {
+                serde_json::json!({"status": "error", "code": "tx_not_found", "tx_id": tx_id, "message": "tx_id is not in pending_txs; already committed/aborted or never existed"})
+            }
+            AbortTxError::StorageError(msg) => {
+                serde_json::json!({"status": "error", "code": "storage_error", "message": msg})
+            }
+        }
+    }
+
     /// Begin a two-phase-commit transaction.
     ///
     /// Delegates to the leader-side coordinator
@@ -422,6 +446,46 @@ impl ClientHandler {
                     "message": "not leader",
                     "tx_id": tx_id,
                 })
+            }
+        }
+    }
+
+    /// Admin RPC: force-abort a stuck 2PC transaction.
+    ///
+    /// Mirrors `propose_add_node` / `propose_remove_node` semantics:
+    ///   - Leader-only (the dispatch guard already rejected non-leaders).
+    ///   - Validates `tx_id` is in `pending_txs`; rejects otherwise so
+    ///     the operator gets a clear "tx not found" error rather than a
+    ///     silent no-op log entry.
+    ///   - On success, proposes a `DecideTx(Abort)` log entry that
+    ///     replicates to every follower through the normal AppendEntries
+    ///     path; the operator gets back the log index of the
+    ///     `DecideTx(Abort)` so they can correlate with cluster logs.
+    ///
+    /// P8 PR 7.
+    async fn abort_tx(
+        tx_id: String,
+        node_arc: &Arc<RwLock<RaftNode>>,
+    ) -> serde_json::Value {
+        let result = {
+            let mut node = node_arc.write().unwrap();
+            node.propose_abort_tx(&tx_id)
+        };
+        match result {
+            Ok(decide_index) => serde_json::json!({
+                "status": "ok",
+                "tx_id": tx_id,
+                "decision": "abort",
+                "decide_index": decide_index,
+            }),
+            Err(e) => {
+                let mut resp = Self::abort_tx_error_to_json(e);
+                // Merge the original `tx_id` field into the error
+                // response so operators can grep for it.
+                if let Some(obj) = resp.as_object_mut() {
+                    obj.insert("tx_id".to_string(), serde_json::Value::String(tx_id));
+                }
+                resp
             }
         }
     }
