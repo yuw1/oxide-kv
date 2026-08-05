@@ -4,3 +4,4 @@ pub mod raft;
 pub mod config;
 pub mod client;
 pub mod coordination;
+pub mod observability;

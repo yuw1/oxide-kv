@@ -15,6 +15,13 @@ rand = "0.8"
 bincode = "1.3"
 clap = { version = "4.0", features = ["derive"] }
 prost = "0.13"
+# `prometheus` is the metrics registry + text-format encoder used
+# by the `/metrics` HTTP endpoint (P8 PR 8). The crate is
+# dependency-free beyond `fnv` + an optional `protobuf` feature
+# (we use the default `text` encoder), so pulling it in keeps the
+# build graph flat. A future PR can gate this behind a
+# `metrics` cargo feature flag once we have real opt-in demand.
+prometheus = { version = "0.14", default-features = false }
 # `oxide-kv-client` is the standalone Rust client crate (P8 PR 2).
 # Pulled in here so the `examples/oxide_kv_cli.rs` example can
 # demonstrate using it from the server crate's binary context.

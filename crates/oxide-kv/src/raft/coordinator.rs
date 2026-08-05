@@ -143,6 +143,17 @@ pub async fn run_tx_timeout_loop(
                         "📤 [TxTimeout] Force-aborted stuck tx_id={} via DecideTx(Abort) at log index {}",
                         tx_id, decide_index
                     );
+                    // Bump the timeout-aborted counter on the
+                    // node's metrics handle, if one is wired in.
+                    // Mirrors `tx_admin_aborted_total` which is
+                    // incremented from `client::abort_tx` — ops
+                    // gets one metric per call site.
+                    {
+                        let n = node_arc.read().unwrap();
+                        if let Some(m) = n.metrics.as_ref() {
+                            m.tx_timeout_aborted_total.inc();
+                        }
+                    }
                 }
                 Err(crate::protocol::AbortTxError::NotFound(_)) => {
                     // Lost the race: a concurrent DecideTx(Commit)
