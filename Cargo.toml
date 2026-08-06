@@ -1,8 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/oxide-kv",
-    "crates/oxide-kv-client",
+    "rust/oxide-kv",
+    "rust/oxide-kv-client",
 ]
 
 # Workspace-level settings shared by every member crate.

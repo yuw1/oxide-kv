@@ -1,5 +1,5 @@
 //! Wire-format sanity tests — verifies that the JSON shapes this
-//! crate sends match the shapes the server crate (`crates/oxide-kv`)
+//! crate sends match the shapes the server crate (`rust/oxide-kv`)
 //! emits. These tests don't need a running server: they just
 //! round-trip the request payloads through `serde_json::Value` and
 //! confirm the fields the server-side `dispatch_command` looks for.
@@ -104,7 +104,7 @@ fn begin_tx_aborted_response_shape() {
 #[test]
 fn not_leader_response_shape() {
     // Server returns this exact shape when a mutation hits a follower
-    // (see crates/oxide-kv/src/client.rs:61).
+    // (see rust/oxide-kv/src/client.rs:61).
     let resp: Value = json!({"error": "Not a leader. Please connect to the leader node."});
     assert!(resp["error"]
         .as_str()
