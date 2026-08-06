@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed (drop Python CI workflow)
+- **`.github/workflows/python.yml` deleted.** The Python SDK is a
+  pure-Python, zero-dependency socket wrapper — no PyO3 extension,
+  no maturin build, no native code. The removed workflow spent
+  several minutes compiling the full Rust binary
+  (`cargo build --release --bin oxide-kv`) on a GitHub Actions
+  runner per matrix cell (Python 3.9 / 3.11 / 3.13) just to boot
+  a single-node server and run seven socket tests that exercise
+  the wire contract. Server correctness is already covered by the
+  Rust test suite + DST suite; the SDK's wire-contract tests are
+  thin enough that compiling the server on every push is
+  disproportionate.
+- **Replacement**: SDK changes get validated locally via
+  `python -m pip install -e ".[dev]" && python -m pytest tests/`
+  (see `python/README.md`). If a future PyO3 binding lands, a
+  proper maturin-based workflow becomes justified — until then,
+  the Python SDK ships without CI.
+- The duplicate-`[project.optional-dependencies]` fix below is
+  still kept: `pip install -e .` must work for local development.
+
 ### Fixed (chore: drop duplicate `[project.optional-dependencies]` block)
 - **`python/pyproject.toml` previously declared
   `[project.optional-dependencies]` twice** — once as a `[test] +

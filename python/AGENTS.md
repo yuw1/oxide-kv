@@ -47,9 +47,12 @@ has zero runtime deps so the resolver isn't a moving target.
 - Each test that needs a server reads `OXIDE_KV_TEST_HOST` /
   `OXIDE_KV_TEST_PORT` env vars; defaults to
   `127.0.0.1:9101`.
-- CI (`.github/workflows/python.yml`) runs `make install && make
-  test` against a real server spawned by the same `cargo run` the
-  Rust smoke test uses.
+- **No CI workflow for the SDK** (the former
+  `.github/workflows/python.yml` was deleted: it compiled the full
+  Rust binary per matrix cell just to run seven socket tests).
+  Validate SDK changes locally:
+  `python -m pip install -e ".[dev]" && python -m pytest tests/`
+  against a running server.
 
 ## Future work
 
