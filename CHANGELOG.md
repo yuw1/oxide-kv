@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (raft: pre-vote self-vote off-by-one + Leader demote on same-term AE)
+
+Two latent Raft hardening bugs. The bootstrap peer-list fix (same
+release) already removed the configuration that made them fire
+constantly in dev, but both remain real algorithm bugs under load:
+
+- **Pre-vote self-vote off-by-one (`become_pre_candidate`).** The
+  pre-vote probe initialised `votes_received = AtomicUsize::new(1)`
+  (counting an implicit self-vote) and checked quorum with
+  `count > total_nodes / 2`. In a 3-node cluster that means one
+  peer grant + the phantom self-vote = 2 > 1 satisfies quorum, so
+  **two concurrent pre-vote candidates could both promote to
+  Candidate and both win the real election → split-brain at the
+  same term** (Raft §5.4.1 election safety violated). Pre-vote is a
+  *probe*: the node has not actually voted for itself yet (that
+  happens in `promote_to_candidate_locked`, after peer quorum). The
+  counter now starts at 0, so a 3-node promote requires grants from
+  both peers.
+- **Leader stepped down on same-term AppendEntries /
+  InstallSnapshot.** `handle_append_entries` unconditionally set
+  `state = Follower` after the term check — including when the
+  receiver was the incumbent Leader at the *same* term (a duplicate
+  heartbeat from a peer that hadn't observed our win yet). The
+  Leader then re-elected itself on the next timeout tick, churning
+  the term every ~7 s. Both handlers now refuse a **same-term**
+  message while remaining Leader (refuse, don't demote), while a
+  **higher-term** message still forces the §5.1 step-down — the
+  asymmetry is the whole point and is covered by regression tests.
+
+Tests added: 3 unit tests (same-term AE refuse / higher-term AE
+demote / same-term InstallSnapshot refuse) + 2 integration tests
+(concurrent pre-vote never split-brains; 3-node pre-vote requires
+both peers). Suite: 271 lib + all integration targets green.
+
 ### Removed (drop Python CI workflow)
 - **`.github/workflows/python.yml` deleted.** The Python SDK is a
   pure-Python, zero-dependency socket wrapper — no PyO3 extension,
