@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (chore: elevate `sdk/python/` → `python/`)
+- **`sdk/python/` moved to top-level `python/`.** Symmetric
+  with the Rust workspace at `rust/`; matches the lance-rs /
+  lance-format multi-language convention. The `sdk/` directory
+  was empty after the move and is removed.
+- **`examples/oxide_kv_demo.py` moved to `python/examples/oxide_kv_demo.py`.**
+  The demo lives next to the SDK package now, so the `sys.path`
+  insert simplifies to a single `os.path.dirname(__file__)`
+  relative path. README "Talk to the cluster" snippet updated
+  to `python3 python/examples/oxide_kv_demo.py`. Top-level
+  `examples/` directory becomes empty and is deleted (Rust
+  examples stay under `rust/oxide-kv/examples/oxide_kv_cli.rs`,
+  they were never in the top-level `examples/` to begin with).
+- **Root `Cargo.toml`** gains `exclude = ["python"]` so cargo's
+  workspace resolver does not scan the Python package (which is
+  built by setuptools, not cargo).
+- **Root `.gitignore`** rewrites `sdk/python/oxide_kv.egg-info/`
+  to `python/oxide_kv.egg-info/` and adds
+  `__pycache__/`, `.pytest_cache/`, `.ruff_cache/`, `.venv/`
+  for the new directory.
+- **`python/Makefile`** — new file mirroring
+  lance-rs/python/Makefile (`install` / `test` / `lint` /
+  `format` / `clean`).
+- **`python/AGENTS.md`** — new file mirroring
+  lance-rs/python/AGENTS.md (scope, commands, style, testing,
+  future work).
+- **`python/pyproject.toml`** — adds `[project.urls]` (Homepage,
+  Issues, Changelog), keywords, two classifiers, and a `[dev]`
+  extras group pinning `ruff>=0.6`.
+- **`python/README.md`** — `pip install -e .` + `make test`
+  command examples replace the old `sdk/python/...` paths.
+- **`python/tests/test_client.py`** — repo-root walk and
+  `sys.path.insert` updated to find `python/` not `sdk/python/`;
+  doctring example path updated.
+- **`.github/workflows/python.yml`** — new CI job that runs
+  `make install` + `make lint` + boots a single-node server via
+  `cargo run --release` and runs `make test` against it. Matrix
+  on Python 3.9 / 3.11 / 3.13.
+- **`README.md` Project layout** — tree now shows `python/oxide_kv/`
+  alongside the Rust sub-trees.
+
 ### Changed (chore: rename `crates/` → `rust/`)
 - **Top-level `crates/` directory renamed to `rust/`.** Follows the
   lance-rs / lance-format convention where the Rust workspace

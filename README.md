@@ -266,6 +266,10 @@ rust/oxide-kv-client/    Async TCP client (JSON line protocol)
 proto/
 ├── raft.proto             Raft wire schema
 └── coordination.proto     2PC coordinator wire schema
+python/                   Pure-Python SDK (TCP + JSON line protocol)
+├── oxide_kv/              Client + Transaction + errors
+├── examples/              Runnable demos (oxide_kv_demo.py)
+└── tests/                 pytest suite
 ```
 
 ---
@@ -387,7 +391,7 @@ cargo build --release
 ./deploy/scripts/bootstrap-cluster.sh status
 
 # Talk to the cluster:
-python3 examples/oxide_kv_demo.py
+python3 python/examples/oxide_kv_demo.py
 # Or via the Rust CLI:
 cargo run --release --example oxide_kv_cli -- set hello world
 
