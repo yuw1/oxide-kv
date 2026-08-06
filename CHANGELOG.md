@@ -18,14 +18,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Doc / comment path references** rewritten from `crates/oxide-kv/...`
   to `rust/oxide-kv/...` across: `README.md`, `ROADMAP.md`,
   `CHANGELOG.md` (this file's earlier P0/P5 history), `proto/raft.proto`,
-  `tests/integration_2pc.rs`, `rust/oxide-kv-client/src/{client,connection,lib}.rs`,
+  `rust/oxide-kv/tests/integration_2pc.rs`, `rust/oxide-kv-client/src/{client,connection,lib}.rs`,
   `rust/oxide-kv-client/tests/wire_format.rs`,
   `.github/workflows/{rust,nightly}.yml`.
 - 48 files renamed under git's rename detection (`R` status, no
   content change inside the files). Rust workspace re-detected on
   next `cargo build`.
 
-### Removed (chore: drop leftover root src/ from crate extraction)
+### Removed
+
+#### Drop duplicate root `tests/` from crate extraction
+- **Top-level `tests/` directory deleted** (4 stale integration
+  tests: `integration_2pc.rs`, `raft_dst.rs`,
+  `raft_dst_log_conflict.rs`, `raft_fuzz.rs`). When the Rust
+  crates were extracted under `rust/oxide-kv/` (P5 era), these
+  integration tests were copied into `rust/oxide-kv/tests/` but
+  the root-level copies were left in place. Cargo continued to
+  auto-detect them as an anonymous root package's integration
+  tests (parallel to the `src/main.rs` shadow binary that PR #44
+  fixed). The duplicate test binaries were:
+  - **Older versions** (committed against the pre-P7
+    `push_log_entry_for_test` signature; `raft_fuzz.rs` was
+    missing the P8 PR 5 "term-churn ceiling" acceptance gate).
+    They would have failed to compile under `cargo test
+    --workspace` once the P7/P8 signature changes were applied,
+    so CI was silently masking the failure by running each
+    duplicate under its own anonymous package.
+  - **One exact duplicate** (`raft_dst_log_conflict.rs`, 0 diff)
+    that was running the same 5 scenarios twice per CI run.
+  Result: `cargo metadata` now reports 10 test binaries for
+  `oxide-kv` (was 14, after PR #44 also dropped `src/`); `cargo
+  test --workspace` runs each test binary exactly once.
+
+#### Drop leftover root `src/` from crate extraction (PR #44)
+- **Root `src/` directory deleted** (22 files: `main.rs`, `lib.rs`,
+  `client.rs`, `config.rs`, `coordination.rs`, `protocol.rs`,
+  `state_machine.rs`, `raft.rs`, `raft/`). When crates were
+  extracted under `rust/oxide-kv/` and `rust/oxide-kv-client/`
+  (P5 era), the root `src/` was left in place. The root
+  `Cargo.toml` has no `[package]` block (it is a pure virtual
+  workspace), but cargo auto-detected the leftover `src/main.rs`
+  and built an anonymous root binary (`oxide-kv`) shadowing the
+  real one in `rust/oxide-kv/`. The shadow binary was a stale
+  pre-P8 snapshot (missing the `--metrics-addr` flag and the
+  observability bootstrap), so any `cargo run` invoked through
+  the wrong entry point would silently lose `/metrics` coverage.
+  This PR removes the duplicate source tree entirely. All
+  production code now lives under `rust/oxide-kv/src/`.
+- **`data/` directory deleted** (dev WAL/SST leftovers).
+  The path was already in `.gitignore`, so this is local-only.
 - **Root `src/` directory deleted** (22 files: `main.rs`, `lib.rs`,
   `client.rs`, `config.rs`, `coordination.rs`, `protocol.rs`,
   `state_machine.rs`, `raft.rs`, `raft/`). When crates were
@@ -58,12 +99,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`proto/raft.proto`** — two `// src/raft/node.rs::...`
   cross-references rewritten to
   `// rust/oxide-kv/src/raft/node.rs::...`.
-- **`tests/integration_2pc.rs`** — one comment cross-reference
+- **`rust/oxide-kv/tests/integration_2pc.rs`** — one comment cross-reference
   rewritten (`src/raft/timer.rs` →
   `rust/oxide-kv/src/raft/timer.rs`).
 
 ### Added (P8 PR 9: cross-process 3-node smoke test under CI)
-- **`tests/cross_process_smoke.rs`** — boots 3 real
+- **`rust/oxide-kv/tests/cross_process_smoke.rs`** — boots 3 real
   `oxide-kv` processes on TCP ports 9001/9002/9003 (Raft RPC)
   + 9101/9102/9103 (JSON client protocol) + 9100/9200/9300
   (Prometheus `/metrics`) via
@@ -169,7 +210,7 @@ Each gated test has a comment block naming the follow-up.
   OTel collector they don't run).
 - **Tests** — 13 new lib unit tests (5 in `observability::registry`
   + 5 in `observability::server` + 3 in `observability::tracer`)
-  + 4 new integration tests in `tests/metrics_endpoint.rs`
+  + 4 new integration tests in `rust/oxide-kv/tests/metrics_endpoint.rs`
   (200 OK on `/metrics`, 200 OK on `/health`, 404 on
   `/not-metrics`, 404 on `POST /metrics`). Total:
   **255 → 268 lib tests, +4 integration tests.**
@@ -198,7 +239,7 @@ Each gated test has a comment block naming the follow-up.
 - **Tests** — 6 new lib unit tests (3 in `raft/node.rs` for
   `propose_abort_tx`, 3 in `raft/coordinator.rs` for the sweep loop)
   + 4 new state-machine tests + 3 new integration tests in
-  `tests/tx_timeout_abort.rs`. Total: **249 → 255 lib tests,
+  `rust/oxide-kv/tests/tx_timeout_abort.rs`. Total: **249 → 255 lib tests,
   +3 integration tests.**
 
 ### Added (JoinCluster RPC — cold-new-server catch-up)
@@ -342,7 +383,7 @@ Each gated test has a comment block naming the follow-up.
   instead of `become_candidate`. Tests and the simulation
   harness still call `become_candidate` directly when they
   want to skip the probe.
-- **Term-churn ceiling** in `tests/raft_fuzz.rs::run_actions`
+- **Term-churn ceiling** in `rust/oxide-kv/tests/raft_fuzz.rs::run_actions`
   — fails any scenario where a node's `current_term` exceeds
   `MAX_TERM_GROWTH_PER_NODE = 20`. Generous enough to
   tolerate the fuzz distribution's legitimate election /
@@ -456,7 +497,7 @@ Each gated test has a comment block naming the follow-up.
 
 ### Added (P7 nightly fuzz + CI split)
 - New `#[ignore]` test entry
-  `fuzz_nightly_seeds_10000_to_11000` in `tests/raft_fuzz.rs`:
+  `fuzz_nightly_seeds_10000_to_11000` in `rust/oxide-kv/tests/raft_fuzz.rs`:
   1000 scenarios × 25 actions over a fresh seed range
   (10000..11000) that doesn't overlap the default CI
   sweeps. Marked `#[ignore]` so PR pushes stay fast
@@ -477,7 +518,7 @@ Each gated test has a comment block naming the follow-up.
   action list into `shrink_repro`).
 
 ### Added (P7 fuzz shrinker)
-- `tests/raft_fuzz.rs` now includes a delta-debugging
+- `rust/oxide-kv/tests/raft_fuzz.rs` now includes a delta-debugging
   shrinker that turns a failing fuzz scenario into a
   minimal reproduction:
   - `shrink_with_checker` (sync, used by property tests)
@@ -520,7 +561,7 @@ Each gated test has a comment block naming the follow-up.
 
 ### Added (P7 fuzz 2PC coverage)
 - The fuzz harness now drives real two-phase-commit rounds.
-  New `SubmitTx { tx_id, ops }` action in `tests/raft_fuzz.rs`
+  New `SubmitTx { tx_id, ops }` action in `rust/oxide-kv/tests/raft_fuzz.rs`
   calls the production coordinator (`raft::coordinator::
   coordinate_tx`) through a new test bridge
   `SimCluster::run_tx`, so every scenario exercises `BeginTx`
@@ -549,7 +590,7 @@ Each gated test has a comment block naming the follow-up.
   transactions; `reset()` clears it alongside `state`.
 
 ### Added (P7 fuzz harness)
-- New `tests/raft_fuzz.rs` (1 integration test file, 5 test
+- New `rust/oxide-kv/tests/raft_fuzz.rs` (1 integration test file, 5 test
   functions, ~750 lines): seeded-RNG scenario fuzz with three
   cross-check oracles (invariants + reference model + per-node
   log consistency). Action vocabulary: `SubmitSet`,
@@ -580,7 +621,7 @@ Each gated test has a comment block naming the follow-up.
   instead of 1s). The heartbeat loop now observes a
   `StopSignal` and exits cleanly when the node is
   killed. All four call sites updated
-  (`src/main.rs`, `tests/integration_2pc.rs`, two in
+  (`src/main.rs`, `rust/oxide-kv/tests/integration_2pc.rs`, two in
   `src/raft/sim_harness.rs`).
 
 ### Changed (P7 fuzz harness)
@@ -612,7 +653,7 @@ Each gated test has a comment block naming the follow-up.
   Treats `Compact` and the 2PC ops as no-ops (those paths are
   covered by other tests; this is the KV linearizability
   oracle).
-- 3 new DST cross-check scenarios in `tests/raft_dst.rs`
+- 3 new DST cross-check scenarios in `rust/oxide-kv/tests/raft_dst.rs`
   (cross-check against the reference model under various
   fault combinations):
   - `dst_reference_model_cross_check_under_faults` —
@@ -639,7 +680,7 @@ Each gated test has a comment block naming the follow-up.
   `current_term()`. With this fix, callers can now actually
   read the entry at a given log index. This is the
   correctness-required for the reference model's
-  `drain_to` path. Verified: `tests/integration_2pc.rs`
+  `drain_to` path. Verified: `rust/oxide-kv/tests/integration_2pc.rs`
   (3 tests) still pass with the fix.
 
 ### Added (P7 fault coverage: delay / reorder / duplicate / restart)
@@ -675,7 +716,7 @@ Each gated test has a comment block naming the follow-up.
   preserved) — this is a deliberate simplification of "real
   restart" which would discard and reload from disk; the DST
   doesn't need to verify the reload path (covered by
-  `tests/integration_2pc.rs`). Re-registers a fresh inbound
+  `rust/oxide-kv/tests/integration_2pc.rs`). Re-registers a fresh inbound
   channel via `Network::re_register` so the sender side has a
   live receiver after the old one was dropped.
 - `Network::re_register(node_id)` replaces the (possibly dead)
@@ -727,7 +768,7 @@ Each gated test has a comment block naming the follow-up.
   is unchanged (still pub(crate) — checker is in-crate).
 
 ### Added (P7 DST scenarios: log conflict / divergent log)
-- `tests/raft_dst_log_conflict.rs` (5 new integration tests):
+- `rust/oxide-kv/tests/raft_dst_log_conflict.rs` (5 new integration tests):
   - `dst_split_brain_old_leader_truncates_divergent_log`
     (§5.3 + §5.4): old leader appends uncommitted entries
     during a partition, the other partition elects a new
@@ -757,7 +798,7 @@ Each gated test has a comment block naming the follow-up.
   in-crate modules; this just relaxes the visibility.
 
 ### Added (P7 DST scenarios: leader failover + partition heal)
-- `tests/raft_dst.rs` (5 new integration tests):
+- `rust/oxide-kv/tests/raft_dst.rs` (5 new integration tests):
   - `dst_leader_failover_preserves_committed_log` (§5.2 +
     §5.4.1): leader crashes, surviving follower wins election,
     committed log entries survive in the new leader's log.
@@ -1390,7 +1431,7 @@ Each gated test has a comment block naming the follow-up.
 ## Unreleased — PR #14 (3-node 2PC integration tests)
 
 ### Added (P6 — PR #14)
-- **`tests/integration_2pc.rs`** (NEW file, 3 tests, 5.3 s total):
+- **`rust/oxide-kv/tests/integration_2pc.rs`** (NEW file, 3 tests, 5.3 s total):
   - `happy_path_3_nodes_commits_via_quorum` — 3-node cluster, manual
     `become_candidate` leader election, full `BeginTx` round-trip.
     Asserts: client response is `committed`, all three nodes have
@@ -1452,7 +1493,7 @@ Each gated test has a comment block naming the follow-up.
   process.
 
 ### Test suite (147 tests, all passing)
-- 3 new integration tests in `tests/integration_2pc.rs`:
+- 3 new integration tests in `rust/oxide-kv/tests/integration_2pc.rs`:
   - happy path (0.27s)
   - no-vote abort (0.31s)
   - timeout abort (5.04s, dominated by the 5s
@@ -1465,7 +1506,7 @@ Each gated test has a comment block naming the follow-up.
 - `cargo clippy --release -- -D warnings` reports 25 errors, all
   pre-existing on `master`. The PR introduces 0 new clippy
   warnings in any file it modifies (`src/raft/coordinator.rs`,
-  `src/raft/node.rs`, `src/raft.rs`, `tests/integration_2pc.rs`).
+  `src/raft/node.rs`, `src/raft.rs`, `rust/oxide-kv/tests/integration_2pc.rs`).
 
 ### Out of scope (deferred)
 - Leader-step-down mid-round fault injection — covered by the
