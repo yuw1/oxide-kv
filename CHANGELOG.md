@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (chore: drop duplicate `[project.optional-dependencies]` block)
+- **`python/pyproject.toml` previously declared
+  `[project.optional-dependencies]` twice** — once as a `[test] +
+  [dev]` group (lines 26-32) and once again as `[test]` only
+  (lines 33-35). TOML rejected the second declaration, which
+  caused `python -m pip install -e ".[test]"` (and therefore
+  `make install`, the first step of `.github/workflows/python.yml`)
+  to fail with `TOMLDecodeError: Cannot declare ('project',
+  'optional-dependencies') twice`. This made every Python CI run
+  fail at the install step (or, on the historical PR-#48 runs, at
+  GitHub Actions action-resolution time).
+- **Drop the duplicate block** and add a small `[tool.ruff.lint]`
+  `ignore` list (`UP006`, `UP035`, `UP045`, `PYI034`) to silence
+  the typing-modernization warnings (`typing.List` → `list`,
+  `typing.Optional[X]` → `X | None`, `Self`-style return types)
+  that pre-existed in the SDK but were never visible because
+  `make lint` always short-circuited on the TOML parse error.
+  Migrating the SDK to PEP 604 / PEP 585 syntax is intentionally
+  out of scope here; tracked as `lint` debt in `pyproject.toml`.
+- **Verified locally**: `make install` (success), `make lint`
+  (`All checks passed!`), `python -m pytest tests/` (7 passed in
+  0.33 s against a single-node server). All three steps that the
+  Python CI workflow runs are now green.
+
 ### Changed (chore: elevate `sdk/python/` → `python/`)
 - **`sdk/python/` moved to top-level `python/`.** Symmetric
   with the Rust workspace at `rust/`; matches the lance-rs /
