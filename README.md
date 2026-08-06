@@ -246,21 +246,26 @@ against an isolated tempdir; the production binary is not required.
 ### Project layout
 
 ```
-src/
-├── client.rs          Client JSON protocol handler
-├── config.rs          Global config (OnceLock)
-├── lib.rs
-├── main.rs            CLI entry point
-├── protocol.rs        Command / LogEntry / Snapshot / 2PC types
-├── state_machine.rs   LSM tree (memtable + WAL + SSTable)
-├── raft/
-│   ├── node.rs        RaftNode (election, log, snapshot, 2PC, read-index)
-│   ├── proto.rs       Protobuf <-> domain conversions
-│   ├── rpc.rs         TCP+protobuf client/server
-│   ├── storage.rs     WAL + meta + snapshot on disk
-│   └── timer.rs       Election timer
+crates/oxide-kv/
+├── src/
+│   ├── client.rs          Client JSON protocol handler
+│   ├── config.rs          Global config (OnceLock)
+│   ├── lib.rs
+│   ├── main.rs            CLI entry point
+│   ├── protocol.rs        Command / LogEntry / Snapshot / 2PC types
+│   ├── state_machine.rs   LSM tree (memtable + WAL + SSTable)
+│   ├── coordination.rs    2PC coordinator RPC types
+│   ├── observability/     Prometheus /metrics + OpenTelemetry no-op
+│   └── raft/
+│       ├── node.rs        RaftNode (election, log, snapshot, 2PC, read-index)
+│       ├── proto.rs       Protobuf <-> domain conversions
+│       ├── rpc.rs         TCP+protobuf client/server
+│       ├── storage.rs     WAL + meta + snapshot on disk
+│       └── timer.rs       Election timer
+crates/oxide-kv-client/    Async TCP client (JSON line protocol)
 proto/
-└── raft.proto         Wire schema
+├── raft.proto             Raft wire schema
+└── coordination.proto     2PC coordinator wire schema
 ```
 
 ---
