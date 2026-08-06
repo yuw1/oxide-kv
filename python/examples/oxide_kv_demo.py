@@ -5,9 +5,10 @@ Start a single-node server in another terminal:
 
     cargo run --release -- --addr 127.0.0.1:9001 --client-addr 127.0.0.1:9101
 
-Then run this from the repo root:
+Then run this from the python/ directory (or anywhere on sys.path
+once you've run `pip install -e .`):
 
-    python3 examples/oxide_kv_demo.py
+    python3 python/examples/oxide_kv_demo.py
 
 Override the endpoint via OXIDE_KV_HOST / OXIDE_KV_PORT env vars for
 multi-node setups (the demo picks the first reachable leader).
@@ -18,9 +19,10 @@ from __future__ import annotations
 import os
 import sys
 
-# Make the in-tree SDK importable without `pip install`.
-_REPO_ROOT = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
-sys.path.insert(0, os.path.join(_REPO_ROOT, "sdk", "python"))
+# Make the in-tree SDK importable without `pip install`. The demo
+# lives at python/examples/, the SDK package is a sibling at
+# python/oxide_kv/, so the parent of __file__ is python/.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from oxide_kv import Client, TxAbortedError  # noqa: E402
 

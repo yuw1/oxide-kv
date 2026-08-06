@@ -6,14 +6,14 @@ stdlib only, so `pip install` doesn't drag in `protobuf` / `aiohttp` /
 anything else.
 
 The wire protocol is documented inline in `oxide_kv/client.py`; it
-matches the server side in `src/client.rs`. See the top-level
-[README](../../README.md) for the matching Rust server.
+matches the server side in `rust/oxide-kv/src/client.rs`. See
+the top-level [README](../README.md) for the matching Rust server.
 
 ## Install (in-tree development)
 
 ```bash
 # Pick any writable prefix — the SDK is a pure Python package.
-pip install -e sdk/python/
+pip install -e .
 ```
 
 For a release, this directory will publish a wheel to PyPI; the same
@@ -76,8 +76,8 @@ cargo run --release -- \
 Then:
 
 ```bash
-pip install -e 'sdk/python/[test]'
-pytest sdk/python/tests/
+make install
+make test
 ```
 
 Tests skip cleanly if the server isn't reachable — so CI doesn't

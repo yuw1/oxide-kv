@@ -4,6 +4,9 @@ members = [
     "rust/oxide-kv",
     "rust/oxide-kv-client",
 ]
+# The Python package is built separately (setuptools / pip), not by
+# cargo, so keep it out of the workspace resolver's package scan.
+exclude = ["python"]
 
 # Workspace-level settings shared by every member crate.
 [workspace.package]

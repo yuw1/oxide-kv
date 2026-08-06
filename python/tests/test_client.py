@@ -10,7 +10,7 @@ Run with::
     cargo run --release -- \
       --addr 127.0.0.1:9001 \
       --client-addr 127.0.0.1:9101
-    pytest sdk/python/tests/
+    pytest python/tests/
 
 The tests are deliberately simple — they exercise the wire contract,
 not Oxide-KV's correctness (that's what the Rust test suite is for).
@@ -26,8 +26,8 @@ import sys
 import pytest
 
 # Make the in-tree SDK importable without `pip install`.
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-sys.path.insert(0, os.path.join(_REPO_ROOT, "sdk", "python"))
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+sys.path.insert(0, os.path.join(_REPO_ROOT, "python"))
 
 from oxide_kv import (  # noqa: E402  (sys.path tweak above)
     Client,
