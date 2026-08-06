@@ -41,7 +41,7 @@ message Command {
     // replication. They exist on the wire for completeness so the
     // type is closed, but in normal operation they never appear in a
     // log entry that another server observes. See
-    // `src/raft/node.rs::MembershipCoordinator` for the policy.
+    // `crates/oxide-kv/src/raft/node.rs::MembershipCoordinator` for the policy.
     ServerId add_node = 8;          // AddNode { server }
     string remove_node = 9;         // RemoveNode { node_id }
     ConfigurationEntry install_configuration = 10; // InstallConfiguration
@@ -173,7 +173,7 @@ message InstallSnapshotReplyArgs {
 // distinguishes the two via the `RaftMessage.body` tag, not via
 // an inner flag. Wire-level semantics: pre-vote **does not** bump
 // `current_term` on either side (Raft §9.6). See
-// `src/raft/node.rs::handle_pre_vote` for the policy.
+// `crates/oxide-kv/src/raft/node.rs::handle_pre_vote` for the policy.
 // P8 PR 6a: cold-new-server catch-up. A brand-new server (with no
 // peers configured) cannot be reached via the normal AppendEntries
 // path because no one in the cluster knows its address. The new

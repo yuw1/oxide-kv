@@ -42,7 +42,7 @@
 //   `become_candidate` on node 1 to elect a leader quickly and skip
 //   the 5-10s randomized election timer. The production behavior
 //   under real election pressure is covered by the election-timer
-//   unit tests in `src/raft/timer.rs`.
+//   unit tests in `crates/oxide-kv/src/raft/timer.rs`.
 //
 // Design notes
 // ------------

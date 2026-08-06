@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed (chore: drop leftover root src/ from crate extraction)
+- **Root `src/` directory deleted** (22 files: `main.rs`, `lib.rs`,
+  `client.rs`, `config.rs`, `coordination.rs`, `protocol.rs`,
+  `state_machine.rs`, `raft.rs`, `raft/`). When crates were
+  extracted under `crates/oxide-kv/` and `crates/oxide-kv-client/`
+  (P5 era), the root `src/` was left in place. The root
+  `Cargo.toml` has no `[package]` block (it is a pure virtual
+  workspace), but cargo auto-detected the leftover `src/main.rs`
+  and built an anonymous root binary (`oxide-kv`) shadowing the
+  real one in `crates/oxide-kv/`. The shadow binary was a stale
+  pre-P8 snapshot (missing the `--metrics-addr` flag and the
+  observability bootstrap), so any `cargo run` invoked through
+  the wrong entry point would silently lose `/metrics` coverage.
+  This PR removes the duplicate source tree entirely. All
+  production code now lives under `crates/oxide-kv/src/`.
+- **`data/` directory deleted** (dev WAL/SST leftovers).
+  The path was already in `.gitignore`, so this is local-only.
+
+### Changed
+- **`README.md` "Project layout"** — ASCII tree updated from the
+  pre-crate-extraction layout (`src/...`) to the current crate
+  layout (`crates/oxide-kv/src/...`, `crates/oxide-kv-client/`,
+  `proto/raft.proto` + `proto/coordination.proto`). Adds the
+  `observability/` module + `coordination.rs` module + the second
+  proto file that were introduced by P6/P8 but never reflected
+  in the tree.
+- **`ROADMAP.md`** — three merged-PR rows (#11, #12, #13) and the
+  P7 foundation note had `src/...` path references for code that
+  has lived in `crates/oxide-kv/src/...` since the crate
+  extraction. Paths rewritten to the canonical form.
+- **`proto/raft.proto`** — two `// src/raft/node.rs::...`
+  cross-references rewritten to
+  `// crates/oxide-kv/src/raft/node.rs::...`.
+- **`tests/integration_2pc.rs`** — one comment cross-reference
+  rewritten (`src/raft/timer.rs` →
+  `crates/oxide-kv/src/raft/timer.rs`).
+
 ### Added (P8 PR 9: cross-process 3-node smoke test under CI)
 - **`tests/cross_process_smoke.rs`** — boots 3 real
   `oxide-kv` processes on TCP ports 9001/9002/9003 (Raft RPC)
