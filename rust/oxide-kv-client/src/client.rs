@@ -162,7 +162,7 @@ impl Client {
 
     /// Server replies to a mutation sent to a follower with
     /// `{"error": "Not a leader. ..."}` (see
-    /// `crates/oxide-kv/src/client.rs`); surface that as a typed error.
+    /// `rust/oxide-kv/src/client.rs`); surface that as a typed error.
     fn check_not_leader(resp: &Value) -> Result<()> {
         if let Some(msg) = resp.get("error").and_then(Value::as_str) {
             if msg.starts_with("Not a leader") {

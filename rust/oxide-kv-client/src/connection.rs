@@ -2,7 +2,7 @@
 //!
 //! One `Connection` owns a single TCP stream to a node. The wire
 //! contract is one JSON object per line, `\n`-terminated; this is
-//! how the server's `ClientHandler` in `crates/oxide-kv/src/client.rs`
+//! how the server's `ClientHandler` in `rust/oxide-kv/src/client.rs`
 //! reads commands. The connection is **not** thread-safe — wrap with
 //! a lock or open one `Connection` per task.
 

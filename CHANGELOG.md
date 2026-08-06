@@ -7,42 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (chore: rename `crates/` → `rust/`)
+- **Top-level `crates/` directory renamed to `rust/`.** Follows the
+  lance-rs / lance-format convention where the Rust workspace
+  members live under a `rust/` subdirectory of the multi-language
+  repo. Makes room for `python/` (currently `sdk/python/`) to take
+  the symmetric top-level slot in a follow-up.
+- **`Cargo.toml` `members = [...]`** updated to
+  `["rust/oxide-kv", "rust/oxide-kv-client"]`.
+- **Doc / comment path references** rewritten from `crates/oxide-kv/...`
+  to `rust/oxide-kv/...` across: `README.md`, `ROADMAP.md`,
+  `CHANGELOG.md` (this file's earlier P0/P5 history), `proto/raft.proto`,
+  `tests/integration_2pc.rs`, `rust/oxide-kv-client/src/{client,connection,lib}.rs`,
+  `rust/oxide-kv-client/tests/wire_format.rs`,
+  `.github/workflows/{rust,nightly}.yml`.
+- 48 files renamed under git's rename detection (`R` status, no
+  content change inside the files). Rust workspace re-detected on
+  next `cargo build`.
+
 ### Removed (chore: drop leftover root src/ from crate extraction)
 - **Root `src/` directory deleted** (22 files: `main.rs`, `lib.rs`,
   `client.rs`, `config.rs`, `coordination.rs`, `protocol.rs`,
   `state_machine.rs`, `raft.rs`, `raft/`). When crates were
-  extracted under `crates/oxide-kv/` and `crates/oxide-kv-client/`
+  extracted under `rust/oxide-kv/` and `rust/oxide-kv-client/`
   (P5 era), the root `src/` was left in place. The root
   `Cargo.toml` has no `[package]` block (it is a pure virtual
   workspace), but cargo auto-detected the leftover `src/main.rs`
   and built an anonymous root binary (`oxide-kv`) shadowing the
-  real one in `crates/oxide-kv/`. The shadow binary was a stale
+  real one in `rust/oxide-kv/`. The shadow binary was a stale
   pre-P8 snapshot (missing the `--metrics-addr` flag and the
   observability bootstrap), so any `cargo run` invoked through
   the wrong entry point would silently lose `/metrics` coverage.
   This PR removes the duplicate source tree entirely. All
-  production code now lives under `crates/oxide-kv/src/`.
+  production code now lives under `rust/oxide-kv/src/`.
 - **`data/` directory deleted** (dev WAL/SST leftovers).
   The path was already in `.gitignore`, so this is local-only.
 
 ### Changed
 - **`README.md` "Project layout"** — ASCII tree updated from the
   pre-crate-extraction layout (`src/...`) to the current crate
-  layout (`crates/oxide-kv/src/...`, `crates/oxide-kv-client/`,
+  layout (`rust/oxide-kv/src/...`, `rust/oxide-kv-client/`,
   `proto/raft.proto` + `proto/coordination.proto`). Adds the
   `observability/` module + `coordination.rs` module + the second
   proto file that were introduced by P6/P8 but never reflected
   in the tree.
 - **`ROADMAP.md`** — three merged-PR rows (#11, #12, #13) and the
   P7 foundation note had `src/...` path references for code that
-  has lived in `crates/oxide-kv/src/...` since the crate
+  has lived in `rust/oxide-kv/src/...` since the crate
   extraction. Paths rewritten to the canonical form.
 - **`proto/raft.proto`** — two `// src/raft/node.rs::...`
   cross-references rewritten to
-  `// crates/oxide-kv/src/raft/node.rs::...`.
+  `// rust/oxide-kv/src/raft/node.rs::...`.
 - **`tests/integration_2pc.rs`** — one comment cross-reference
   rewritten (`src/raft/timer.rs` →
-  `crates/oxide-kv/src/raft/timer.rs`).
+  `rust/oxide-kv/src/raft/timer.rs`).
 
 ### Added (P8 PR 9: cross-process 3-node smoke test under CI)
 - **`tests/cross_process_smoke.rs`** — boots 3 real
@@ -221,7 +239,7 @@ Each gated test has a comment block naming the follow-up.
   - `handle_join_cluster_returns_term_even_when_rejected`
   - `handle_join_cluster_works_under_joint_config_too`
 - **4 new integration tests** in
-  `crates/oxide-kv/tests/join_cluster.rs`:
+  `rust/oxide-kv/tests/join_cluster.rs`:
   - `cold_new_server_joins_3_node_cluster_via_join_cluster_rpc`
     — end-to-end: cold-new-server -> JoinCluster -> set_peers ->
     propose_add_node -> Joint+Simple commit -> 4-node quorum.
@@ -275,7 +293,7 @@ Each gated test has a comment block naming the follow-up.
   predicates (simple + joint + dual), membership validation,
   propose hooks, post-joint auto-propose, replay correctness.
 - **4 new integration tests** in
-  `crates/oxide-kv/tests/joint_consensus.rs`:
+  `rust/oxide-kv/tests/joint_consensus.rs`:
   - 3-node cluster accepts a 4th node, all 4 form quorum.
   - 4-node cluster drops a node, quorum shrinks to 3.
   - Cannot remove self / last server.
@@ -364,13 +382,13 @@ Each gated test has a comment block naming the follow-up.
     `cargo test --workspace` /
     `cargo build --workspace --examples`. Required by
     PR #34's Cargo workspace restructure (which introduced
-    `crates/oxide-kv/` and `crates/oxide-kv-client/`); the
+    `rust/oxide-kv/` and `rust/oxide-kv-client/`); the
     pre-PR-#34 `cargo build` / `cargo test` invocations no
     longer cover the new client crate.
   - Default PR run now invokes `cargo test --workspace --
     --skip fuzz_` instead of the full workspace sweep. The
     four `fuzz_*_seeds_*` scenarios + `fuzz_smoke_single_seed`
-    (in `crates/oxide-kv/tests/raft_fuzz.rs`) cost ~8
+    (in `rust/oxide-kv/tests/raft_fuzz.rs`) cost ~8
     minutes on an ubuntu-latest runner and are entirely
     redundant with the nightly sweep (which runs
     `fuzz_nightly_seeds_10000_to_11000` — 1000 scenarios ×
@@ -379,7 +397,7 @@ Each gated test has a comment block naming the follow-up.
     skipped (millisecond-scale unit tests, not scenarios).
 - `.github/workflows/nightly.yml`:
   - Updated fuzz-test path to
-    `crates/oxide-kv/tests/raft_fuzz.rs` (moved by PR #34).
+    `rust/oxide-kv/tests/raft_fuzz.rs` (moved by PR #34).
   - Added `--workspace` to `cargo build --release` /
     `cargo test --release` invocations (required since PR
     #34's workspace restructure).

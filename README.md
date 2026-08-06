@@ -246,7 +246,7 @@ against an isolated tempdir; the production binary is not required.
 ### Project layout
 
 ```
-crates/oxide-kv/
+rust/oxide-kv/
 ├── src/
 │   ├── client.rs          Client JSON protocol handler
 │   ├── config.rs          Global config (OnceLock)
@@ -262,7 +262,7 @@ crates/oxide-kv/
 │       ├── rpc.rs         TCP+protobuf client/server
 │       ├── storage.rs     WAL + meta + snapshot on disk
 │       └── timer.rs       Election timer
-crates/oxide-kv-client/    Async TCP client (JSON line protocol)
+rust/oxide-kv-client/    Async TCP client (JSON line protocol)
 proto/
 ├── raft.proto             Raft wire schema
 └── coordination.proto     2PC coordinator wire schema
@@ -490,7 +490,7 @@ What this means in practice:
   check), upgrade to the `pre-vote`-enabled build once P8
   PR 5 lands.
 
-The nightly fuzz sweep (`crates/oxide-kv/tests/raft_fuzz.rs`)
+The nightly fuzz sweep (`rust/oxide-kv/tests/raft_fuzz.rs`)
 uses a `DriveElection` action that injects elections directly,
 so it does **not** cover this timer-collision scenario. A
 follow-up test using the real timer loop would have caught

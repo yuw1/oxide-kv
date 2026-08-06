@@ -17,17 +17,17 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: Install protoc
-      # Required by build.rs (prost-build) inside crates/oxide-kv.
+      # Required by build.rs (prost-build) inside rust/oxide-kv.
       # Not pre-installed on ubuntu-latest runners.
       run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
     - name: Build (workspace)
       # Cargo workspace introduced by PR #34; must use `--workspace` so
-      # both `crates/oxide-kv` (server) and `crates/oxide-kv-client`
+      # both `rust/oxide-kv` (server) and `rust/oxide-kv-client`
       # (new client crate) are built.
       run: cargo build --workspace --verbose
     - name: Run tests (workspace, default only)
       # Default CI skips the fuzz scenarios in
-      # `crates/oxide-kv/tests/raft_fuzz.rs` (`fuzz_default_seeds_*`,
+      # `rust/oxide-kv/tests/raft_fuzz.rs` (`fuzz_default_seeds_*`,
       # `fuzz_long_seeds_*`, `fuzz_short_seeds_*`, `fuzz_smoke_single_seed`).
       # Those scenarios take ~8 minutes on a runner and are entirely
       # redundant with the nightly sweep (see
@@ -39,7 +39,7 @@ jobs:
       #
       # The cross-process smoke test binary
       # (`tests/cross_process_smoke.rs`) is gated behind the
-      # `cross-process-smoke` feature (see `crates/oxide-kv/Cargo.toml`),
+      # `cross-process-smoke` feature (see `rust/oxide-kv/Cargo.toml`),
       # so it's not built or run by this default sweep. The dedicated
       # smoke step below enables that feature and runs the suite
       # end-to-end with `--test-threads=1` and a release binary.
@@ -47,7 +47,7 @@ jobs:
     - name: Run examples (workspace)
       # `--examples` is part of `--all-targets`, but call it explicitly so
       # future readers see the intent. The CLI example under
-      # `crates/oxide-kv/examples/oxide_kv_cli.rs` exercises the new
+      # `rust/oxide-kv/examples/oxide_kv_cli.rs` exercises the new
       # `oxide-kv-client` crate end-to-end at build time.
       run: cargo build --workspace --examples --verbose
     - name: Cross-process 3-node smoke test (P8 PR 9)
@@ -61,7 +61,7 @@ jobs:
       # *surfaces* but does not gate on.
       #
       # The test binary is gated behind the `cross-process-smoke`
-      # cargo feature (see `crates/oxide-kv/Cargo.toml` [[test]]
+      # cargo feature (see `rust/oxide-kv/Cargo.toml` [[test]]
       # block: `required-features = ["cross-process-smoke"]`). This
       # stops the default CI test sweep from compiling + running
       # the heavy suite in parallel with the other test binaries,

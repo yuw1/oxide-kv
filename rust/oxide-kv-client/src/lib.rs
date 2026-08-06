@@ -6,7 +6,7 @@
 //! implementation.
 //!
 //! Wire format is one JSON object per line, `\n`-terminated.
-//! Matches `crates/oxide-kv/src/client.rs` (the server's `ClientHandler`).
+//! Matches `rust/oxide-kv/src/client.rs` (the server's `ClientHandler`).
 //!
 //! Quick start:
 //! ```no_run
