@@ -29,14 +29,12 @@ import pytest
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, os.path.join(_REPO_ROOT, "python"))
 
-from oxide_kv import (  # noqa: E402  (sys.path tweak above)
+from oxide_kv import (
     Client,
     NotLeaderError,
     OxideKVError,
-    TxAbortedError,
     Transaction,
 )
-
 
 HOST = os.environ.get("OXIDE_KV_TEST_HOST", "127.0.0.1")
 PORT = int(os.environ.get("OXIDE_KV_TEST_PORT", "9101"))

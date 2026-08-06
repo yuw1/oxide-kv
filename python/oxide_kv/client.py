@@ -27,19 +27,17 @@ from __future__ import annotations
 
 import json
 import socket
-from contextlib import contextmanager
-from dataclasses import dataclass, field
-from typing import Iterator, List, Optional, Tuple, Union
-
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
 
 # Public API surface
 __all__ = [
     "Client",
-    "Transaction",
-    "TxResult",
-    "OxideKVError",
     "NotLeaderError",
+    "OxideKVError",
+    "Transaction",
     "TxAbortedError",
+    "TxResult",
 ]
 
 
@@ -91,7 +89,7 @@ class _Connection:
         self._sock: Optional[socket.socket] = None
         self._buf: str = ""
 
-    def __enter__(self) -> "_Connection":
+    def __enter__(self) -> _Connection:
         self._sock = socket.create_connection(
             (self.host, self.port), timeout=self.timeout
         )
@@ -142,16 +140,16 @@ class Transaction:
         result = tx.commit()
     """
 
-    def __init__(self, client: "Client", tx_id: str) -> None:
+    def __init__(self, client: Client, tx_id: str) -> None:
         self._client = client
         self.tx_id = tx_id
         self.ops: List[dict] = []
 
-    def set(self, key: str, value: str) -> "Transaction":
+    def set(self, key: str, value: str) -> Transaction:
         self.ops.append({"Put": {"key": key, "value": value}})
         return self
 
-    def delete(self, key: str) -> "Transaction":
+    def delete(self, key: str) -> Transaction:
         self.ops.append({"Delete": {"key": key}})
         return self
 
@@ -165,7 +163,7 @@ class Transaction:
 
     # ----- context manager -----
 
-    def __enter__(self) -> "Transaction":
+    def __enter__(self) -> Transaction:
         # The context manager doesn't enforce a server-side abort on
         # exception; that would require an async hook we don't have
         # on this sync SDK. Callers who want auto-abort should
@@ -200,7 +198,7 @@ class Client:
     # ----- factory methods -----
 
     @classmethod
-    def connect(cls, host: str, port: int, timeout: float = 5.0) -> "Client":
+    def connect(cls, host: str, port: int, timeout: float = 5.0) -> Client:
         """Open a single-node connection. Will raise NotLeaderError
         on the first mutation if the node isn't a leader."""
         conn = _Connection(host, port, timeout)
@@ -216,7 +214,7 @@ class Client:
         cls,
         endpoints: List[Tuple[str, int]],
         timeout: float = 5.0,
-    ) -> "Client":
+    ) -> Client:
         """Try each (host, port) until one accepts a Set without
         returning the not-leader error. Returns a connected Client
         pointing at that leader; raises OxideKVError if none worked.
@@ -250,7 +248,7 @@ class Client:
 
     # ----- context manager -----
 
-    def __enter__(self) -> "Client":
+    def __enter__(self) -> Client:
         return self
 
     def __exit__(self, *exc) -> None:

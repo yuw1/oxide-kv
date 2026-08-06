@@ -15,11 +15,11 @@ from .client import (
 
 __all__ = [
     "Client",
-    "Transaction",
-    "TxResult",
-    "OxideKVError",
     "NotLeaderError",
+    "OxideKVError",
+    "Transaction",
     "TxAbortedError",
+    "TxResult",
 ]
 
 __version__ = "0.1.0"
