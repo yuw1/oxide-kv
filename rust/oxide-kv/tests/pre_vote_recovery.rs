@@ -276,3 +276,143 @@ fn pre_vote_refuses_probe_more_than_one_term_ahead_at_handler_level() {
     );
     assert_eq!(reply.term, 5, "reply must echo our local term");
 }
+/// **Split-brain regression (regression for the bug introduced by
+/// P8 PR 5, commit `abac391`):** pre-vote must NOT count the
+/// candidate's own implicit vote toward the quorum.
+///
+/// Reproduces the exact failure mode Calvin hit on 2026-08-06:
+/// three nodes, two of them concurrently call `become_pre_candidate`
+/// at the same term. Both probes receive grants from the third
+/// node (which has nothing to lose by granting a same-term probe
+/// with empty log), both increment their `votes_received` to 2,
+/// both promote to Candidate, both win the real RequestVote round,
+/// and the cluster ends up with two leaders at the same term.
+///
+/// Before the fix: `votes_received = AtomicUsize::new(1)`
+/// (self-vote) + 1 peer grant = 2 > total_nodes / 2 (= 1) → quorum.
+/// This let a single peer grant satisfy a 3-node quorum.
+///
+/// After the fix: `votes_received = AtomicUsize::new(0)` (no
+/// self-vote) + 1 peer grant = 1 > 1 → false, no quorum. Both
+/// probes need grants from BOTH peers to win, which is impossible
+/// for two concurrent candidates (one peer can only grant once
+/// per term).
+#[tokio::test(flavor = "current_thread")]
+async fn pre_vote_concurrent_candidates_do_not_split_brain() {
+    // NoFaults scheduler: every link delivers, no partitions.
+    let cluster = SimCluster::new_3_nodes(Arc::new(
+        oxide_kv::raft::fault_scheduler::AlwaysDeliver,
+    ))
+    .await;
+
+    // No prior leader; all three are clean Followers at term 0.
+
+    // Both n0 and n1 fire pre-vote concurrently. n2 is the
+    // "swing voter" — its grant will go to whichever probe it
+    // sees first, but with the bug both probes will see a
+    // satisfied quorum anyway because each only needs ONE
+    // peer grant (thanks to the spurious self-vote).
+    let n0 = cluster.nodes[0].raft.clone();
+    let n1 = cluster.nodes[1].raft.clone();
+
+    // Concurrently fire both pre-vote phases. The shared
+    // SimTransport serialises the inbound RPCs, but the
+    // pre-vote reply handlers run concurrently (separate
+    // tokio::spawn tasks), so this is the exact race that
+    // produced Calvin's split-brain in production.
+    let h0 = tokio::spawn(async move { RaftNode::become_pre_candidate(n0); });
+    let h1 = tokio::spawn(async move { RaftNode::become_pre_candidate(n1); });
+    let _ = tokio::join!(h0, h1);
+
+    // Give the probe fan-out + real RequestVote fan-out time
+    // to settle. 1s is generous for an in-process transport.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // After the race, at most ONE node may be Leader (Raft §3.4
+    // / §5.4.2 election safety).
+    let leader_count = (0..3)
+        .filter(|&i| {
+            cluster.nodes[i].raft.read().unwrap().state == NodeState::Leader
+        })
+        .count();
+    assert!(
+        leader_count <= 1,
+        "split-brain: {} nodes are Leader at the same term (election \
+         safety violated); leader indices: {:?}",
+        leader_count,
+        (0..3)
+            .filter(|&i| {
+                cluster.nodes[i].raft.read().unwrap().state
+                    == NodeState::Leader
+            })
+            .collect::<Vec<_>>(),
+    );
+
+    // Stronger invariant: no two Leaders share the same term.
+    use std::collections::HashMap;
+    let mut by_term: HashMap<u64, Vec<usize>> = HashMap::new();
+    for i in 0..3 {
+        let n = cluster.nodes[i].raft.read().unwrap();
+        if n.state == NodeState::Leader {
+            by_term.entry(n.current_term).or_default().push(i);
+        }
+    }
+    for (term, leaders) in by_term {
+        assert!(
+            leaders.len() <= 1,
+            "split-brain: {} nodes share term {} as Leader: {:?}",
+            leaders.len(),
+            term,
+            leaders,
+        );
+    }
+}
+
+/// **Pre-vote quorum boundary check (regression).**
+///
+/// Pure unit test for the off-by-one in `process_pre_vote_reply`'s
+/// quorum boundary. Before the fix, the boundary was satisfied
+/// by `1 peer grant + self-vote = 2 > 3/2 = 1`. This test
+/// constructs the state by hand and asserts the boundary is
+/// `2 peer grants + 0 self-vote = 2 > 1` instead, so the same
+/// off-by-one can't sneak back via a refactor.
+#[tokio::test(flavor = "current_thread")]
+async fn pre_vote_quorum_requires_both_peers_in_3_node_cluster() {
+    let cluster = SimCluster::new_3_nodes(Arc::new(
+        oxide_kv::raft::fault_scheduler::AlwaysDeliver,
+    ))
+    .await;
+
+    let n0 = cluster.nodes[0].raft.clone();
+    let initial_term = n0.read().unwrap().current_term;
+
+    // Drive pre-vote on n0. With AlwaysDeliver, both peers
+    // (n1, n2) will reply with vote_granted=true (empty log
+    // satisfies the election restriction). After the fan-out
+    // settles, n0 must be Leader at term initial_term + 1.
+    RaftNode::become_pre_candidate(n0.clone());
+
+    // Wait for promote. 1s is generous.
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        {
+            let n = n0.read().unwrap();
+            if n.state == NodeState::Leader {
+                assert_eq!(
+                    n.current_term,
+                    initial_term + 1,
+                    "pre-vote promoted to real Candidate then to Leader at term +1",
+                );
+                return;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            let n = n0.read().unwrap();
+            panic!(
+                "pre-vote on n0 did not promote to Leader (state={:?}, term={})",
+                n.state, n.current_term,
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}

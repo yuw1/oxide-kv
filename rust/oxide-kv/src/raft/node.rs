@@ -1578,15 +1578,28 @@ impl RaftNode {
         }
 
         let total_nodes = peers.len() + 1;
-        let votes_received = Arc::new(std::sync::atomic::AtomicUsize::new(1)); // self-vote counts
+        // Pre-vote does NOT self-vote: a pre-vote is a *probe* asking
+        // peers "would you grant me a real RequestVote if I started
+        // one?". The candidate hasn't actually voted for itself yet
+        // (that happens in `promote_to_candidate_locked`, which runs
+        // only after a peer quorum has granted the probe). Counting
+        // self-vote here would mean a single peer grant satisfies
+        // the quorum for a 3-node cluster, which lets two candidates
+        // each probe concurrently and both win — producing split-
+        // brain at the new term.
+        //
+        // Initializing to 0 means the quorum check below requires
+        // `count > total_nodes / 2`, i.e. `count >= 2` for 3 nodes,
+        // i.e. both peers must grant before we promote.
+        let votes_received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         println!(
             "🔎 [PreVote] Node {} probing at Term {} (current {} + 1)",
             candidate_id, probed_term, probed_term - 1
         );
 
-        // Single-node cluster: we are already a majority of 1. Skip
-        // the RPC fan-out entirely and promote directly.
+        // Single-node cluster: there are no peers to probe. Promote
+        // straight to Candidate → Leader via the existing fast path.
         if total_nodes == 1 {
             let mut n = raft_node.write().unwrap();
             if n.state == NodeState::PreCandidate {
@@ -1799,6 +1812,38 @@ impl RaftNode {
             return AppendReplyArgs { term: self.current_term, success: false };
         }
 
+        // Two cases land here: args.term > current_term (newer
+        // leader observed) or args.term == current_term (heartbeat
+        // from the current round).
+        //
+        // Both cases should NOT clobber an incumbent Leader. If we
+        // are the Leader at this term, any incoming AppendEntries is
+        // either stale (lower term, handled above) or a competing
+        // claim (same term, can't happen in a healthy Raft because
+        // §5.4.1 election safety forbids two leaders per term).
+        // Either way, refusing without stepping down is the safe
+        // choice — stepping down here is what was producing leader
+        // self-election timeouts (the node briefly demoted itself
+        // on every heartbeat round, then re-promoted on the next
+        // election timer tick, churning the term every ~7s).
+        // Same-term AE on an incumbent Leader is a duplicate or stale
+        // message from a peer that hasn't yet observed our win.
+        // Refusing without stepping down is the safe choice —
+        // stepping down here is what was producing leader self-
+        // election timeouts (the node briefly demoted itself on
+        // every heartbeat round, then re-promoted on the next
+        // election timer tick, churning the term every ~7s).
+        //
+        // CRITICAL: this same-term check must come BEFORE the
+        // higher-term step-down. A higher term DOES demote us even
+        // if we are Leader (Raft §5.1: when a candidate's term is
+        // greater than its own, a server steps down to Follower).
+        // Only same-term AE from a peer gets the "you're a duplicate,
+        // I'll stay Leader" treatment.
+        if args.term == self.current_term && self.state == NodeState::Leader {
+            return AppendReplyArgs { term: self.current_term, success: false };
+        }
+
         if args.term > self.current_term {
             self.current_term = args.term;
             self.vote_for = None;
@@ -1848,6 +1893,18 @@ impl RaftNode {
     pub fn handle_install_snapshot(&mut self, args: &InstallSnapshotArgs) -> InstallSnapshotReplyArgs {
         // 1. Term check
         if args.term < self.current_term {
+            return InstallSnapshotReplyArgs { term: self.current_term };
+        }
+        // Same defense as handle_append_entries: same-term snapshot on
+        // an incumbent Leader is a duplicate or stale message from a
+        // peer that hasn't observed our win yet. Refusing without
+        // stepping down is the safe choice — stepping down here is
+        // what was producing leader self-election timeouts.
+        //
+        // CRITICAL: this same-term check must come BEFORE the
+        // higher-term step-down. A higher term DOES demote us even
+        // if we are Leader.
+        if args.term == self.current_term && self.state == NodeState::Leader {
             return InstallSnapshotReplyArgs { term: self.current_term };
         }
         if args.term > self.current_term {
@@ -4089,5 +4146,122 @@ mod tests {
         let stale =
             node.pending_txs_older_than(std::time::Duration::from_millis(100));
         assert_eq!(stale, vec!["node-old".to_string()]);
+    }
+
+    // ----------------------------------------------------------------
+    // Leader-demote regression (Raft §5.2 + §5.4.1 election safety)
+    //
+    // Before the fix: `handle_append_entries` unconditionally set
+    // `state = Follower` after the term check, even when the
+    // receiver was the incumbent Leader at the same term. This
+    // caused the Leader to step down on every heartbeat round from
+    // a peer (peer is still alive but doesn't know we won the
+    // election yet, so it sends an AE at the same term it's been
+    // using). The node would then re-promote on the next election
+    // timeout tick, churning the term every ~7s. Same root cause
+    // affected `handle_install_snapshot`.
+    // ----------------------------------------------------------------
+
+    /// An incumbent Leader must NOT step down when receiving
+    /// AppendEntries at the same term — §5.4.1 election safety
+    /// forbids two leaders per term, so the peer is either stale
+    /// or duplicative. Returning failure without demoting is the
+    /// only safe choice.
+    #[test]
+    fn leader_refuses_append_entries_at_same_term_without_stepping_down() {
+        let (_d, mut node) = make_node("n1", vec!["n2".into(), "n3".into()]);
+        node.current_term = 5;
+        node.state = NodeState::Leader;
+        let initial_term = node.current_term;
+        let initial_state = node.state.clone();
+
+        let args = append_args(5, "n2", 0, 0, vec![], 0);
+        let reply = node.handle_append_entries(&args);
+
+        // Must refuse (success = false) but keep the same term and
+        // the same Leader state.
+        assert!(!reply.success, "incumbent Leader must refuse peer AE at same term");
+        assert_eq!(reply.term, initial_term, "reply must echo our term");
+        assert_eq!(
+            node.state, initial_state,
+            "incumbent Leader must not be demoted by a same-term AE"
+        );
+        assert_eq!(
+            node.current_term, initial_term,
+            "term must not change"
+        );
+    }
+
+    /// An incumbent Leader MUST step down when receiving
+    /// AppendEntries at a HIGHER term (Raft §5.1: "If a candidate's
+    /// term is greater than its own, a server steps down to
+    /// Follower"). This is the asymmetry with the same-term case
+    /// above: same-term AE = duplicate/stale, refuse; higher-term
+    /// AE = the cluster has moved on, demote and adopt the new
+    /// term. The earlier fix broke this case by checking Leader
+    /// status before the term comparison; the new order is the
+    /// only correct one.
+    #[test]
+    fn leader_steps_down_on_append_entries_at_higher_term() {
+        let (_d, mut node) = make_node("n1", vec!["n2".into(), "n3".into()]);
+        node.current_term = 5;
+        node.state = NodeState::Leader;
+
+        let args = append_args(7, "n2", 0, 0, vec![], 0);
+        let reply = node.handle_append_entries(&args);
+
+        // Must adopt the higher term and step down to Follower.
+        assert_eq!(
+            reply.term, 7,
+            "reply must echo the higher term"
+        );
+        assert_eq!(
+            node.current_term, 7,
+            "we must adopt the higher term"
+        );
+        assert_eq!(
+            node.state,
+            NodeState::Follower,
+            "Leader MUST step down on a higher-term AE (Raft §5.1)"
+        );
+    }
+
+    /// Same-term InstallSnapshot on a Leader is also a no-op for
+    /// the receiver's state. The Leader's log + state machine
+    /// already represent the latest committed data; a snapshot
+    /// from a same-term peer can only be stale.
+    #[test]
+    fn leader_refuses_install_snapshot_at_same_term_without_stepping_down() {
+        let (_d, mut node) = make_node("n1", vec!["n2".into(), "n3".into()]);
+        node.current_term = 7;
+        node.state = NodeState::Leader;
+
+        // Build a minimal snapshot. handle_install_snapshot
+        // should bail before touching any of it.
+        let args = InstallSnapshotArgs {
+            term: 7,
+            leader_id: "n2".into(),
+            last_included_index: 0,
+            last_included_term: 0,
+            snapshot: crate::protocol::Snapshot {
+                last_included_index: 0,
+                last_included_term: 0,
+                data: std::collections::HashMap::new(),
+            },
+        };
+        let reply = node.handle_install_snapshot(&args);
+        assert_eq!(
+            reply.term, 7,
+            "reply must echo our term"
+        );
+        assert_eq!(
+            node.state,
+            NodeState::Leader,
+            "incumbent Leader must not be demoted by a same-term snapshot"
+        );
+        assert_eq!(
+            node.current_term, 7,
+            "term must not change"
+        );
     }
 }
