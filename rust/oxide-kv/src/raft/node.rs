@@ -3,6 +3,7 @@ use crate::coordination::{VoteRequest, VoteResponse};
 use crate::protocol::{config_quorum_reached_index, AbortTxError, Command, Configuration, LogEntry, MembershipError, ReadIndex, ServerId, Snapshot, TxDecision, Vote};
 use crate::raft::clock::{system_clock, Clock};
 use crate::raft::net::{system_transport, Transport};
+use tracing::{debug, error, info, warn};
 use crate::raft::rpc::{
     AppendEntriesArgs, AppendReplyArgs, InstallSnapshotArgs, InstallSnapshotReplyArgs,
     JoinClusterRequest, JoinClusterResponse, RaftMessage, RequestVoteArgs, VoteResponseArgs,
@@ -635,7 +636,7 @@ impl RaftNode {
             self.vote_for = None;
 
             if let Err(e) = self.storage.save_meta(self.current_term.clone(), self.vote_for.clone()) {
-                eprintln!("[Critical] Failed to save metadata after term update: {}", e);
+                error!(error = %e, "failed to save metadata after term update");
             }
         }
 
@@ -733,10 +734,7 @@ impl RaftNode {
             if let Err(e) =
                 self.storage.save_meta(self.current_term, self.vote_for.clone())
             {
-                eprintln!(
-                    "[Critical] Failed to save metadata after term update in tx_vote: {}",
-                    e
-                );
+                error!(error = %e, "failed to save metadata after term update in tx_vote");
             }
             return VoteResponse {
                 term: self.current_term,
@@ -840,7 +838,7 @@ impl RaftNode {
         };
 
         if let Err(e) = self.storage.append_wal_log(&entry) {
-            eprintln!("[Error] Failed to append wal log: {}", e);
+            error!(error = %e, "failed to append wal log");
             return false;
         }
 
@@ -871,7 +869,7 @@ impl RaftNode {
                 command,
             };
             if let Err(e) = self.storage.append_wal_log(&entry) {
-                eprintln!("[Error] Failed to append wal log: {}", e);
+                error!(error = %e, "failed to append wal log");
                 return false;
             }
             self.log.push(entry);
@@ -944,7 +942,7 @@ impl RaftNode {
             command: Command::InstallConfiguration { config: joint },
         };
         if let Err(e) = self.storage.append_wal_log(&entry) {
-            eprintln!("[Error] Failed to append Joint config: {}", e);
+            error!(error = %e, "failed to append Joint config entry");
             return Err(MembershipError::StorageError(e.to_string()));
         }
         self.log.push(entry);
@@ -995,7 +993,7 @@ impl RaftNode {
             command: Command::InstallConfiguration { config: joint },
         };
         if let Err(e) = self.storage.append_wal_log(&entry) {
-            eprintln!("[Error] Failed to append Joint config: {}", e);
+            error!(error = %e, "failed to append Joint config entry");
             return Err(MembershipError::StorageError(e.to_string()));
         }
         self.log.push(entry);
@@ -1181,13 +1179,13 @@ impl RaftNode {
                         // encounter this because each send_*_rpc helper
                         // unwrapped the variant itself; with the trait
                         // surface, the dispatch happens at the caller.
-                        eprintln!(
-                            "[Protocol] AppendEntries to {} got unexpected reply variant {:?}",
-                            peer_addr_clone,
-                            std::mem::discriminant(&other)
+                        warn!(
+                            peer = %peer_addr_clone,
+                            discriminant = ?std::mem::discriminant(&other),
+                            "AppendEntries got unexpected reply variant"
                         );
                     }
-                    Err(e) => eprintln!("[Network] RPC error with {}: {}", peer_addr_clone, e),
+                    Err(e) => warn!(peer = %peer_addr_clone, error = %e, "RPC error"),
                 }
             });
         }
@@ -1230,9 +1228,10 @@ impl RaftNode {
                 .unwrap_or(0);
             if log_term == self.current_term {
                 self.commit_index = highest_quorum_index;
-                println!(
-                    "🚀 [Commit] Majority reached under {:?}! Commit Index advanced to {}",
-                    self.current_config, highest_quorum_index
+                info!(
+                    config = ?self.current_config,
+                    commit_index = highest_quorum_index,
+                    "majority reached; commit_index advanced"
                 );
                 self.apply_logs();
             }
@@ -1244,7 +1243,7 @@ impl RaftNode {
             let log_idx_to_apply = self.last_applied as usize;
 
             let Some(entry) = self.log.get(log_idx_to_apply) else {
-                eprintln!("[Critical] Log entry {} not found during apply", self.last_applied + 1);
+                error!(index = self.last_applied + 1, "log entry not found during apply");
                 break;
             };
             // Snapshot the command first so we can drop the
@@ -1271,35 +1270,34 @@ impl RaftNode {
                 match &cmd {
                     Command::Set { key, value } => {
                         let _ = state_machine.set(&*key.clone(), &*value.clone());
-                        println!("✅ [Apply] Index {}: SET {} = {}", entry_idx, key, value);
+                        debug!(index = entry_idx, key = %key, value = %value, "apply: SET");
                     }
                     Command::Delete { key } => {
                         let _ = state_machine.delete(&key);
-                        println!("✅ [Apply] Index {}: DELETE {}", entry_idx, key);
+                        debug!(index = entry_idx, key = %key, "apply: DELETE");
                     }
                     Command::BeginTx { tx_id, ops } => {
                         let _ = state_machine.begin_tx(tx_id.clone(), ops.clone());
-                        println!("✅ [Apply] Index {}: BEGIN_TX {} ({} ops)", entry_idx, tx_id, ops.len());
+                        debug!(index = entry_idx, tx_id = %tx_id, ops = ops.len(), "apply: BEGIN_TX");
                     }
                     Command::DecideTx { tx_id, decision } => {
                         let _ = state_machine.decide_tx(tx_id, decision.clone());
-                        println!("✅ [Apply] Index {}: DECIDE_TX {} = {:?}", entry_idx, tx_id, decision);
+                        debug!(index = entry_idx, tx_id = %tx_id, decision = ?decision, "apply: DECIDE_TX");
                     }
                     _ => unreachable!("needs_sm implies one of the above"),
                 }
             } else {
                 match &cmd {
-                    Command::Get { .. } => println!("🔍 [Apply] Index {}: GET (no-op)", entry_idx),
-                    Command::Compact => println!("🔍 [Apply] Index {}: Compact marker (no-op)", entry_idx),
+                    Command::Get { .. } => debug!(index = entry_idx, "apply: GET (no-op)"),
+                    Command::Compact => debug!(index = entry_idx, "apply: Compact marker (no-op)"),
                     Command::InstallConfiguration { config } => {
                         // P8 PR 6: install the new membership configuration.
                         // Update `current_config`, derive `peers` from
                         // `all_servers()`, and (leader-only) propose
                         // the Simple(new) entry that follows a Joint.
-                        println!(
-                            "📐 [Apply] Index {}: InstallConfiguration {}",
-                            entry_idx,
-                            match config {
+                        debug!(
+                            index = entry_idx,
+                            config = match config {
                                 Configuration::Simple(s) => format!("Simple({} servers)", s.len()),
                                 Configuration::Joint { old, new } => format!("Joint(old:{}, new:{})", old.len(), new.len()),
                             }
@@ -1315,11 +1313,10 @@ impl RaftNode {
                     // no-op and warn (a missing warn-then-noop
                     // silently skips).
                     Command::AddNode { .. } | Command::RemoveNode { .. } => {
-                        eprintln!(
-                            "[WARN] Index {}: client-facing {:?} appeared in committed log; \
-                             this should have been translated to InstallConfiguration",
-                            entry_idx,
-                            std::mem::discriminant(&cmd)
+                        warn!(
+                            index = entry_idx,
+                            discriminant = ?std::mem::discriminant(&cmd),
+                            "client-facing AddNode/RemoveNode appeared in committed log; this should have been translated to InstallConfiguration"
                         );
                     }
                     _ => {}
@@ -1384,10 +1381,7 @@ impl RaftNode {
                     },
                 };
                 if let Err(e) = self.storage.append_wal_log(&entry) {
-                    eprintln!(
-                        "[Error] Failed to append Simple(new) log entry: {}",
-                        e
-                    );
+                    error!(error = %e, "failed to append Simple(new) log entry");
                     return;
                 }
                 self.log.push(entry);
@@ -1397,10 +1391,9 @@ impl RaftNode {
                 // commit advancement paths that already have a sync
                 // in flight, and triggering another one synchronously
                 // risks lock contention.
-                println!(
-                    "📐 [Membership] Leader auto-proposed Simple(new) \
-                     at index {} after Joint commit",
-                    new_index
+                info!(
+                    index = new_index,
+                    "leader auto-proposed Simple(new) after Joint commit"
                 );
             }
         }
@@ -1445,11 +1438,10 @@ impl RaftNode {
             }
         }
         self.last_applied = self.log.len() as u64;
-        println!(
-            "✅ [Replay] Successfully replayed {} logs to state machine \
-             (current membership: {:?})",
-            self.log.len(),
-            self.current_config
+        info!(
+            log_count = self.log.len(),
+            membership = ?self.current_config,
+            "replayed logs to state machine"
         );
     }
 
@@ -1498,7 +1490,7 @@ impl RaftNode {
     pub fn become_candidate(raft_node: Arc<RwLock<Self>>) {
         let mut node = raft_node.write().unwrap();
         Self::promote_to_candidate_locked(&mut node);
-        println!("🗳️ Node {} candidate for Term {}", node.node_id, node.current_term);
+        info!(node = %node.node_id, term = node.current_term, "became candidate");
         let term = node.current_term;
         let state = node.state.clone();
         drop(node);
@@ -1593,9 +1585,10 @@ impl RaftNode {
         // i.e. both peers must grant before we promote.
         let votes_received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-        println!(
-            "🔎 [PreVote] Node {} probing at Term {} (current {} + 1)",
-            candidate_id, probed_term, probed_term - 1
+        info!(
+            node = %candidate_id,
+            probed_term,
+            "pre-vote probe"
         );
 
         // Single-node cluster: there are no peers to probe. Promote
@@ -1638,13 +1631,13 @@ impl RaftNode {
                         .await;
                     }
                     Ok(other) => {
-                        eprintln!(
-                            "[Protocol] PreVote to {} got unexpected reply variant {:?}",
-                            peer_addr,
-                            std::mem::discriminant(&other)
+                        warn!(
+                            peer = %peer_addr,
+                            discriminant = ?std::mem::discriminant(&other),
+                            "PreVote got unexpected reply variant"
                         );
                     }
-                    Err(e) => eprintln!("[Network] PreVote RPC error with {}: {}", peer_addr, e),
+                    Err(e) => warn!(peer = %peer_addr, error = %e, "PreVote RPC error"),
                 }
             });
         }
@@ -1705,9 +1698,10 @@ impl RaftNode {
         drop(n);
         debug_assert_eq!(state_after, NodeState::Candidate);
         debug_assert_eq!(new_term, probed_term);
-        println!(
-            "✅ [PreVote] Node {} got quorum at Term {} → promoted to Candidate",
-            candidate_id, new_term
+        info!(
+            node = %candidate_id,
+            term = new_term,
+            "pre-vote quorum; promoted to candidate"
         );
         Self::request_votes(raft_arc);
     }
@@ -1785,13 +1779,13 @@ impl RaftNode {
                         // each send_*_rpc helper unwrapped its own
                         // expected reply; the trait surface defers
                         // dispatch to the caller. Log and move on.
-                        eprintln!(
-                            "[Protocol] RequestVote to {} got unexpected reply variant {:?}",
-                            peer_addr,
-                            std::mem::discriminant(&other)
+                        warn!(
+                            peer = %peer_addr,
+                            discriminant = ?std::mem::discriminant(&other),
+                            "RequestVote got unexpected reply variant"
                         );
                     }
-                    Err(e) => eprintln!("[Network] RPC error with {}: {}", peer_addr, e),
+                    Err(e) => warn!(peer = %peer_addr, error = %e, "RequestVote RPC error"),
                 }
             });
         }
@@ -1799,7 +1793,7 @@ impl RaftNode {
 
     pub fn become_leader(&mut self) {
         if self.state == NodeState::Leader { return; }
-        println!("👑 [Leader] Node {} elected for Term {}", self.node_id, self.current_term);
+        info!(node = %self.node_id, term = self.current_term, "elected leader");
         self.state = NodeState::Leader;
         let next_idx = self.log.len() as u64 + 1;
         self.next_index = self.peers.iter().map(|p| (p.clone(), next_idx)).collect();
@@ -1875,11 +1869,17 @@ impl RaftNode {
             }
         }
 
-        eprintln!("[peer {}] AE: leader_commit={}, my_commit={}, log_len={}, entries={}", 
-            self.node_id, args.leader_commit, self.commit_index, self.log.len(), args.entries.len());
+        debug!(
+            from = %args.leader_id,
+            leader_commit = args.leader_commit,
+            my_commit = self.commit_index,
+            log_len = self.log.len(),
+            entries = args.entries.len(),
+            "AE received"
+        );
         if args.leader_commit > self.commit_index {
             self.commit_index = std::cmp::min(args.leader_commit, self.log.len() as u64);
-            eprintln!("[peer {}] AE: commit_index advanced to {}, applying...", self.node_id, self.commit_index);
+            debug!(commit_index = self.commit_index, "AE: commit_index advanced; applying logs");
             self.apply_logs();
         }
 

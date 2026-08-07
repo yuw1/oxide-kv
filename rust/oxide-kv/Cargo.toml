@@ -33,6 +33,17 @@ prost = "0.13"
 # build graph flat. A future PR can gate this behind a
 # `metrics` cargo feature flag once we have real opt-in demand.
 prometheus = { version = "0.14", default-features = false }
+# `tracing` + `tracing-subscriber` provide the structured
+# logging layer (chore/tracing-subsystem). All `println!` /
+# `eprintln!` calls in the codebase are mapped to `tracing`
+# macros so the log level can be tuned via `RUST_LOG` instead
+# of every node spamming heartbeats unfiltered. The
+# `env-filter` feature lets users opt into per-module
+# verbosity (e.g. `RUST_LOG=oxide_kv::raft=debug`).
+# `tracing-subscriber` is only needed by the binary entry
+# point (`main.rs`); library code just emits events.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # `oxide-kv-client` is the standalone Rust client crate (P8 PR 2).
 # Pulled in here so the `examples/oxide_kv_cli.rs` example can
 # demonstrate using it from the server crate's binary context.

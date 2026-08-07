@@ -28,6 +28,7 @@ use crate::coordination::VoteResponse;
 use crate::raft::node::RaftNode;
 use crate::raft::rpc::{RpcClient, RpcServer, RaftMessage};
 use std::sync::{Arc, RwLock};
+use tracing::warn;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
@@ -331,7 +332,7 @@ impl Transport for TcpTransport {
                                 });
                             }
                             Err(e) => {
-                                eprintln!("[raft] listener accept error: {}", e);
+                                warn!(error = %e, "raft listener accept error");
                                 // Don't return — keep accepting. Real
                                 // accept errors are usually transient
                                 // (per-process fd exhaustion, etc.).

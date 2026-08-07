@@ -4,6 +4,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tracing::{debug, info, warn};
 
 pub struct ClientHandler;
 
@@ -11,7 +12,7 @@ impl ClientHandler {
     /// Entry point for handling client TCP connections.
     /// Manages the network lifecycle and JSON serialization/deserialization.
     pub async fn handle_client_request(mut stream: TcpStream, node_arc: Arc<RwLock<RaftNode>>) {
-        println!("Client connected: {:?}", stream.peer_addr());
+        info!(peer = ?stream.peer_addr(), "client connected");
 
         let (reader, mut writer) = stream.split();
         let mut buf_reader = BufReader::new(reader);
@@ -26,7 +27,7 @@ impl ClientHandler {
                     let command: Command = match serde_json::from_str(&line) {
                         Ok(cmd) => cmd,
                         Err(e) => {
-                            eprintln!("❌ [Client] Failed to parse command: {}", e);
+                            warn!(error = %e, "failed to parse client command");
                             let error_resp = serde_json::json!({"status": "error", "message": format!("Invalid JSON: {}", e)});
                             let _ = writer.write_all(format!("{}\n", error_resp).as_bytes()).await;
                             continue;
@@ -39,17 +40,17 @@ impl ClientHandler {
                     // 3. Send response back to client
                     let resp_str = format!("{}\n", response_json.to_string());
                     if let Err(e) = writer.write_all(resp_str.as_bytes()).await {
-                        eprintln!("Failed to send response: {}", e);
+                        warn!(error = %e, "failed to send response");
                         break;
                     }
                 }
                 Err(e) => {
-                    eprintln!("Network read error: {}", e);
+                    warn!(error = %e, "network read error");
                     break;
                 }
             }
         }
-        println!("Client connection closed");
+        debug!("client connection closed");
     }
 
     /// Routes the command based on its type and performs role validation.
