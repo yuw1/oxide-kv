@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (chore: instrument logging via `tracing` + `tracing-subscriber`)
+
+All 61 `println!` / `eprintln!` calls in the codebase are routed
+through the `tracing` facade so log level can be tuned via
+`RUST_LOG` instead of every node spamming heartbeats unfiltered.
+
+- **Default level** (`RUST_LOG` unset): `info` for the `oxide_kv`
+  crate. The default log is a clean state-change summary
+  (startup banner, leader election, commit advance, snapshot
+  taken, 2PC lifecycle, shutdown). On a 3-node cluster with no
+  traffic, each node produces ~7 lines in the first 4 seconds.
+- **`RUST_LOG=oxide_kv::raft=debug`**: full protocol trace
+  (every heartbeat, every AppendEntries, every commit advance).
+  Useful for diagnosing election churn, AE mismatch, or split-brain.
+- **`RUST_LOG=oxide_kv=trace`**: everything including apply-log
+  details (SET / DELETE / DECIDE_TX per entry). Only useful
+  for single-node smoke testing — turn off under load.
+
+Mapping rationale:
+
+- **info** — state changes the operator wants to see at a glance
+  (election outcome, commit advance, snapshot, restart, Client
+  connect, InstallSnapshot, JoinCluster, Replay, Membership change).
+- **debug** — high-volume per-RPC / per-entry events (every
+  AppendEntries received, every apply_logs entry, every
+  pre-vote probe, election timeouts, client connection close).
+- **warn** — recoverable errors (RPC transport failure, RPC
+  reply discriminator mismatch, malformed Joint config).
+- **error** — non-recoverable I/O failures (WAL append, meta
+  save, log entry missing during apply).
+
+No behaviour change. All 271 lib tests + the cross-process smoke
+suite still pass; `cargo clippy --release --all-targets -- -D warnings`
+emits the same 32 pre-existing warnings as master (the change
+adds zero new ones).
+
 ### Changed (test: cross-process smoke tests un-gated; P8 complete)
 
 The three consensus-scope tests in `tests/cross_process_smoke.rs`

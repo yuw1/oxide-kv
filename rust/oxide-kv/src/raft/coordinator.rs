@@ -36,6 +36,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use tokio::time::timeout;
+use tracing::{info, warn};
 
 use crate::coordination::{VoteRequest, VoteResponse};
 use crate::protocol::{Command, TxDecision, Vote};
@@ -139,9 +140,10 @@ pub async fn run_tx_timeout_loop(
             };
             match result {
                 Ok(decide_index) => {
-                    println!(
-                        "📤 [TxTimeout] Force-aborted stuck tx_id={} via DecideTx(Abort) at log index {}",
-                        tx_id, decide_index
+                    info!(
+                        tx_id = %tx_id,
+                        decide_index,
+                        "force-aborted stuck 2PC transaction via DecideTx(Abort)"
                     );
                     // Bump the timeout-aborted counter on the
                     // node's metrics handle, if one is wired in.
@@ -167,9 +169,10 @@ pub async fn run_tx_timeout_loop(
                     // will pick this up on its next sweep tick.
                 }
                 Err(crate::protocol::AbortTxError::StorageError(msg)) => {
-                    eprintln!(
-                        "⚠️ [TxTimeout] Storage error force-aborting tx_id={}: {}",
-                        tx_id, msg
+                    warn!(
+                        tx_id = %tx_id,
+                        error = %msg,
+                        "storage error force-aborting stuck 2PC transaction"
                     );
                 }
             }

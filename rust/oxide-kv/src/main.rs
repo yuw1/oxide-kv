@@ -1,6 +1,8 @@
 use std::sync::{Arc, RwLock};
 use clap::Parser;
 use tokio::net::TcpListener;
+use tracing::{error, info};
+use tracing_subscriber::EnvFilter;
 use oxide_kv::client::ClientHandler;
 use oxide_kv::config::Config;
 use oxide_kv::state_machine::{StateMachine, StateMachineConfig};
@@ -9,6 +11,29 @@ use oxide_kv::raft::coordinator;
 use oxide_kv::raft::net::{StopSignal, TcpTransport, Transport};
 use oxide_kv::raft::timer::run_election_timer;
 use oxide_kv::observability::{run_metrics_server, Metrics};
+
+/// Initialise the global `tracing` subscriber.
+///
+/// Behaviour:
+/// - **No `RUST_LOG` set** → default level `info` for the
+///   `oxide_kv` crate (heartbeat / AE receive stay at `debug`,
+///   so the default log is the clean state-change summary).
+/// - **`RUST_LOG=oxide_kv::raft=debug`** → full protocol trace
+///   (every heartbeat, every AE, every commit advance).
+/// - **`RUST_LOG=oxide_kv=trace`** → everything including
+///   `tracing::trace!` calls if any module adds them later.
+///
+/// Idempotent: if a subscriber is already installed (e.g. a
+/// test main installs its own), `try_init` is a no-op so we
+/// don't pull the floor out.
+fn init_tracing() {
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("oxide_kv=info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .try_init();
+}
 
 #[derive(Parser, Debug)]
 pub struct Args {
@@ -30,6 +55,8 @@ pub struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    init_tracing();
+
     // 1. Parse command line arguments
     let args = <Args as clap::Parser>::parse();
     let config = Config {
@@ -58,7 +85,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 4. Handle single-node startup: If no peers, become Leader automatically
     if args.peers.is_empty() {
-        println!("🚀 No peers detected. Entering standalone Leader mode.");
+        info!("no peers detected; entering standalone Leader mode");
         raft_node_inner.state = NodeState::Leader;
     }
 
@@ -72,10 +99,7 @@ async fn main() -> anyhow::Result<()> {
     {
         let mut node = raft_node.write().unwrap();
         if let Some((idx, term)) = node.restore_from_snapshot() {
-            println!(
-                "📸 Restored snapshot up to index={} term={}; replaying WAL delta",
-                idx, term
-            );
+            info!(idx, term, "restored snapshot; replaying WAL delta");
         }
         node.replay_logs();
     }
@@ -98,7 +122,7 @@ async fn main() -> anyhow::Result<()> {
         node.refresh_metrics();
     }
     if args.metrics_addr != "disabled" {
-        println!("📊 Metrics will be served at http://{}/metrics", args.metrics_addr);
+        info!(endpoint = %args.metrics_addr, "metrics endpoint will be served");
     }
 
     // 6. Start Raft RPC listener (Handles internal voting and heartbeats).
@@ -108,7 +132,7 @@ async fn main() -> anyhow::Result<()> {
     //    graceful shutdown can drain the accept loop.
     let r_node = raft_node.clone();
     let raft_listener = TcpListener::bind(&Config::global().listen_addr).await?;
-    println!("📡 Raft RPC Service started at: {}", Config::global().listen_addr);
+    info!(addr = %Config::global().listen_addr, "Raft RPC service started");
     let raft_transport: Arc<dyn Transport> = Arc::new(TcpTransport::with_listener(raft_listener));
     let raft_stop = StopSignal::new();
     {
@@ -116,7 +140,7 @@ async fn main() -> anyhow::Result<()> {
         let raft_stop = raft_stop.clone();
         tokio::spawn(async move {
             if let Err(e) = raft_transport.serve(r_node, raft_stop).await {
-                eprintln!("[raft] transport serve stopped: {}", e);
+                error!(error = %e, "raft transport serve stopped");
             }
         });
     }
@@ -159,7 +183,7 @@ async fn main() -> anyhow::Result<()> {
         let metrics_stop = raft_stop.clone();
         tokio::spawn(async move {
             if let Err(e) = run_metrics_server(metrics_for_server, metrics_addr, metrics_stop).await {
-                eprintln!("[metrics] server stopped: {}", e);
+                error!(error = %e, "metrics server stopped");
             }
         });
     }
@@ -170,7 +194,7 @@ async fn main() -> anyhow::Result<()> {
     let raft_stop_for_ctrl_c = raft_stop.clone();
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.ok();
-        println!("\n🛑 Shutdown signal received. Saving state...");
+        info!("shutdown signal received; draining");
         // Tell the Raft listener to stop accepting new connections;
         // in-flight RPCs drain naturally. Persistence/cleanup will
         // land in a later PR (see CHANGELOG).
@@ -181,9 +205,9 @@ async fn main() -> anyhow::Result<()> {
     // 10. Start External Client API listener (Handles SET/GET commands)
     let c_node = raft_node.clone();
     let client_listener = TcpListener::bind(&Config::global().client_addr).await?;
-    println!("📥 Client API Service started at: {}", &Config::global().client_addr);
+    info!(addr = %Config::global().client_addr, "client API service started");
 
-    println!("✅ System ready. Waiting for client connections...");
+    info!("system ready; waiting for client connections");
 
     // 11. Main client processing loop
     while let Ok((stream, _)) = client_listener.accept().await {

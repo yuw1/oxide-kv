@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::protocol::{LogEntry, Snapshot};
+use tracing::info;
 
 pub struct RaftStorage {
     wal_path: String,
@@ -25,7 +26,7 @@ impl RaftStorage {
 
     pub fn load_initial_state(&self) -> (u64, Option<String>, Vec<LogEntry>) {
         let (term, vote) = self.read_meta();
-        println!("📖 Meta Restored: Term={}, VotedFor={:?}", term, vote);
+        info!(term, vote_for = ?vote, "restored meta from disk");
 
         let logs = self.restore_wal_log();
         (term, vote, logs)

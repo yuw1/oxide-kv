@@ -9,6 +9,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
+use tracing::{debug, info, warn};
 
 use crate::raft::transport::{
     read_envelope, read_envelope_discriminator, read_envelope_payload, write_envelope, DispatchKind,
@@ -202,10 +203,10 @@ impl RpcServer {
     /// 2PC coordinator vote surface added in P6.
     pub async fn dispatch(mut stream: TcpStream, raft_node: Arc<RwLock<RaftNode>>) {
         if let Err(e) = Self::dispatch_logic(&mut stream, raft_node).await {
-            eprintln!(
-                "[Thread {:?}] RPC dispatch error: {}",
-                std::thread::current().id(),
-                e
+            warn!(
+                thread_id = ?std::thread::current().id(),
+                error = %e,
+                "RPC dispatch error"
             );
         }
     }
@@ -301,7 +302,7 @@ impl RpcServer {
                     let mut node = raft_node.write().unwrap();
                     node.handle_request_vote(&args)
                 };
-                println!("✅ Responded to vote request from node {}", args.candidate_id);
+                debug!(from = %args.candidate_id, "Responded to vote request");
                 RaftMessage::VoteResponse(reply)
             }
             // Pre-vote probe (P8 PR 5, Raft §9.6). Same wire path
@@ -316,9 +317,10 @@ impl RpcServer {
                     let mut node = raft_node.write().unwrap();
                     node.handle_pre_vote(&args)
                 };
-                println!(
-                    "🔎 Responded to pre-vote probe from node {} at Term {}",
-                    args.candidate_id, args.term
+                debug!(
+                    from = %args.candidate_id,
+                    term = args.term,
+                    "Responded to pre-vote probe"
                 );
                 RaftMessage::PreVoteResponse(reply)
             }
@@ -327,7 +329,12 @@ impl RpcServer {
                     let mut node = raft_node.write().unwrap();
                     node.handle_append_entries(&args)
                 };
-                println!("✅ Responded to heartbeat from Leader {} (Term {})", args.leader_id, args.term);
+                debug!(
+                    from = %args.leader_id,
+                    term = args.term,
+                    entries = args.entries.len(),
+                    "Responded to AppendEntries"
+                );
                 RaftMessage::AppendReply(reply)
             }
             RaftMessage::InstallSnapshot(args) => {
@@ -335,7 +342,11 @@ impl RpcServer {
                     let mut node = raft_node.write().unwrap();
                     node.handle_install_snapshot(&args)
                 };
-                println!("📦 Responded to InstallSnapshot from Leader {} (Term {})", args.leader_id, args.term);
+                info!(
+                    from = %args.leader_id,
+                    term = args.term,
+                    "Responded to InstallSnapshot"
+                );
                 RaftMessage::InstallSnapshotReply(reply)
             }
             // Cold-new-server catch-up (P8 PR 6a). The handler
@@ -346,14 +357,15 @@ impl RpcServer {
                     let node = raft_node.read().unwrap();
                     node.handle_join_cluster(&req)
                 };
-                println!(
-                    "🆕 Responded to JoinCluster from candidate {} (accepted={})",
-                    req.candidate_addr, reply.accepted
+                info!(
+                    from = %req.candidate_addr,
+                    accepted = reply.accepted,
+                    "Responded to JoinCluster"
                 );
                 RaftMessage::JoinClusterResponse(reply)
             }
             other => {
-                println!("⚠️ Received unexpected RPC message type: {:?}", other);
+                warn!(message = ?other, "received unexpected RPC message type");
                 return Ok(());
             }
         };

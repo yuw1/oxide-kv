@@ -31,6 +31,7 @@ use crate::observability::MetricsHandle;
 use crate::raft::net::StopSignal;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tracing::{info, warn};
 
 /// How often the per-connection loop re-accepts after a clean
 /// shutdown. There isn't a tight bound here — 50 ms keeps the
@@ -49,12 +50,12 @@ pub async fn run_metrics_server(
     stop: StopSignal,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(&addr).await?;
-    eprintln!("📊 Metrics endpoint listening at http://{}/metrics", addr);
+    info!(endpoint = %addr, "metrics endpoint listening");
     loop {
         tokio::select! {
             biased;
             _ = stop.0.notified() => {
-                eprintln!("[metrics] stop signal received; draining listener");
+                info!("metrics stop signal received; draining listener");
                 return Ok(());
             }
             accept = listener.accept() => {
@@ -64,12 +65,12 @@ pub async fn run_metrics_server(
                         let stop = stop.clone();
                         tokio::spawn(async move {
                             if let Err(e) = handle_connection(stream, m, stop).await {
-                                eprintln!("[metrics] connection error: {}", e);
+                                warn!(error = %e, "metrics connection error");
                             }
                         });
                     }
                     Err(e) => {
-                        eprintln!("[metrics] accept error: {}", e);
+                        warn!(error = %e, "metrics accept error");
                         // Brief backoff so we don't busy-loop on a
                         // pathological accept failure.
                         tokio::time::sleep(std::time::Duration::from_millis(
