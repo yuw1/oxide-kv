@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed (workspace: drop stale root `build.rs` + `proto/` duplicates)
+
+When the project moved to a multi-crate workspace (P5 era: crates
+extracted under `crates/oxide-kv/`; then P7: renamed to `rust/oxide-kv/`),
+the root-level `build.rs` and `proto/` directory were copied into the
+new crate layout but the root-level copies were left in place. PR #44
+later dropped the parallel root `src/` and PR #47 dropped the parallel
+root `tests/`, but missed these two — they have remained as silent
+stale duplicates ever since.
+
+They are not a build hazard: the root `Cargo.toml` is a pure virtual
+workspace manifest with no `[package]` block, so cargo never tries to
+compile the root `build.rs` or read the root `proto/` files. They are
+purely documentary debt — every new contributor who opens the repo
+sees `build.rs` and `proto/` at the root and assumes that is the
+canonical entry, when the real ones live at `rust/oxide-kv/build.rs`
+and `rust/oxide-kv/proto/`.
+
+This commit drops the three root-level files:
+
+- `build.rs` — byte-identical to `rust/oxide-kv/build.rs`
+- `proto/raft.proto` — same content as `rust/oxide-kv/proto/raft.proto`;
+  the only diff was two stale `src/...` comment paths that pointed at
+  the pre-crate-extraction layout (the crate copy already carries the
+  correct `rust/oxide-kv/src/...` paths)
+- `proto/coordination.proto` — byte-identical to
+  `rust/oxide-kv/proto/coordination.proto`
+
+`Cargo.toml` and `Cargo.lock` at the root are intentionally retained:
+they are the workspace manifest + lockfile and are required by cargo.
+
+Verified: `cargo build --release` clean; `cargo test --lib` 271 passed.
+
 ### Changed (chore: instrument logging via `tracing` + `tracing-subscriber`)
 
 All 61 `println!` / `eprintln!` calls in the codebase are routed
