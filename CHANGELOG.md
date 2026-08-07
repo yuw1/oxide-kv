@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (test: cross-process smoke tests un-gated; P8 complete)
+
+The three consensus-scope tests in `tests/cross_process_smoke.rs`
+(`single_leader_converges_within_15_seconds`,
+`commit_index_advances_after_set_on_cluster`,
+`set_then_get_on_leader_returns_written_value`) were `#[ignore]`-gated
+on the pre-vote split-brain and multi-node commit-advance bugs. Both
+bugs are fixed in this release (see the two `Fixed` entries below),
+and the tests were verified passing against master before un-gating.
+They now run in every CI cross-process smoke run, so any future
+split-brain / commit-stall regression fails CI instead of hiding
+behind an `#[ignore]`.
+
+ROADMAP.md: P8 marked complete — all six acceptance criteria
+verified on master (268 lib tests, CI green).
+
 ### Fixed (raft: pre-vote self-vote off-by-one + Leader demote on same-term AE)
 
 Two latent Raft hardening bugs. The bootstrap peer-list fix (same

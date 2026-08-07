@@ -32,14 +32,18 @@
 //!    processes don't survive from one `cargo test` invocation to
 //!    the next.
 //!
-//! What this test does NOT do (consensus scope, gated)
-//! ----------------------------------------------------
-//! - **Single-stable-leader convergence** under sustained load —
-//!   gated on the pre-vote tie fix in a follow-up PR. See
-//!   `single_leader_converges_*` below.
-//! - **Multi-node `commit_index` advance** after a Set — gated on
-//!   the multi-node commit-advance bug fix. See
-//!   `commit_index_advances_after_set_on_cluster` below.
+//! What this test does NOT do (consensus scope)
+//! --------------------------------------------
+//! Historical note: three consensus-scope tests in this file
+//! (`single_leader_converges_within_15_seconds`,
+//! `commit_index_advances_after_set_on_cluster`,
+//! `set_then_get_on_leader_returns_written_value`) were
+//! originally `#[ignore]`-gated on the pre-vote tie / split-brain
+//! and multi-node commit-advance bugs. Both were fixed by PR #50
+//! (bootstrap peer-list off-by-one) and PR #51 (pre-vote must not
+//! self-vote; incumbent leader must not demote on same-term AE),
+//! and the three tests now run un-gated — verified locally before
+//! un-gating and in CI ever since.
 //!
 //! Bugs surfaced by this test (fixed in later PRs, not here)
 //! ----------------------------------------------------------
@@ -50,20 +54,21 @@
 //!   node tried to bind 9100 and failed with `EADDRINUSE`. The
 //!   fix lives in `bootstrap-cluster.sh::start_one`; this test
 //!   is the regression guard.
-//! - **Pre-vote tie / split-brain**: two nodes entering pre-vote
-//!   ~simultaneously can both pass pre-vote (each gets 2 of 3
-//!   yes votes including the other's), both promote to Candidate,
-//!   both win a real vote round, and both become Leader. We
-//!   observed 30+ consecutive split-brain observations in a
-//!   single 15-second `find_leader` window before bailing. Fix
-//!   is deferred to a follow-up PR; the gated tests below
-//!   will un-`#[ignore]` themselves when that lands.
-//! - **`commit_index` stuck at 0** after a successful Set: the
-//!   leader's `sync_logs` only calls `maybe_commit` from the
-//!   per-peer AE-success reply handler. Multi-node catch-up of
-//!   the leader's own log isn't covered, so `commit_index` never
-//!   advances. `commit_index_advances_after_set_on_cluster`
-//!   is `#[ignore]`'d so a future fix can opt in.
+//! - **Pre-vote tie / split-brain** (FIXED in PR #51): two nodes
+//!   entering pre-vote ~simultaneously could both pass pre-vote
+//!   (each gets 2 of 3 yes votes including the other's), both
+//!   promote to Candidate, both win a real vote round, and both
+//!   become Leader. We observed 30+ consecutive split-brain
+//!   observations in a single 15-second `find_leader` window
+//!   before bailing. Root causes: pre-vote allowed a self-vote,
+//!   and an incumbent leader demoted itself on receiving a
+//!   same-term AppendEntries from a rival. `single_leader_*` and
+//!   `set_then_get_*` below are the regression guards.
+//! - **`commit_index` stuck at 0** (FIXED in PR #50) after a
+//!   successful Set: the bootstrap script's off-by-one peer list
+//!   broke replication so `commit_index` never advanced.
+//!   `commit_index_advances_after_set_on_cluster` is the
+//!   regression guard.
 //!
 //! CI integration
 //! --------------
@@ -497,12 +502,9 @@ fn logs_show_election_completed_within_timeout() {
 // you remove the ignore — they're not commented out, they're
 // honest about the gap.
 
-/// Single-stable-leader convergence. Opt in once the pre-vote
-/// tie / split-brain bug is fixed. Today this test would fail
-/// because two nodes simultaneously report `role=2` and never
-/// self-heal within the 15s budget.
+/// Single-stable-leader convergence. Regression guard for the
+/// pre-vote tie / split-brain bug fixed in PR #51.
 #[test]
-#[ignore = "gated on fix for pre-vote tie / split-brain (P8 PR #10+)"]
 fn single_leader_converges_within_15_seconds() {
     run_smoke(|records| {
         let deadline = Instant::now() + Duration::from_secs(15);
@@ -528,11 +530,9 @@ fn single_leader_converges_within_15_seconds() {
     });
 }
 
-/// Multi-node commit advance after a successful Set. Opt in
-/// once the leader's `sync_logs` covers the leader's own log
-/// in addition to per-peer AE success handlers.
+/// Multi-node commit advance after a successful Set. Regression
+/// guard for the commit-advance bug fixed in PR #50.
 #[test]
-#[ignore = "gated on fix for multi-node commit advance (P8 PR #10+)"]
 fn commit_index_advances_after_set_on_cluster() {
     run_smoke(|records| {
         // Find the leader — same retry loop as the active
@@ -594,11 +594,10 @@ fn commit_index_advances_after_set_on_cluster() {
     });
 }
 
-/// Set + Get round trip on the same leader client port. Opt in
-/// once the cluster can hold a stable leader long enough for
-/// both ops to land on the same node.
+/// Set + Get round trip on the same leader client port.
+/// Regression guard for the pre-vote tie / split-brain bug
+/// fixed in PR #51 (requires a stable leader for both ops).
 #[test]
-#[ignore = "gated on fix for pre-vote tie / split-brain (P8 PR #10+)"]
 fn set_then_get_on_leader_returns_written_value() {
     run_smoke(|records| {
         // Find the current leader (retry loop handles churn).
