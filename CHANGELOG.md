@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed (deploy: bootstrap-cluster.sh peer-list off-by-one)
+- **`deploy/scripts/bootstrap-cluster.sh` passed a 1-based index
+  (`idx + 1`) to `start_one`, while the peer-building loop iterated
+  a 0-based `n` over `NODES`.** The `[[ "$n" -eq "$idx" ]]`
+  self-skip therefore skipped the wrong slot (or no slot at all),
+  and every port formula (`9000 + n + 1`, `9000 + idx`, …) drifted
+  by one. Result: node-1/node-2 each got only **one** peer, and
+  node-3's `--peers` list even contained its own raft address.
+- **Symptom this caused**: the cluster's on-disk membership was
+  corrupted (`Simple([9002, 9001, 9002])` — a node listed twice),
+  which in turn made the 2PC coordinator's replication gate treat
+  the leader's own address as a peer, poll `match_index[self] == 0`
+  forever, and abort every `BeginTx` after 5 s
+  (`replication failed: timed out waiting for index N to replicate
+  to all peers (current: [..., ("127.0.0.1:9002", 0)])`). The
+  wrong peer views also kept every node election-timing-out and
+  re-probing, which is what made earlier debugging sessions look
+  like "constant split-brain / term churn".
+- **Fix**: pass the real 0-based `idx` into `start_one` and align
+  all port arithmetic (`raft_port = 9001 + idx`,
+  `client_port = 9101 + idx`, `p_port = 9001 + n`,
+  `metrics_port = 9000 + offset * (idx + 1)`). Net effect on the
+  wire is unchanged (ports were already correct for the 1-based
+  path); what changes is the **peer list**, which now contains
+  exactly the two real peers for every node.
+- **Regression test**: new `deploy/tests/test_bootstrap_peers.sh`
+  replays the peer-list construction and asserts (a) raft ports are
+  9001/9002/9003, (b) each node's peer list matches exactly
+  [9002,9003] / [9001,9003] / [9001,9002], (c) a node's own raft
+  port never appears in its peer list, and (d) the script no longer
+  passes `idx + 1` to `start_one`. Runs without launching the
+  binary; wire it into CI later if desired.
+- **Verified end-to-end**: fresh 3-node cluster comes up with clean
+  membership (`Simple([9001, 9002, 9003])` on every node, each
+  rotated by local-self-first), elects one stable leader, and
+  passes Set/Get/BeginTx(2PC commit)/Delete smoke in ~0.2 s per
+  op; 30 s soak shows a single leader and a stable term throughout.
+
 ### Removed (drop Python CI workflow)
 - **`.github/workflows/python.yml` deleted.** The Python SDK is a
   pure-Python, zero-dependency socket wrapper — no PyO3 extension,

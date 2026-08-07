@@ -14,10 +14,10 @@
 #
 # Logs go to /tmp/oxide-kv-node-{1,2,3}.log. Each node gets its own
 # data dir under /tmp/oxide-kv-node-{1,2,3}. Override with $BASE.
-# Metrics ports: by default, node-N binds 127.0.0.1:(9100 + N*100)
-# (i.e. 9100, 9200, 9300). Override with OXIDE_METRICS_PORT_OFFSET
-# or set `--metrics-addr disabled` via the wrapper script if you
-# only want one node scraping the leader.
+# Metrics ports: by default, node-N (1-indexed) binds
+# 127.0.0.1:(9000 + N*100) (i.e. 9100, 9200, 9300). Override with
+# OXIDE_METRICS_PORT_OFFSET or set `--metrics-addr disabled` via the
+# wrapper script if you only want one node scraping the leader.
 
 set -euo pipefail
 
@@ -34,20 +34,20 @@ is_built() {
 start_one() {
     local id="$1" idx="$2"
     local data_dir="$BASE/oxide-kv-$id"
-    local raft_port=$((9000 + idx))
-    local client_port=$((9100 + idx))
+    local raft_port=$((9001 + idx))
+    local client_port=$((9101 + idx))
     # Metrics port offset: P8 PR #8 ships the `/metrics` endpoint
     # and defaults to `127.0.0.1:9100`. Three nodes would collide on
-    # that port, so use `9000 + 100*idx` (node-1=9100, node-2=9200,
+    # that port, so use `9000 + 100*(idx+1)` (node-1=9100, node-2=9200,
     # node-3=9300). Set `OXIDE_METRICS_PORT_OFFSET=0` (or set
     # `--metrics-addr disabled` via env override) to revert to a
     # single-port binding for debugging.
     local metrics_offset="${OXIDE_METRICS_PORT_OFFSET:-100}"
-    local metrics_port=$((9000 + metrics_offset * idx))
+    local metrics_port=$((9000 + metrics_offset * (idx + 1)))
     local peers=""
     for ((n=0; n<${#NODES[@]}; n++)); do
         [[ "$n" -eq "$idx" ]] && continue
-        local p_port=$((9000 + n + 1))
+        local p_port=$((9001 + n))
         peers+="127.0.0.1:$p_port,"
     done
     peers="${peers%,}"  # strip trailing comma
@@ -115,7 +115,7 @@ case "$cmd" in
         stop_all || true
         rm -f "$BASE/cluster.jsonl"
         for idx in "${!NODES[@]}"; do
-            start_one "${NODES[$idx]}" "$((idx + 1))"
+            start_one "${NODES[$idx]}" "$idx"
         done
         echo "3 nodes started; logs: $BASE/oxide-kv-node-*.log"
         echo "wait ~2s for leader election, then check status"
