@@ -4,7 +4,7 @@
 //! round-trip the request payloads through `serde_json::Value` and
 //! confirm the fields the server-side `dispatch_command` looks for.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Replicate the request shape `Client::set` would send.
 #[test]
@@ -106,8 +106,5 @@ fn not_leader_response_shape() {
     // Server returns this exact shape when a mutation hits a follower
     // (see rust/oxide-kv/src/client.rs:61).
     let resp: Value = json!({"error": "Not a leader. Please connect to the leader node."});
-    assert!(resp["error"]
-        .as_str()
-        .unwrap()
-        .starts_with("Not a leader"));
+    assert!(resp["error"].as_str().unwrap().starts_with("Not a leader"));
 }

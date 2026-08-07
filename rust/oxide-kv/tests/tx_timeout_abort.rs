@@ -41,7 +41,7 @@ use oxide_kv::raft::coordinator;
 use oxide_kv::raft::net::StopSignal;
 use oxide_kv::raft::node::{NodeState, RaftNode};
 use oxide_kv::raft::storage::RaftStorage;
-use oxide_kv::state_machine::{now_unix_ms, StateMachine, StateMachineConfig};
+use oxide_kv::state_machine::{StateMachine, StateMachineConfig, now_unix_ms};
 
 struct TestNode {
     raft: Arc<RwLock<RaftNode>>,
@@ -151,9 +151,11 @@ async fn admin_abort_tx_round_trip_on_single_node_leader() {
 
     // Send AbortTx over the JSON client.
     let port = spawn_client_listener(node.raft.clone()).await;
-    let resp =
-        client_command(port, serde_json::json!({"AbortTx": {"tx_id": "aborted-tx"}}))
-            .await;
+    let resp = client_command(
+        port,
+        serde_json::json!({"AbortTx": {"tx_id": "aborted-tx"}}),
+    )
+    .await;
     assert_eq!(resp.get("status").and_then(|v| v.as_str()), Some("ok"));
     assert_eq!(resp.get("decision").and_then(|v| v.as_str()), Some("abort"));
     let decide_index = resp.get("decide_index").and_then(|v| v.as_u64()).unwrap();
@@ -255,7 +257,10 @@ async fn coordinator_sweep_force_aborts_stuck_tx() {
             assert_eq!(tx_id, "sweep-me");
             assert_eq!(*decision, TxDecision::Abort);
         }
-        other => panic!("expected DecideTx(Abort) appended by sweep, got {:?}", other),
+        other => panic!(
+            "expected DecideTx(Abort) appended by sweep, got {:?}",
+            other
+        ),
     }
     drop(n);
     // Apply the new entry so pending_txs is purged.

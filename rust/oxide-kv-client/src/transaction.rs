@@ -4,7 +4,7 @@
 //! client-side and only sent to the server on `commit()` / `abort()`.
 //! Chains return `&mut Self` so calls can be fluent.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::client::Client;
 

@@ -57,10 +57,7 @@ pub enum TxOutcome {
     },
     /// The transaction was aborted (any peer returned No, timed out, or
     /// returned a higher term causing the leader to step down).
-    Aborted {
-        tx_id: String,
-        reason: String,
-    },
+    Aborted { tx_id: String, reason: String },
     /// The node is no longer the leader (stepped down during the round)
     /// and the transaction cannot be completed on this connection.
     NotLeader { tx_id: String },
@@ -99,16 +96,11 @@ const COORDINATE_TIMEOUT: Duration = Duration::from_secs(10);
 ///   - **Observable.** Each force-abort is logged at INFO so an
 ///     operator can correlate with the application that started the
 ///     tx.
-pub async fn run_tx_timeout_loop(
-    node_arc: Arc<RwLock<RaftNode>>,
-    stop: super::net::StopSignal,
-) {
+pub async fn run_tx_timeout_loop(node_arc: Arc<RwLock<RaftNode>>, stop: super::net::StopSignal) {
     use crate::config::Config;
     let clock = node_arc.read().unwrap().clock.clone();
-    let timeout_duration =
-        Duration::from_millis(Config::tx_timeout_ms());
-    let sweep_period =
-        Duration::from_millis(Config::tx_timeout_sweep_interval_ms());
+    let timeout_duration = Duration::from_millis(Config::tx_timeout_ms());
+    let sweep_period = Duration::from_millis(Config::tx_timeout_sweep_interval_ms());
     loop {
         tokio::select! {
             biased;
@@ -395,11 +387,11 @@ async fn coordinate_tx_inner(
                     // Record the peer's Yes on the state machine so
                     // `pending_tx_view` is complete.
                     let n = node_arc.write().unwrap();
-                    let _ = n
-                        .state_machine
-                        .write()
-                        .unwrap()
-                        .record_vote(&tx_id, addr.clone(), Vote::Yes);
+                    let _ = n.state_machine.write().unwrap().record_vote(
+                        &tx_id,
+                        addr.clone(),
+                        Vote::Yes,
+                    );
                 } else {
                     let reason = if resp.reason.is_empty() {
                         format!("peer {} declined vote", addr)
@@ -569,17 +561,17 @@ async fn propose_and_wait_for_apply(
 /// to apply (no `prev_log` mismatch in subsequent AppendEntries).
 ///
 /// Returns `Ok(())` on success, `Err(reason)` on timeout or step-down.
-async fn wait_for_replication(
-    node_arc: &Arc<RwLock<RaftNode>>,
-    index: u64,
-) -> Result<(), String> {
+async fn wait_for_replication(node_arc: &Arc<RwLock<RaftNode>>, index: u64) -> Result<(), String> {
     let start = std::time::Instant::now();
     let bound = Duration::from_secs(5);
     loop {
         let snapshot = {
             let n = node_arc.read().unwrap();
             if n.state != NodeState::Leader {
-                return Err(format!("stepped down to {:?} during replication wait", n.state));
+                return Err(format!(
+                    "stepped down to {:?} during replication wait",
+                    n.state
+                ));
             }
             n.peers()
                 .iter()
@@ -874,8 +866,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_tx_timeout_loop_force_aborts_stuck_tx_on_single_node() {
         // Tight sweep + tx timeouts so the test runs fast.
-        unsafe { std::env::set_var("OXIDE_TX_TIMEOUT_MS", "10"); }
-        unsafe { std::env::set_var("OXIDE_TX_TIMEOUT_SWEEP_INTERVAL_MS", "20"); }
+        unsafe {
+            std::env::set_var("OXIDE_TX_TIMEOUT_MS", "10");
+        }
+        unsafe {
+            std::env::set_var("OXIDE_TX_TIMEOUT_SWEEP_INTERVAL_MS", "20");
+        }
 
         let (_d, node_arc) = make_single_node("sweep-solo");
 
@@ -926,13 +922,15 @@ mod tests {
                 )
                 .unwrap();
         }
-        assert!(node_arc
-            .read()
-            .unwrap()
-            .state_machine
-            .read()
-            .unwrap()
-            .is_tx_pending("stuck"));
+        assert!(
+            node_arc
+                .read()
+                .unwrap()
+                .state_machine
+                .read()
+                .unwrap()
+                .is_tx_pending("stuck")
+        );
 
         // Spawn the sweep loop and let it run for a couple of
         // sweep periods, then stop it.
@@ -965,8 +963,12 @@ mod tests {
         }
 
         // Restore defaults so other tests aren't affected.
-        unsafe { std::env::remove_var("OXIDE_TX_TIMEOUT_MS"); }
-        unsafe { std::env::remove_var("OXIDE_TX_TIMEOUT_SWEEP_INTERVAL_MS"); }
+        unsafe {
+            std::env::remove_var("OXIDE_TX_TIMEOUT_MS");
+        }
+        unsafe {
+            std::env::remove_var("OXIDE_TX_TIMEOUT_SWEEP_INTERVAL_MS");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -975,8 +977,12 @@ mod tests {
         // the only one allowed to propose log entries. This guards
         // against a future refactor accidentally sweeping from
         // every node.
-        unsafe { std::env::set_var("OXIDE_TX_TIMEOUT_MS", "5"); }
-        unsafe { std::env::set_var("OXIDE_TX_TIMEOUT_SWEEP_INTERVAL_MS", "10"); }
+        unsafe {
+            std::env::set_var("OXIDE_TX_TIMEOUT_MS", "5");
+        }
+        unsafe {
+            std::env::set_var("OXIDE_TX_TIMEOUT_SWEEP_INTERVAL_MS", "10");
+        }
 
         let (_d, node_arc) = make_single_node("sweep-follower");
         // Demote to Follower.
@@ -991,11 +997,7 @@ mod tests {
             n.state_machine
                 .write()
                 .unwrap()
-                .begin_tx_at(
-                    "follower-stuck".into(),
-                    vec![],
-                    now.saturating_sub(60_000),
-                )
+                .begin_tx_at("follower-stuck".into(), vec![], now.saturating_sub(60_000))
                 .unwrap();
         }
         let log_len_before = node_arc.read().unwrap().log.len();
@@ -1017,23 +1019,33 @@ mod tests {
             "follower must not append DecideTx(Abort) entries"
         );
         // The stuck tx is still pending (no decision happened).
-        assert!(node_arc
-            .read()
-            .unwrap()
-            .state_machine
-            .read()
-            .unwrap()
-            .is_tx_pending("follower-stuck"));
+        assert!(
+            node_arc
+                .read()
+                .unwrap()
+                .state_machine
+                .read()
+                .unwrap()
+                .is_tx_pending("follower-stuck")
+        );
 
-        unsafe { std::env::remove_var("OXIDE_TX_TIMEOUT_MS"); }
-        unsafe { std::env::remove_var("OXIDE_TX_TIMEOUT_SWEEP_INTERVAL_MS"); }
+        unsafe {
+            std::env::remove_var("OXIDE_TX_TIMEOUT_MS");
+        }
+        unsafe {
+            std::env::remove_var("OXIDE_TX_TIMEOUT_SWEEP_INTERVAL_MS");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn run_tx_timeout_loop_skips_fresh_txs() {
         // Sanity: a tx that just began should NOT be swept.
-        unsafe { std::env::set_var("OXIDE_TX_TIMEOUT_MS", "60_000"); }
-        unsafe { std::env::set_var("OXIDE_TX_TIMEOUT_SWEEP_INTERVAL_MS", "10"); }
+        unsafe {
+            std::env::set_var("OXIDE_TX_TIMEOUT_MS", "60_000");
+        }
+        unsafe {
+            std::env::set_var("OXIDE_TX_TIMEOUT_SWEEP_INTERVAL_MS", "10");
+        }
 
         let (_d, node_arc) = make_single_node("sweep-fresh");
         node_arc
@@ -1056,15 +1068,21 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_millis(100), handle).await;
 
         // Fresh tx still pending — sweep correctly skipped it.
-        assert!(node_arc
-            .read()
-            .unwrap()
-            .state_machine
-            .read()
-            .unwrap()
-            .is_tx_pending("fresh"));
+        assert!(
+            node_arc
+                .read()
+                .unwrap()
+                .state_machine
+                .read()
+                .unwrap()
+                .is_tx_pending("fresh")
+        );
 
-        unsafe { std::env::remove_var("OXIDE_TX_TIMEOUT_MS"); }
-        unsafe { std::env::remove_var("OXIDE_TX_TIMEOUT_SWEEP_INTERVAL_MS"); }
+        unsafe {
+            std::env::remove_var("OXIDE_TX_TIMEOUT_MS");
+        }
+        unsafe {
+            std::env::remove_var("OXIDE_TX_TIMEOUT_SWEEP_INTERVAL_MS");
+        }
     }
 }

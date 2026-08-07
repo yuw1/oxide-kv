@@ -40,11 +40,7 @@ use std::time::Duration;
 /// Helper: wait until `predicate` returns true, polling every
 /// `poll` for at most `timeout`. Returns whether the predicate
 /// observed success.
-async fn wait_until<F: Fn() -> bool>(
-    timeout: Duration,
-    poll: Duration,
-    predicate: F,
-) -> bool {
+async fn wait_until<F: Fn() -> bool>(timeout: Duration, poll: Duration, predicate: F) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     loop {
         if predicate() {
@@ -79,8 +75,7 @@ async fn wait_until<F: Fn() -> bool>(
 #[tokio::test(flavor = "current_thread")]
 async fn pre_vote_isolated_follower_does_not_promote_or_disrupt() {
     let partition = Arc::new(PartitionedNetwork::new());
-    let scheduler: Arc<dyn oxide_kv::raft::fault_scheduler::FaultScheduler> =
-        partition.clone();
+    let scheduler: Arc<dyn oxide_kv::raft::fault_scheduler::FaultScheduler> = partition.clone();
     let cluster = SimCluster::new_3_nodes(scheduler).await;
 
     // (1) Get a stable leader at term 1.
@@ -119,7 +114,8 @@ async fn pre_vote_isolated_follower_does_not_promote_or_disrupt() {
         matches!(final_state, NodeState::Follower | NodeState::PreCandidate),
         "isolated node-1 must not become Candidate (pre-vote should fail to gather quorum); \
          got state={:?} term={}",
-        final_state, final_term,
+        final_state,
+        final_term,
     );
 
     // (6) Hard invariant: no term churn on the isolated follower.
@@ -171,8 +167,7 @@ async fn pre_vote_isolated_follower_does_not_promote_or_disrupt() {
 #[tokio::test(flavor = "current_thread")]
 async fn pre_vote_with_quorum_promotes_and_wins_election() {
     let partition = Arc::new(PartitionedNetwork::new());
-    let scheduler: Arc<dyn oxide_kv::raft::fault_scheduler::FaultScheduler> =
-        partition.clone();
+    let scheduler: Arc<dyn oxide_kv::raft::fault_scheduler::FaultScheduler> = partition.clone();
     let cluster = SimCluster::new_3_nodes(scheduler).await;
 
     // Initial leader = node-0 at term 1.
@@ -211,7 +206,11 @@ async fn pre_vote_with_quorum_promotes_and_wins_election() {
     // The new term must be the one we probed at: initial_term +
     // 1 = 2. If we end up at a higher term, that means we went
     // through two probe rounds, which would indicate a bug.
-    assert_eq!(term, initial_term + 1, "single pre-vote round should land at term+1");
+    assert_eq!(
+        term,
+        initial_term + 1,
+        "single pre-vote round should land at term+1"
+    );
 
     cluster.shutdown().await;
 }
@@ -300,10 +299,8 @@ fn pre_vote_refuses_probe_more_than_one_term_ahead_at_handler_level() {
 #[tokio::test(flavor = "current_thread")]
 async fn pre_vote_concurrent_candidates_do_not_split_brain() {
     // NoFaults scheduler: every link delivers, no partitions.
-    let cluster = SimCluster::new_3_nodes(Arc::new(
-        oxide_kv::raft::fault_scheduler::AlwaysDeliver,
-    ))
-    .await;
+    let cluster =
+        SimCluster::new_3_nodes(Arc::new(oxide_kv::raft::fault_scheduler::AlwaysDeliver)).await;
 
     // No prior leader; all three are clean Followers at term 0.
 
@@ -320,8 +317,12 @@ async fn pre_vote_concurrent_candidates_do_not_split_brain() {
     // pre-vote reply handlers run concurrently (separate
     // tokio::spawn tasks), so this is the exact race that
     // produced Calvin's split-brain in production.
-    let h0 = tokio::spawn(async move { RaftNode::become_pre_candidate(n0); });
-    let h1 = tokio::spawn(async move { RaftNode::become_pre_candidate(n1); });
+    let h0 = tokio::spawn(async move {
+        RaftNode::become_pre_candidate(n0);
+    });
+    let h1 = tokio::spawn(async move {
+        RaftNode::become_pre_candidate(n1);
+    });
     let _ = tokio::join!(h0, h1);
 
     // Give the probe fan-out + real RequestVote fan-out time
@@ -331,9 +332,7 @@ async fn pre_vote_concurrent_candidates_do_not_split_brain() {
     // After the race, at most ONE node may be Leader (Raft §3.4
     // / §5.4.2 election safety).
     let leader_count = (0..3)
-        .filter(|&i| {
-            cluster.nodes[i].raft.read().unwrap().state == NodeState::Leader
-        })
+        .filter(|&i| cluster.nodes[i].raft.read().unwrap().state == NodeState::Leader)
         .count();
     assert!(
         leader_count <= 1,
@@ -341,10 +340,7 @@ async fn pre_vote_concurrent_candidates_do_not_split_brain() {
          safety violated); leader indices: {:?}",
         leader_count,
         (0..3)
-            .filter(|&i| {
-                cluster.nodes[i].raft.read().unwrap().state
-                    == NodeState::Leader
-            })
+            .filter(|&i| { cluster.nodes[i].raft.read().unwrap().state == NodeState::Leader })
             .collect::<Vec<_>>(),
     );
 
@@ -378,10 +374,8 @@ async fn pre_vote_concurrent_candidates_do_not_split_brain() {
 /// off-by-one can't sneak back via a refactor.
 #[tokio::test(flavor = "current_thread")]
 async fn pre_vote_quorum_requires_both_peers_in_3_node_cluster() {
-    let cluster = SimCluster::new_3_nodes(Arc::new(
-        oxide_kv::raft::fault_scheduler::AlwaysDeliver,
-    ))
-    .await;
+    let cluster =
+        SimCluster::new_3_nodes(Arc::new(oxide_kv::raft::fault_scheduler::AlwaysDeliver)).await;
 
     let n0 = cluster.nodes[0].raft.clone();
     let initial_term = n0.read().unwrap().current_term;

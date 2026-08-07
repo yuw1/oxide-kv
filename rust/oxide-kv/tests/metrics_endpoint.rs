@@ -22,13 +22,14 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use oxide_kv::observability::server::handle_connection;
 use oxide_kv::observability::Metrics;
+use oxide_kv::observability::server::handle_connection;
 use oxide_kv::raft::net::StopSignal;
 
 async fn drive_one_request(metrics_port: u16, request: &[u8]) -> String {
-    let metrics = Metrics::with_peers(&["127.0.0.1:9002".to_string(), "127.0.0.1:9003".to_string()])
-        .expect("registry");
+    let metrics =
+        Metrics::with_peers(&["127.0.0.1:9002".to_string(), "127.0.0.1:9003".to_string()])
+            .expect("registry");
     // Seed a couple of gauges so the response carries real
     // values (not just pre-registered zeros).
     metrics.raft_term.set(13);
@@ -59,11 +60,7 @@ async fn drive_one_request(metrics_port: u16, request: &[u8]) -> String {
     let mut resp = Vec::new();
     // Bound the read with a timeout so a hung server doesn't hang
     // the test forever.
-    let read = tokio::time::timeout(
-        Duration::from_secs(2),
-        client.read_to_end(&mut resp),
-    )
-    .await;
+    let read = tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut resp)).await;
     let _ = read.expect("server read timeout").expect("read");
 
     stop.stop();
@@ -77,11 +74,7 @@ async fn metrics_endpoint_serves_prometheus_text() {
     let metrics_port = listener.local_addr().unwrap().port();
     drop(listener);
 
-    let s = drive_one_request(
-        metrics_port,
-        b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n",
-    )
-    .await;
+    let s = drive_one_request(metrics_port, b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n").await;
 
     assert!(s.starts_with("HTTP/1.1 200 OK\r\n"), "status: {}", s);
     assert!(
@@ -122,11 +115,7 @@ async fn metrics_endpoint_health_returns_ok() {
     let metrics_port = listener.local_addr().unwrap().port();
     drop(listener);
 
-    let s = drive_one_request(
-        metrics_port,
-        b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n",
-    )
-    .await;
+    let s = drive_one_request(metrics_port, b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n").await;
     assert!(s.starts_with("HTTP/1.1 200 OK\r\n"), "got: {}", s);
     assert!(s.ends_with("ok\n"), "body: {}", s);
 }

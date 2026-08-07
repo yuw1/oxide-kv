@@ -262,11 +262,7 @@ impl ReferenceModel {
     /// considers committed, regardless of any
     /// intermediate drains that may have used a
     /// previous leader's log.
-    pub fn replay_from_leader(
-        &mut self,
-        cluster: &SimCluster,
-        commit_index: u64,
-    ) -> usize {
+    pub fn replay_from_leader(&mut self, cluster: &SimCluster, commit_index: u64) -> usize {
         let leader_idx = match cluster.leader_index() {
             Some(idx) => idx,
             None => {
@@ -318,7 +314,13 @@ mod tests {
     #[test]
     fn reference_model_set_then_get() {
         let mut rm = ReferenceModel::new();
-        assert!(rm.apply(1, &Command::Set { key: "k".into(), value: "v".into() }));
+        assert!(rm.apply(
+            1,
+            &Command::Set {
+                key: "k".into(),
+                value: "v".into()
+            }
+        ));
         assert_eq!(rm.get("k"), Some(&"v".to_string()));
         assert_eq!(rm.applied_index(), 1);
     }
@@ -326,7 +328,13 @@ mod tests {
     #[test]
     fn reference_model_delete_removes_key() {
         let mut rm = ReferenceModel::new();
-        rm.apply(1, &Command::Set { key: "k".into(), value: "v".into() });
+        rm.apply(
+            1,
+            &Command::Set {
+                key: "k".into(),
+                value: "v".into(),
+            },
+        );
         rm.apply(2, &Command::Delete { key: "k".into() });
         assert_eq!(rm.get("k"), None);
         assert_eq!(rm.applied_index(), 2);
@@ -336,19 +344,43 @@ mod tests {
     fn reference_model_out_of_order_apply_returns_false() {
         let mut rm = ReferenceModel::new();
         // Index 3 before index 1 — gap, returns false.
-        assert!(!rm.apply(3, &Command::Set { key: "k".into(), value: "v".into() }));
+        assert!(!rm.apply(
+            3,
+            &Command::Set {
+                key: "k".into(),
+                value: "v".into()
+            }
+        ));
         assert_eq!(rm.applied_index(), 0);
         // Now apply in order.
-        assert!(rm.apply(1, &Command::Set { key: "k".into(), value: "v".into() }));
+        assert!(rm.apply(
+            1,
+            &Command::Set {
+                key: "k".into(),
+                value: "v".into()
+            }
+        ));
         assert_eq!(rm.applied_index(), 1);
     }
 
     #[test]
     fn reference_model_stale_index_skipped() {
         let mut rm = ReferenceModel::new();
-        rm.apply(1, &Command::Set { key: "k".into(), value: "v".into() });
+        rm.apply(
+            1,
+            &Command::Set {
+                key: "k".into(),
+                value: "v".into(),
+            },
+        );
         // Re-applying index 1 is a no-op.
-        assert!(!rm.apply(1, &Command::Set { key: "k".into(), value: "other".into() }));
+        assert!(!rm.apply(
+            1,
+            &Command::Set {
+                key: "k".into(),
+                value: "other".into()
+            }
+        ));
         assert_eq!(rm.get("k"), Some(&"v".to_string()));
     }
 
@@ -363,17 +395,47 @@ mod tests {
     #[test]
     fn reference_model_overwrite_takes_latest() {
         let mut rm = ReferenceModel::new();
-        rm.apply(1, &Command::Set { key: "k".into(), value: "v1".into() });
-        rm.apply(2, &Command::Set { key: "k".into(), value: "v2".into() });
-        rm.apply(3, &Command::Set { key: "k".into(), value: "v3".into() });
+        rm.apply(
+            1,
+            &Command::Set {
+                key: "k".into(),
+                value: "v1".into(),
+            },
+        );
+        rm.apply(
+            2,
+            &Command::Set {
+                key: "k".into(),
+                value: "v2".into(),
+            },
+        );
+        rm.apply(
+            3,
+            &Command::Set {
+                key: "k".into(),
+                value: "v3".into(),
+            },
+        );
         assert_eq!(rm.get("k"), Some(&"v3".to_string()));
     }
 
     #[test]
     fn reference_model_snapshot_returns_full_state() {
         let mut rm = ReferenceModel::new();
-        rm.apply(1, &Command::Set { key: "a".into(), value: "1".into() });
-        rm.apply(2, &Command::Set { key: "b".into(), value: "2".into() });
+        rm.apply(
+            1,
+            &Command::Set {
+                key: "a".into(),
+                value: "1".into(),
+            },
+        );
+        rm.apply(
+            2,
+            &Command::Set {
+                key: "b".into(),
+                value: "2".into(),
+            },
+        );
         let snap = rm.snapshot();
         assert_eq!(snap.len(), 2);
         assert_eq!(snap.get("a"), Some(&"1".to_string()));
@@ -390,7 +452,10 @@ mod tests {
             1,
             &Command::BeginTx {
                 tx_id: "t1".into(),
-                ops: vec![TxOp::Put { key: "a".into(), value: "1".into() }],
+                ops: vec![TxOp::Put {
+                    key: "a".into(),
+                    value: "1".into()
+                }],
             }
         ));
         assert_eq!(rm.get("a"), None, "staged ops must be invisible pre-commit");
@@ -405,14 +470,23 @@ mod tests {
             &Command::BeginTx {
                 tx_id: "t1".into(),
                 ops: vec![
-                    TxOp::Put { key: "a".into(), value: "1".into() },
-                    TxOp::Put { key: "b".into(), value: "2".into() },
+                    TxOp::Put {
+                        key: "a".into(),
+                        value: "1".into(),
+                    },
+                    TxOp::Put {
+                        key: "b".into(),
+                        value: "2".into(),
+                    },
                 ],
             },
         );
         assert!(rm.apply(
             2,
-            &Command::DecideTx { tx_id: "t1".into(), decision: TxDecision::Commit }
+            &Command::DecideTx {
+                tx_id: "t1".into(),
+                decision: TxDecision::Commit
+            }
         ));
         assert_eq!(rm.get("a"), Some(&"1".to_string()));
         assert_eq!(rm.get("b"), Some(&"2".to_string()));
@@ -421,17 +495,29 @@ mod tests {
     #[test]
     fn reference_model_decide_abort_discards_ops() {
         let mut rm = ReferenceModel::new();
-        rm.apply(1, &Command::Set { key: "a".into(), value: "pre".into() });
+        rm.apply(
+            1,
+            &Command::Set {
+                key: "a".into(),
+                value: "pre".into(),
+            },
+        );
         rm.apply(
             2,
             &Command::BeginTx {
                 tx_id: "t1".into(),
-                ops: vec![TxOp::Put { key: "a".into(), value: "new".into() }],
+                ops: vec![TxOp::Put {
+                    key: "a".into(),
+                    value: "new".into(),
+                }],
             },
         );
         assert!(rm.apply(
             3,
-            &Command::DecideTx { tx_id: "t1".into(), decision: TxDecision::Abort }
+            &Command::DecideTx {
+                tx_id: "t1".into(),
+                decision: TxDecision::Abort
+            }
         ));
         // Abort must leave the pre-tx value intact.
         assert_eq!(rm.get("a"), Some(&"pre".to_string()));
@@ -440,7 +526,13 @@ mod tests {
     #[test]
     fn reference_model_decide_delete_op_applies() {
         let mut rm = ReferenceModel::new();
-        rm.apply(1, &Command::Set { key: "a".into(), value: "1".into() });
+        rm.apply(
+            1,
+            &Command::Set {
+                key: "a".into(),
+                value: "1".into(),
+            },
+        );
         rm.apply(
             2,
             &Command::BeginTx {
@@ -450,7 +542,10 @@ mod tests {
         );
         rm.apply(
             3,
-            &Command::DecideTx { tx_id: "t1".into(), decision: TxDecision::Commit },
+            &Command::DecideTx {
+                tx_id: "t1".into(),
+                decision: TxDecision::Commit,
+            },
         );
         assert_eq!(rm.get("a"), None);
     }
@@ -458,11 +553,20 @@ mod tests {
     #[test]
     fn reference_model_decide_unknown_tx_is_no_op() {
         let mut rm = ReferenceModel::new();
-        rm.apply(1, &Command::Set { key: "a".into(), value: "1".into() });
+        rm.apply(
+            1,
+            &Command::Set {
+                key: "a".into(),
+                value: "1".into(),
+            },
+        );
         // DecideTx for a tx that was never begun: no-op, no panic.
         assert!(rm.apply(
             2,
-            &Command::DecideTx { tx_id: "ghost".into(), decision: TxDecision::Commit }
+            &Command::DecideTx {
+                tx_id: "ghost".into(),
+                decision: TxDecision::Commit
+            }
         ));
         assert_eq!(rm.get("a"), Some(&"1".to_string()));
         assert_eq!(rm.applied_index(), 2);
@@ -475,7 +579,10 @@ mod tests {
             1,
             &Command::BeginTx {
                 tx_id: "t1".into(),
-                ops: vec![TxOp::Put { key: "a".into(), value: "1".into() }],
+                ops: vec![TxOp::Put {
+                    key: "a".into(),
+                    value: "1".into(),
+                }],
             },
         );
         rm.reset();
@@ -483,7 +590,10 @@ mod tests {
         // (the staged ops are gone), not a resurrection.
         rm.apply(
             1,
-            &Command::DecideTx { tx_id: "t1".into(), decision: TxDecision::Commit },
+            &Command::DecideTx {
+                tx_id: "t1".into(),
+                decision: TxDecision::Commit,
+            },
         );
         assert_eq!(rm.get("a"), None);
     }

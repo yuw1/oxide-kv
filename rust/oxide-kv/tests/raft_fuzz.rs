@@ -258,8 +258,7 @@ async fn run_actions(actions: &[Action]) -> Result<(), String> {
     // Message-level faults are covered by the unit tests
     // in PR #21 and the integration tests in PR #26.
     let partition = Arc::new(PartitionedNetwork::new());
-    let scheduler: Arc<dyn oxide_kv::raft::fault_scheduler::FaultScheduler> =
-        partition.clone();
+    let scheduler: Arc<dyn oxide_kv::raft::fault_scheduler::FaultScheduler> = partition.clone();
     let mut cluster = SimCluster::new_3_nodes(scheduler).await;
 
     // Drive an initial election so we have a leader to
@@ -285,7 +284,8 @@ async fn run_actions(actions: &[Action]) -> Result<(), String> {
         if std::time::Instant::now() >= scenario_deadline {
             return Err(format!(
                 "[fuzz] scenario deadline exceeded at action {}/{}; aborting",
-                i, actions.len()
+                i,
+                actions.len()
             ));
         }
         match action {
@@ -296,9 +296,7 @@ async fn run_actions(actions: &[Action]) -> Result<(), String> {
             }
             Action::SubmitDelete { key } => {
                 if let Some(leader) = cluster.leader_index() {
-                    let cmd = oxide_kv::protocol::Command::Delete {
-                        key: key.clone(),
-                    };
+                    let cmd = oxide_kv::protocol::Command::Delete { key: key.clone() };
                     let _ = cluster.submit_command(leader, cmd);
                 }
             }
@@ -342,10 +340,7 @@ async fn run_actions(actions: &[Action]) -> Result<(), String> {
                 }
             }
             Action::PartitionLink { from, to } => {
-                partition.partition(LinkId::new(
-                    format!("n{}", from),
-                    format!("n{}", to),
-                ));
+                partition.partition(LinkId::new(format!("n{}", from), format!("n{}", to)));
             }
             Action::HealPartitions => {
                 partition.heal();
@@ -379,11 +374,7 @@ async fn run_actions(actions: &[Action]) -> Result<(), String> {
             // current leader's commit_index (which may
             // not have advanced yet for this op).
             if let Some(leader) = cluster.leader_index() {
-                let commit_idx = cluster.nodes[leader]
-                    .raft
-                    .read()
-                    .unwrap()
-                    .commit_index;
+                let commit_idx = cluster.nodes[leader].raft.read().unwrap().commit_index;
                 rm.drain_to(&cluster, commit_idx);
             }
             // Brief yield so commit can advance.
@@ -392,16 +383,10 @@ async fn run_actions(actions: &[Action]) -> Result<(), String> {
 
         // Drain again on partition/heal/restart to
         // catch the cluster up before the next action.
-        if matches!(
-            action,
-            Action::HealPartitions | Action::RestartNode { .. }
-        ) && let Some(leader) = cluster.leader_index()
+        if matches!(action, Action::HealPartitions | Action::RestartNode { .. })
+            && let Some(leader) = cluster.leader_index()
         {
-            let commit_idx = cluster.nodes[leader]
-                .raft
-                .read()
-                .unwrap()
-                .commit_index;
+            let commit_idx = cluster.nodes[leader].raft.read().unwrap().commit_index;
             rm.drain_to(&cluster, commit_idx);
         }
 
@@ -420,11 +405,7 @@ async fn run_actions(actions: &[Action]) -> Result<(), String> {
     // Final drain: pull the reference model forward to
     // the cluster's last committed index.
     if let Some(leader) = cluster.leader_index() {
-        let commit_idx = cluster.nodes[leader]
-            .raft
-            .read()
-            .unwrap()
-            .commit_index;
+        let commit_idx = cluster.nodes[leader].raft.read().unwrap().commit_index;
         rm.drain_to(&cluster, commit_idx);
     }
 
@@ -438,13 +419,11 @@ async fn run_actions(actions: &[Action]) -> Result<(), String> {
     // positive on transient replication lag.
     //
     // We poll up to 5s wall-clock, generous for CI hosts.
-    let settle_deadline = std::time::Instant::now()
-        + Duration::from_secs(5);
+    let settle_deadline = std::time::Instant::now() + Duration::from_secs(5);
     'settle: loop {
         // Use alive leader (skip killed nodes).
         let alive_leader = (0..3).find(|&i| {
-            !killed[i]
-                && cluster.nodes[i].raft.read().unwrap().state == NodeState::Leader
+            !killed[i] && cluster.nodes[i].raft.read().unwrap().state == NodeState::Leader
         });
         let leader_commit = alive_leader
             .map(|l| cluster.nodes[l].raft.read().unwrap().commit_index)
@@ -453,11 +432,7 @@ async fn run_actions(actions: &[Action]) -> Result<(), String> {
             if killed[n] {
                 return true; // skip killed nodes
             }
-            let last_applied = cluster.nodes[n]
-                .raft
-                .read()
-                .unwrap()
-                .last_applied;
+            let last_applied = cluster.nodes[n].raft.read().unwrap().last_applied;
             last_applied >= leader_commit
         });
         if all_caught_up {
@@ -486,10 +461,8 @@ async fn run_actions(actions: &[Action]) -> Result<(), String> {
     // from the *current* leader's log up to the
     // *current* leader's commit_index.
     // Find an *alive* leader (skipping killed nodes).
-    let alive_leader = (0..3).find(|&i| {
-        !killed[i]
-            && cluster.nodes[i].raft.read().unwrap().state == NodeState::Leader
-    });
+    let alive_leader = (0..3)
+        .find(|&i| !killed[i] && cluster.nodes[i].raft.read().unwrap().state == NodeState::Leader);
     let leader_commit = alive_leader
         .map(|l| cluster.nodes[l].raft.read().unwrap().commit_index)
         .unwrap_or(0);
@@ -733,10 +706,7 @@ const SHRINK_MAX_ITERATIONS: usize = 256;
 /// original scenario doesn't fail in the first place (callers
 /// can use this to gate the entry-point test on actual
 /// reproduction).
-async fn shrink_failing_scenario(
-    seed: u64,
-    action_len: usize,
-) -> Option<Vec<Action>> {
+async fn shrink_failing_scenario(seed: u64, action_len: usize) -> Option<Vec<Action>> {
     // Step 0: reproduce. We need a known-failing scenario to
     // shrink; bail out otherwise.
     let mut rng = FuzzRng::new(seed);
@@ -756,10 +726,7 @@ async fn shrink_failing_scenario(
 /// the property tests so they don't need to drive the full
 /// cluster harness. Algorithmically identical to the async
 /// version; only the checker type differs.
-async fn shrink_with_checker<F>(
-    original: &[Action],
-    check: F,
-) -> Vec<Action>
+async fn shrink_with_checker<F>(original: &[Action], check: F) -> Vec<Action>
 where
     F: Fn(&[Action]) -> bool,
 {
@@ -770,9 +737,7 @@ where
     while chunk > 0 && iterations < SHRINK_MAX_ITERATIONS {
         let mut progressed = false;
         let mut start = 0usize;
-        while start + chunk <= current.len()
-            && iterations < SHRINK_MAX_ITERATIONS
-        {
+        while start + chunk <= current.len() && iterations < SHRINK_MAX_ITERATIONS {
             let mut candidate = current.clone();
             candidate.drain(start..start + chunk);
             iterations += 1;
@@ -809,10 +774,7 @@ where
 /// Async variant of [`shrink_with_checker`]: drives `check`
 /// (an async closure) sequentially so we can use the real
 /// `run_actions` future as the failure oracle.
-async fn shrink_with_async_checker<F, Fut>(
-    original: &[Action],
-    check: F,
-) -> Vec<Action>
+async fn shrink_with_async_checker<F, Fut>(original: &[Action], check: F) -> Vec<Action>
 where
     F: Fn(Vec<Action>) -> Fut,
     Fut: std::future::Future<Output = bool>,
@@ -825,9 +787,7 @@ where
     while chunk > 0 && iterations < SHRINK_MAX_ITERATIONS {
         let mut progressed = false;
         let mut start = 0usize;
-        while start + chunk <= current.len()
-            && iterations < SHRINK_MAX_ITERATIONS
-        {
+        while start + chunk <= current.len() && iterations < SHRINK_MAX_ITERATIONS {
             let mut candidate = current.clone();
             candidate.drain(start..start + chunk);
             iterations += 1;
@@ -886,16 +846,10 @@ fn format_shrunk_sequence(actions: &[Action]) -> String {
                 ));
             }
             Action::SubmitDelete { key } => {
-                out.push_str(&format!(
-                    "SubmitDelete {{ key: {}.into() }},\n",
-                    key
-                ));
+                out.push_str(&format!("SubmitDelete {{ key: {}.into() }},\n", key));
             }
             Action::SubmitTx { tx_id, ops } => {
-                out.push_str(&format!(
-                    "SubmitTx {{ tx_id: {}.into(), ops: vec![",
-                    tx_id
-                ));
+                out.push_str(&format!("SubmitTx {{ tx_id: {}.into(), ops: vec![", tx_id));
                 for op in ops {
                     match op {
                         oxide_kv::protocol::TxOp::Put { key, value } => {
@@ -905,10 +859,7 @@ fn format_shrunk_sequence(actions: &[Action]) -> String {
                             ));
                         }
                         oxide_kv::protocol::TxOp::Delete { key } => {
-                            out.push_str(&format!(
-                                "TxOp::Delete {{ key: {}.into() }},",
-                                key
-                            ));
+                            out.push_str(&format!("TxOp::Delete {{ key: {}.into() }},", key));
                         }
                     }
                 }
@@ -924,10 +875,7 @@ fn format_shrunk_sequence(actions: &[Action]) -> String {
                 out.push_str(&format!("KillNode {{ idx: {} }},\n", idx));
             }
             Action::RestartNode { idx } => {
-                out.push_str(&format!(
-                    "RestartNode {{ idx: {} }},\n",
-                    idx
-                ));
+                out.push_str(&format!("RestartNode {{ idx: {} }},\n", idx));
             }
             Action::PartitionLink { from, to } => {
                 out.push_str(&format!(
@@ -1011,9 +959,7 @@ async fn shrink_repro() {
 #[tokio::test]
 async fn shrink_algorithm_reduces_to_minimum() {
     // 25 actions: 1 SubmitSet + 24 Yield. Original length 25.
-    let mut actions: Vec<Action> = (0..24)
-        .map(|_| Action::Yield)
-        .collect();
+    let mut actions: Vec<Action> = (0..24).map(|_| Action::Yield).collect();
     actions.push(Action::SubmitSet {
         key: "k0".into(),
         value: "v0".into(),
@@ -1063,17 +1009,14 @@ async fn shrink_algorithm_no_op_on_pass() {
 /// failing input (and never longer).
 #[tokio::test]
 async fn shrink_algorithm_strictly_shorter_or_equal() {
-    let mut actions: Vec<Action> = (0..50)
-        .map(|_| Action::Yield)
-        .collect();
+    let mut actions: Vec<Action> = (0..50).map(|_| Action::Yield).collect();
     // Mark "fail iff there is at least one DriveElection".
     actions.push(Action::DriveElection { candidate_idx: 0 });
     actions.push(Action::Yield);
     actions.push(Action::Yield);
 
     let shrunk = shrink_with_checker(&actions, |c| {
-        c.iter()
-            .any(|a| matches!(a, Action::DriveElection { .. }))
+        c.iter().any(|a| matches!(a, Action::DriveElection { .. }))
     })
     .await;
 
@@ -1108,7 +1051,9 @@ async fn shrink_algorithm_strictly_shorter_or_equal() {
 #[tokio::test]
 async fn fuzz_default_seeds_0_to_200() {
     for seed in 0..200u64 {
-        run_scenario(seed, 25).await.unwrap_or_else(|e| panic!("{}", e));
+        run_scenario(seed, 25)
+            .await
+            .unwrap_or_else(|e| panic!("{}", e));
     }
 }
 
@@ -1117,7 +1062,9 @@ async fn fuzz_default_seeds_0_to_200() {
 #[tokio::test]
 async fn fuzz_default_seeds_1000_to_1200() {
     for seed in 1000..1200u64 {
-        run_scenario(seed, 25).await.unwrap_or_else(|e| panic!("{}", e));
+        run_scenario(seed, 25)
+            .await
+            .unwrap_or_else(|e| panic!("{}", e));
     }
 }
 
@@ -1126,7 +1073,9 @@ async fn fuzz_default_seeds_1000_to_1200() {
 #[tokio::test]
 async fn fuzz_long_seeds_2000_to_2100() {
     for seed in 2000..2100u64 {
-        run_scenario(seed, 50).await.unwrap_or_else(|e| panic!("{}", e));
+        run_scenario(seed, 50)
+            .await
+            .unwrap_or_else(|e| panic!("{}", e));
     }
 }
 
@@ -1136,7 +1085,9 @@ async fn fuzz_long_seeds_2000_to_2100() {
 #[tokio::test]
 async fn fuzz_short_seeds_3000_to_3100() {
     for seed in 3000..3100u64 {
-        run_scenario(seed, 5).await.unwrap_or_else(|e| panic!("{}", e));
+        run_scenario(seed, 5)
+            .await
+            .unwrap_or_else(|e| panic!("{}", e));
     }
 }
 
@@ -1165,6 +1116,8 @@ async fn fuzz_smoke_single_seed() {
 #[ignore = "nightly: 1000-scenario sweep driven by .github/workflows/nightly.yml"]
 async fn fuzz_nightly_seeds_10000_to_11000() {
     for seed in 10000..11000u64 {
-        run_scenario(seed, 25).await.unwrap_or_else(|e| panic!("{}", e));
+        run_scenario(seed, 25)
+            .await
+            .unwrap_or_else(|e| panic!("{}", e));
     }
 }

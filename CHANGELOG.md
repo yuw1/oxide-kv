@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (chore: apply `cargo fmt` to entire workspace)
+
+Mechanical formatting pass via `cargo fmt --all` against the Rust
+2024 edition default style. Touches 44 files (1,844 insertions
+/1,120 deletions) — the change is entirely whitespace, import
+re-ordering, and line-wrap reformatting. **Zero behavioural
+change, zero source logic change.**
+
+Common shapes the formatter rewrites:
+
+- Multi-line struct literals collapsed to one line when they fit
+  the column limit (e.g.
+  `Configuration::Simple(vec![ServerId { node_id: ... }, ...])`
+  → one-statement-per-element variants).
+- Long function signatures broken into one-argument-per-line form
+  (`fn handle_install_snapshot(&mut self, args: &InstallSnapshotArgs)`
+  → wrapped multi-line).
+- `use` blocks alphabetised and re-grouped per rustfmt 2024 rules
+  (`use serde_json::{json, Value}` → `use serde_json::{Value, json}`).
+- Single-line `if` statements broken into braced blocks
+  (`if self.state != NodeState::Leader { return; }`).
+- Trailing newline at EOF added where missing (rustfmt enforces
+  exactly one trailing newline).
+
+This is the baseline before the `format:` CI gate lands in a
+follow-up PR (`cargo fmt --all -- --check` will then run on every
+PR and reject any code that drifts from rustfmt output). Without
+this commit landing first, the gate would block every existing PR
+until the codebase is reformatted.
+
+CHANGELOG: Unreleased / Changed (chore: apply `cargo fmt` to entire workspace).
+
+Verified: `cargo build --release` clean; `cargo test --lib` 271
+passed, 0 failed, 0 ignored; `cargo fmt --all -- --check` exits 0.
+
 ### Removed (workspace: drop stale root `build.rs` + `proto/` duplicates)
 
 When the project moved to a multi-crate workspace (P5 era: crates

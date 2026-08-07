@@ -29,9 +29,7 @@
 //! Per-peer gauges (`peer_match_index`, `peer_next_index`) are
 //! updated at the end of every AppendEntries reply, in `sync_logs`.
 
-use prometheus::{
-    Encoder, IntCounter, IntGauge, IntGaugeVec, Registry, TextEncoder,
-};
+use prometheus::{Encoder, IntCounter, IntGauge, IntGaugeVec, Registry, TextEncoder};
 use std::sync::Arc;
 
 /// All typed metric handles. Holds the `prometheus::Registry`
@@ -244,16 +242,25 @@ mod tests {
 
     #[test]
     fn new_registers_all_metrics() {
-        let m = Metrics::with_peers(&["127.0.0.1:9002".to_string()])
-            .expect("registry construction");
+        let m =
+            Metrics::with_peers(&["127.0.0.1:9002".to_string()]).expect("registry construction");
         // `gather_text` returning a non-empty buffer implies every
         // registered gauge / counter was encoded.
         let buf = m.gather_text().expect("encode");
         let s = std::str::from_utf8(&buf).expect("utf-8");
         assert!(s.contains("oxide_raft_term"), "missing raft_term: {}", s);
-        assert!(s.contains("oxide_raft_commit_index"), "missing raft_commit_index");
-        assert!(s.contains("oxide_raft_last_applied"), "missing raft_last_applied");
-        assert!(s.contains("oxide_raft_log_length"), "missing raft_log_length");
+        assert!(
+            s.contains("oxide_raft_commit_index"),
+            "missing raft_commit_index"
+        );
+        assert!(
+            s.contains("oxide_raft_last_applied"),
+            "missing raft_last_applied"
+        );
+        assert!(
+            s.contains("oxide_raft_log_length"),
+            "missing raft_log_length"
+        );
         assert!(s.contains("oxide_raft_role"), "missing raft_role");
         assert!(
             s.contains("oxide_raft_snapshot_age_seconds"),
@@ -263,7 +270,10 @@ mod tests {
             s.contains("oxide_raft_snapshot_bytes"),
             "missing raft_snapshot_bytes"
         );
-        assert!(s.contains("oxide_tx_pending_count"), "missing tx_pending_count");
+        assert!(
+            s.contains("oxide_tx_pending_count"),
+            "missing tx_pending_count"
+        );
         assert!(
             s.contains("oxide_tx_timeout_aborted_total"),
             "missing tx_timeout_aborted_total"
@@ -272,14 +282,20 @@ mod tests {
             s.contains("oxide_tx_admin_aborted_total"),
             "missing tx_admin_aborted_total"
         );
-        assert!(s.contains("oxide_peer_match_index"), "missing peer_match_index");
-        assert!(s.contains("oxide_peer_next_index"), "missing peer_next_index");
+        assert!(
+            s.contains("oxide_peer_match_index"),
+            "missing peer_match_index"
+        );
+        assert!(
+            s.contains("oxide_peer_next_index"),
+            "missing peer_next_index"
+        );
     }
 
     #[test]
     fn typed_setters_appear_in_gather() {
-        let m = Metrics::with_peers(&["127.0.0.1:9002".to_string()])
-            .expect("registry construction");
+        let m =
+            Metrics::with_peers(&["127.0.0.1:9002".to_string()]).expect("registry construction");
         m.raft_term.set(7);
         m.raft_commit_index.set(42);
         m.raft_log_length.set(99);
@@ -297,23 +313,27 @@ mod tests {
         // We don't pin the timestamp, so we just look for the
         // value-bearing line.
         assert!(
-            s.lines().any(|l| l.starts_with("oxide_raft_term ") && l.ends_with(" 7")),
+            s.lines()
+                .any(|l| l.starts_with("oxide_raft_term ") && l.ends_with(" 7")),
             "raft_term value missing:\n{}",
             s
         );
         assert!(
-            s.lines().any(|l| l.starts_with("oxide_raft_commit_index ") && l.ends_with(" 42")),
+            s.lines()
+                .any(|l| l.starts_with("oxide_raft_commit_index ") && l.ends_with(" 42")),
             "commit_index missing:\n{}",
             s
         );
         assert!(
-            s.lines()
-                .any(|l| l.starts_with("oxide_peer_match_index{") && l.contains("9002") && l.ends_with(" 17")),
+            s.lines().any(|l| l.starts_with("oxide_peer_match_index{")
+                && l.contains("9002")
+                && l.ends_with(" 17")),
             "peer_match_index missing:\n{}",
             s
         );
         assert!(
-            s.lines().any(|l| l.starts_with("oxide_tx_admin_aborted_total ") && l.ends_with(" 1")),
+            s.lines()
+                .any(|l| l.starts_with("oxide_tx_admin_aborted_total ") && l.ends_with(" 1")),
             "admin_aborted_total missing:\n{}",
             s
         );

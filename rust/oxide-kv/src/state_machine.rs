@@ -257,7 +257,10 @@ impl StateMachine {
 
     /// Insert or overwrite a key. Triggers a flush if the memtable threshold is exceeded.
     pub fn set(&mut self, key: &str, value: &str) -> io::Result<()> {
-        let op = WalOp::Put { key: key.to_string(), value: value.to_string() };
+        let op = WalOp::Put {
+            key: key.to_string(),
+            value: value.to_string(),
+        };
         self.append_wal(&op)?;
 
         if let Some(prev) = self.memtable.get(key) {
@@ -268,7 +271,12 @@ impl StateMachine {
             self.memtable_bytes += estimate_entry(key);
         }
         self.memtable_bytes += value.len();
-        self.memtable.insert(key.to_string(), MemEntry { value: Some(value.to_string()) });
+        self.memtable.insert(
+            key.to_string(),
+            MemEntry {
+                value: Some(value.to_string()),
+            },
+        );
 
         if self.memtable_bytes >= self.config.memtable_size_threshold {
             self.flush()?;
@@ -279,7 +287,9 @@ impl StateMachine {
     /// Tombstone a key. The tombstone persists through flush and is only
     /// dropped during compaction (and only if no later write resurrects it).
     pub fn delete(&mut self, key: &str) -> io::Result<()> {
-        let op = WalOp::Delete { key: key.to_string() };
+        let op = WalOp::Delete {
+            key: key.to_string(),
+        };
         self.append_wal(&op)?;
 
         if let Some(prev) = self.memtable.get(key) {
@@ -289,7 +299,8 @@ impl StateMachine {
         } else {
             self.memtable_bytes += estimate_entry(key);
         }
-        self.memtable.insert(key.to_string(), MemEntry { value: None });
+        self.memtable
+            .insert(key.to_string(), MemEntry { value: None });
 
         if self.memtable_bytes >= self.config.memtable_size_threshold {
             self.flush()?;
@@ -316,7 +327,11 @@ impl StateMachine {
             for entry in &entries {
                 match entry.key.as_str().cmp(key) {
                     std::cmp::Ordering::Equal => {
-                        return if entry.tombstone { None } else { entry.value.clone() };
+                        return if entry.tombstone {
+                            None
+                        } else {
+                            entry.value.clone()
+                        };
                     }
                     std::cmp::Ordering::Greater => return None,
                     std::cmp::Ordering::Less => continue,
@@ -364,10 +379,7 @@ impl StateMachine {
     /// *after* `last_included_index`. 2PC `pending_txs` are also cleared,
     /// since they belong to Raft log state, not LSM state — and we cannot
     /// reconstruct them from the snapshot alone.
-    pub fn install_snapshot(
-        &mut self,
-        data: HashMap<String, String>,
-    ) -> io::Result<()> {
+    pub fn install_snapshot(&mut self, data: HashMap<String, String>) -> io::Result<()> {
         self.clear_for_snapshot()?;
         // Reset memtable_bytes so the loop below sees a clean slate, then
         // let each insert bump it via the same accounting used by the live
@@ -577,7 +589,10 @@ impl StateMachine {
         };
         write_json(&meta_path(&sst_path), &meta)?;
 
-        self.sstables.push(SSTableHandle { path: sst_path, meta });
+        self.sstables.push(SSTableHandle {
+            path: sst_path,
+            meta,
+        });
 
         // Reset memtable + WAL.
         self.memtable.clear();
@@ -626,7 +641,10 @@ impl StateMachine {
         // Drop the old SSTables.
         let old_paths: Vec<PathBuf> = self.sstables.iter().map(|s| s.path.clone()).collect();
         self.sstables.clear();
-        self.sstables.push(SSTableHandle { path: sst_path, meta });
+        self.sstables.push(SSTableHandle {
+            path: sst_path,
+            meta,
+        });
         for p in old_paths {
             let _ = fs::remove_file(&p);
             let _ = fs::remove_file(meta_path(&p));
@@ -635,8 +653,8 @@ impl StateMachine {
     }
 
     fn append_wal(&mut self, op: &WalOp) -> io::Result<()> {
-        let line = serde_json::to_string(op)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let line =
+            serde_json::to_string(op).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         writeln!(self.wal, "{line}")?;
         self.wal.sync_all()?;
         Ok(())
@@ -644,8 +662,8 @@ impl StateMachine {
 }
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
-    let s = serde_json::to_string_pretty(value)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let s =
+        serde_json::to_string_pretty(value).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     let tmp = path.with_extension("tmp");
     fs::write(&tmp, s)?;
     fs::rename(tmp, path)?;
@@ -783,8 +801,14 @@ mod tests {
             let v = "x".repeat(100);
             sm.set(&k, &v).unwrap();
         }
-        assert!(sm.sstable_count() > 0, "expected at least one SSTable after writes");
-        assert!(sm.memtable_len() < 50, "memtable should have been flushed at least once");
+        assert!(
+            sm.sstable_count() > 0,
+            "expected at least one SSTable after writes"
+        );
+        assert!(
+            sm.memtable_len() < 50,
+            "memtable should have been flushed at least once"
+        );
 
         // All keys must still be readable.
         for i in 0..50 {
@@ -802,7 +826,11 @@ mod tests {
         assert!(sm2.sstable_count() > 0);
         for i in 0..50 {
             let k = format!("key-{:03}", i);
-            assert_eq!(sm2.get(&k), Some("x".repeat(100)), "after reopen missing {k}");
+            assert_eq!(
+                sm2.get(&k),
+                Some("x".repeat(100)),
+                "after reopen missing {k}"
+            );
         }
     }
 
@@ -816,7 +844,11 @@ mod tests {
         sm.flush().unwrap();
 
         assert_eq!(sm.get("a"), None, "tombstone must hide the value");
-        assert_eq!(sm.get("b"), Some("2".to_string()), "live value must persist");
+        assert_eq!(
+            sm.get("b"),
+            Some("2".to_string()),
+            "live value must persist"
+        );
     }
 
     // ---------- manual flush + read across SSTables ----------
@@ -911,7 +943,11 @@ mod tests {
         sm.flush().unwrap();
         let count_before = sm.sstable_count();
         sm.compact().unwrap();
-        assert_eq!(sm.sstable_count(), count_before, "compact must be no-op with 1 sstable");
+        assert_eq!(
+            sm.sstable_count(),
+            count_before,
+            "compact must be no-op with 1 sstable"
+        );
     }
 
     // ---------- snapshot / clear ----------
@@ -977,7 +1013,8 @@ mod tests {
         sm.set("k", "v").unwrap();
         sm.flush().unwrap();
 
-        sm.install_snapshot(std::collections::HashMap::new()).unwrap();
+        sm.install_snapshot(std::collections::HashMap::new())
+            .unwrap();
 
         assert_eq!(sm.memtable_len(), 0);
         assert_eq!(sm.sstable_count(), 0);
@@ -1057,7 +1094,10 @@ mod tests {
         let (_d, mut sm) = open_default();
         sm.begin_tx(
             "tx-1".into(),
-            vec![TxOp::Put { key: "a".into(), value: "1".into() }],
+            vec![TxOp::Put {
+                key: "a".into(),
+                value: "1".into(),
+            }],
         )
         .unwrap();
         // Reads must not see the pending op.
@@ -1075,8 +1115,14 @@ mod tests {
         sm.begin_tx(
             "tx-2".into(),
             vec![
-                TxOp::Put { key: "a".into(), value: "1".into() },
-                TxOp::Put { key: "b".into(), value: "2".into() },
+                TxOp::Put {
+                    key: "a".into(),
+                    value: "1".into(),
+                },
+                TxOp::Put {
+                    key: "b".into(),
+                    value: "2".into(),
+                },
                 TxOp::Delete { key: "c".into() },
             ],
         )
@@ -1097,8 +1143,14 @@ mod tests {
         sm.begin_tx(
             "tx-3".into(),
             vec![
-                TxOp::Put { key: "a".into(), value: "should-not-apply".into() },
-                TxOp::Put { key: "existing".into(), value: "should-not-overwrite".into() },
+                TxOp::Put {
+                    key: "a".into(),
+                    value: "should-not-apply".into(),
+                },
+                TxOp::Put {
+                    key: "existing".into(),
+                    value: "should-not-overwrite".into(),
+                },
             ],
         )
         .unwrap();
@@ -1113,11 +1165,18 @@ mod tests {
     #[test]
     fn record_vote_updates_pending_tx_view() {
         let (_d, mut sm) = open_default();
-        sm.begin_tx("tx-4".into(), vec![TxOp::Put { key: "k".into(), value: "v".into() }])
-            .unwrap();
+        sm.begin_tx(
+            "tx-4".into(),
+            vec![TxOp::Put {
+                key: "k".into(),
+                value: "v".into(),
+            }],
+        )
+        .unwrap();
 
         sm.record_vote("tx-4", "node-A".into(), Vote::Yes).unwrap();
-        sm.record_vote("tx-4", "node-B".into(), Vote::No("conflict".into())).unwrap();
+        sm.record_vote("tx-4", "node-B".into(), Vote::No("conflict".into()))
+            .unwrap();
 
         let view = sm.pending_tx("tx-4").unwrap();
         assert_eq!(view.op_count, 1);
@@ -1131,7 +1190,8 @@ mod tests {
     #[test]
     fn vote_for_unknown_tx_is_noop() {
         let (_d, mut sm) = open_default();
-        sm.record_vote("nonexistent", "node-A".into(), Vote::Yes).unwrap();
+        sm.record_vote("nonexistent", "node-A".into(), Vote::Yes)
+            .unwrap();
         assert_eq!(sm.pending_tx_count(), 0);
     }
 
@@ -1147,12 +1207,18 @@ mod tests {
         let (_d, mut sm) = open_default();
         sm.begin_tx(
             "tx-A".into(),
-            vec![TxOp::Put { key: "shared".into(), value: "from-A".into() }],
+            vec![TxOp::Put {
+                key: "shared".into(),
+                value: "from-A".into(),
+            }],
         )
         .unwrap();
         sm.begin_tx(
             "tx-B".into(),
-            vec![TxOp::Put { key: "shared".into(), value: "from-B".into() }],
+            vec![TxOp::Put {
+                key: "shared".into(),
+                value: "from-B".into(),
+            }],
         )
         .unwrap();
 
@@ -1179,12 +1245,18 @@ mod tests {
         let (_d, mut sm) = open_default();
         sm.begin_tx(
             "tx-dup".into(),
-            vec![TxOp::Put { key: "a".into(), value: "1".into() }],
+            vec![TxOp::Put {
+                key: "a".into(),
+                value: "1".into(),
+            }],
         )
         .unwrap();
         sm.begin_tx(
             "tx-dup".into(),
-            vec![TxOp::Put { key: "b".into(), value: "2".into() }],
+            vec![TxOp::Put {
+                key: "b".into(),
+                value: "2".into(),
+            }],
         )
         .unwrap();
         let view = sm.pending_tx("tx-dup").unwrap();
@@ -1200,14 +1272,20 @@ mod tests {
         // 1s old tx — should be returned at threshold = 100ms.
         sm.begin_tx_at(
             "old".into(),
-            vec![TxOp::Put { key: "k".into(), value: "v".into() }],
+            vec![TxOp::Put {
+                key: "k".into(),
+                value: "v".into(),
+            }],
             now.saturating_sub(1_000),
         )
         .unwrap();
         // Fresh tx (now) — should NOT be returned at threshold = 100ms.
         sm.begin_tx(
             "fresh".into(),
-            vec![TxOp::Put { key: "k2".into(), value: "v2".into() }],
+            vec![TxOp::Put {
+                key: "k2".into(),
+                value: "v2".into(),
+            }],
         )
         .unwrap();
 
@@ -1228,8 +1306,7 @@ mod tests {
 
         // After waiting past fresh's birth, both qualify.
         std::thread::sleep(std::time::Duration::from_millis(50));
-        let both =
-            sm.pending_txs_older_than(std::time::Duration::from_millis(20));
+        let both = sm.pending_txs_older_than(std::time::Duration::from_millis(20));
         assert_eq!(both.len(), 2);
     }
 
@@ -1243,7 +1320,10 @@ mod tests {
         let future_ts = now_unix_ms() + 60_000;
         sm.begin_tx_at(
             "future".into(),
-            vec![TxOp::Put { key: "k".into(), value: "v".into() }],
+            vec![TxOp::Put {
+                key: "k".into(),
+                value: "v".into(),
+            }],
             future_ts,
         )
         .unwrap();
@@ -1256,7 +1336,10 @@ mod tests {
         let (_d, mut sm) = open_default();
         sm.begin_tx(
             "live".into(),
-            vec![TxOp::Put { key: "k".into(), value: "v".into() }],
+            vec![TxOp::Put {
+                key: "k".into(),
+                value: "v".into(),
+            }],
         )
         .unwrap();
         assert!(sm.is_tx_pending("live"));
@@ -1280,7 +1363,10 @@ mod tests {
         let marker_ts: u64 = 1_700_000_123_456;
         sm.begin_tx_at(
             "json-test".into(),
-            vec![TxOp::Put { key: "k".into(), value: "v".into() }],
+            vec![TxOp::Put {
+                key: "k".into(),
+                value: "v".into(),
+            }],
             marker_ts,
         )
         .unwrap();

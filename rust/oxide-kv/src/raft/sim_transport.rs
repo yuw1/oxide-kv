@@ -160,10 +160,7 @@ impl Network {
     /// scheduler is shared by every `SimTransport` registered on
     /// this network, so a single `partition(...)` call from the
     /// harness affects every node's outbound path.
-    pub fn with_scheduler(
-        rpc_timeout: Duration,
-        scheduler: Arc<dyn FaultScheduler>,
-    ) -> Self {
+    pub fn with_scheduler(rpc_timeout: Duration, scheduler: Arc<dyn FaultScheduler>) -> Self {
         Self {
             inner: Arc::new(NetworkInner {
                 peers: Mutex::new(HashMap::new()),
@@ -195,11 +192,7 @@ impl Network {
 
     /// Consult the shared fault scheduler on an outbound message.
     /// Returns the outcome the caller should apply.
-    async fn consult_scheduler(
-        &self,
-        link: &LinkId,
-        body: &InboundMessageBody,
-    ) -> ScheduleOutcome {
+    async fn consult_scheduler(&self, link: &LinkId, body: &InboundMessageBody) -> ScheduleOutcome {
         self.inner.scheduler.before_send(link, body).await
     }
 
@@ -263,11 +256,7 @@ impl SimTransport {
     /// inbound receiver returned by [`Network::register`]. The
     /// receiver is moved into `self.inbound`; `serve` takes it back
     /// out.
-    pub fn new(
-        self_id: String,
-        network: Network,
-        inbound: mpsc::Receiver<InboundMessage>,
-    ) -> Self {
+    pub fn new(self_id: String, network: Network, inbound: mpsc::Receiver<InboundMessage>) -> Self {
         Self {
             self_id,
             network,
@@ -350,9 +339,10 @@ async fn push_with_reply(
         body,
         reply: Some(reply_tx),
     };
-    sender.send(inbound).await.map_err(|_| {
-        TransportError::Unreachable("peer inbound channel closed".to_string())
-    })?;
+    sender
+        .send(inbound)
+        .await
+        .map_err(|_| TransportError::Unreachable("peer inbound channel closed".to_string()))?;
     match reply_rx.await {
         Ok(result) => result,
         Err(_) => Err(TransportError::Protocol(
@@ -362,11 +352,7 @@ async fn push_with_reply(
 }
 
 impl Transport for SimTransport {
-    fn send_raft<'a>(
-        &'a self,
-        to: &'a str,
-        msg: RaftMessage,
-    ) -> futures::SendRaftFuture<'a> {
+    fn send_raft<'a>(&'a self, to: &'a str, msg: RaftMessage) -> futures::SendRaftFuture<'a> {
         let to_owned = to.to_string();
         let self_id = self.self_id.clone();
         let network = self.network.clone();
@@ -374,9 +360,9 @@ impl Transport for SimTransport {
         let fut = Box::pin(async move {
             // Unknown peer => Unreachable (matches TCP connection
             // refused behavior).
-            let sender = network
-                .lookup(&to_owned)
-                .ok_or_else(|| TransportError::Unreachable(format!("peer {} not registered", to_owned)))?;
+            let sender = network.lookup(&to_owned).ok_or_else(|| {
+                TransportError::Unreachable(format!("peer {} not registered", to_owned))
+            })?;
             // Consult the fault scheduler on the link from
             // `self_id` to `to_owned`. A `Drop` outcome makes
             // the sender see a Timeout (no reply ever arrives);
@@ -442,19 +428,15 @@ impl Transport for SimTransport {
         futures::SendRaftFuture(fut)
     }
 
-    fn send_vote<'a>(
-        &'a self,
-        to: &'a str,
-        req: VoteRequest,
-    ) -> futures::SendVoteFuture<'a> {
+    fn send_vote<'a>(&'a self, to: &'a str, req: VoteRequest) -> futures::SendVoteFuture<'a> {
         let to_owned = to.to_string();
         let self_id = self.self_id.clone();
         let network = self.network.clone();
         let rpc_timeout = network.rpc_timeout();
         let fut = Box::pin(async move {
-            let sender = network
-                .lookup(&to_owned)
-                .ok_or_else(|| TransportError::Unreachable(format!("peer {} not registered", to_owned)))?;
+            let sender = network.lookup(&to_owned).ok_or_else(|| {
+                TransportError::Unreachable(format!("peer {} not registered", to_owned))
+            })?;
             let link = LinkId::new(self_id.clone(), to_owned.clone());
             let body = InboundMessageBody::Vote(req);
             match network.consult_scheduler(&link, &body).await {
@@ -579,8 +561,7 @@ mod tests {
     use super::*;
     use crate::raft::clock::SystemClock;
     use crate::raft::rpc::{
-        AppendEntriesArgs, AppendReplyArgs, InstallSnapshotArgs,
-        RequestVoteArgs,
+        AppendEntriesArgs, AppendReplyArgs, InstallSnapshotArgs, RequestVoteArgs,
     };
 
     /// Helper: build a fresh `RaftNode` for tests. Mirrors the
@@ -653,10 +634,16 @@ mod tests {
                 // Fresh follower with empty log + candidate with
                 // matching empty log → vote is granted (both are
                 // "up-to-date", §5.4.1 election restriction).
-                assert!(reply.vote_granted, "empty-log follower should grant vote to empty-log candidate");
+                assert!(
+                    reply.vote_granted,
+                    "empty-log follower should grant vote to empty-log candidate"
+                );
                 assert_eq!(reply.term, 1);
             }
-            other => panic!("expected VoteResponse, got {:?}", std::mem::discriminant(&other)),
+            other => panic!(
+                "expected VoteResponse, got {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
     }
 
@@ -678,10 +665,16 @@ mod tests {
         .expect("dispatch should succeed for append entries");
         match result {
             RaftMessage::AppendReply(reply) => {
-                assert!(reply.success, "empty append with matching prev should succeed");
+                assert!(
+                    reply.success,
+                    "empty append with matching prev should succeed"
+                );
                 assert_eq!(reply.term, 1);
             }
-            other => panic!("expected AppendReply, got {:?}", std::mem::discriminant(&other)),
+            other => panic!(
+                "expected AppendReply, got {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
     }
 
@@ -769,10 +762,16 @@ mod tests {
                 // Fresh follower with empty log + candidate with
                 // matching empty log → vote is granted (both are
                 // "up-to-date", §5.4.1 election restriction).
-                assert!(v.vote_granted, "empty-log follower should grant vote to empty-log candidate");
+                assert!(
+                    v.vote_granted,
+                    "empty-log follower should grant vote to empty-log candidate"
+                );
                 assert_eq!(v.term, 1);
             }
-            other => panic!("expected VoteResponse, got {:?}", std::mem::discriminant(&other)),
+            other => panic!(
+                "expected VoteResponse, got {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
 
         // Clean up.
@@ -859,10 +858,16 @@ mod tests {
             .expect("heartbeat should succeed");
         match reply {
             RaftMessage::AppendReply(r) => {
-                assert!(r.success, "empty heartbeat with matching prev should succeed");
+                assert!(
+                    r.success,
+                    "empty heartbeat with matching prev should succeed"
+                );
                 assert_eq!(r.term, 1);
             }
-            other => panic!("expected AppendReply, got {:?}", std::mem::discriminant(&other)),
+            other => panic!(
+                "expected AppendReply, got {:?}",
+                std::mem::discriminant(&other)
+            ),
         }
 
         stop.stop();

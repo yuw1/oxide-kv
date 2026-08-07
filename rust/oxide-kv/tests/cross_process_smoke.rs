@@ -103,8 +103,8 @@ fn binary_path() -> PathBuf {
     // Prefer release (the dedicated CI step ships a release binary),
     // but fall back to debug so local `cargo test` works without
     // an explicit `cargo build --release` first.
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
-        .expect("CARGO_MANIFEST_DIR must be set by cargo test");
+    let manifest_dir =
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set by cargo test");
     let manifest = PathBuf::from(manifest_dir);
     let workspace = manifest.parent().unwrap().parent().unwrap();
     let release = workspace.join("target").join("release").join("oxide-kv");
@@ -124,17 +124,15 @@ fn binary_path() -> PathBuf {
 }
 
 fn workspace_root() -> PathBuf {
-    let manifest = PathBuf::from(
-        std::env::var("CARGO_MANIFEST_DIR")
-            .expect("CARGO_MANIFEST_DIR must be set"),
-    );
+    let manifest =
+        PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set"));
     manifest.parent().unwrap().parent().unwrap().to_path_buf()
 }
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // `raft` / `pid` / `data_dir` / `log` are
-                    // captured for diagnostics + future tests but
-                    // not all read today.
+// captured for diagnostics + future tests but
+// not all read today.
 struct NodeRecord {
     node: String,
     raft: u16,
@@ -243,9 +241,7 @@ fn http_get(url: &str, timeout: Duration) -> std::io::Result<String> {
     let stripped = url
         .trim_start_matches("http://")
         .trim_start_matches("https://");
-    let (host_port, path) = stripped
-        .split_once('/')
-        .unwrap_or((stripped, "metrics"));
+    let (host_port, path) = stripped.split_once('/').unwrap_or((stripped, "metrics"));
     let mut stream = TcpStream::connect(host_port)?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
@@ -285,13 +281,8 @@ fn parse_metric(body: &str, name: &str) -> Option<i64> {
 /// AbortTx. Times out after `timeout` if the server doesn't
 /// respond.
 #[allow(dead_code)]
-fn issue_command(
-    client_port: u16,
-    cmd: &str,
-    timeout: Duration,
-) -> serde_json::Value {
-    let mut stream = TcpStream::connect(("127.0.0.1", client_port))
-        .expect("connect client port");
+fn issue_command(client_port: u16, cmd: &str, timeout: Duration) -> serde_json::Value {
+    let mut stream = TcpStream::connect(("127.0.0.1", client_port)).expect("connect client port");
     stream.set_read_timeout(Some(timeout)).unwrap();
     stream.set_write_timeout(Some(timeout)).unwrap();
     stream.write_all(cmd.as_bytes()).unwrap();
@@ -431,15 +422,12 @@ fn client_port_serves_json_protocol() {
                 r#"{"Get":{"key":"smoke-probe"}}"#,
                 Duration::from_secs(2),
             );
-            let obj = resp.as_object()
-                .unwrap_or_else(|| panic!(
-                    "node {}: response is not a JSON object: {}",
-                    rec.node, resp
-                ));
+            let obj = resp.as_object().unwrap_or_else(|| {
+                panic!("node {}: response is not a JSON object: {}", rec.node, resp)
+            });
             // Must be either a success object or an error
             // object — never an empty body or a parse error.
-            let is_success = obj.contains_key("status")
-                || obj.contains_key("data");
+            let is_success = obj.contains_key("status") || obj.contains_key("data");
             let is_error = obj.contains_key("error");
             assert!(
                 is_success || is_error,
@@ -524,9 +512,7 @@ fn single_leader_converges_within_15_seconds() {
             }
             std::thread::sleep(Duration::from_millis(200));
         }
-        panic!(
-            "no single stable leader within 15s; pre-vote tie / split-brain still present"
-        );
+        panic!("no single stable leader within 15s; pre-vote tie / split-brain still present");
     });
 }
 
@@ -576,13 +562,9 @@ fn commit_index_advances_after_set_on_cluster() {
                 Duration::from_secs(2),
             )
             .unwrap();
-            let commit = parse_metric(&body, "oxide_raft_commit_index")
-                .unwrap_or(-1);
+            let commit = parse_metric(&body, "oxide_raft_commit_index").unwrap_or(-1);
             let role = parse_metric(&body, "oxide_raft_role").unwrap_or(-1);
-            eprintln!(
-                "node {}: role={} commit_index={}",
-                rec.node, role, commit
-            );
+            eprintln!("node {}: role={} commit_index={}", rec.node, role, commit);
             if commit >= 1 {
                 any_committed = true;
             }
@@ -652,11 +634,7 @@ fn set_then_get_on_leader_returns_written_value() {
             std::thread::sleep(Duration::from_millis(200));
         }
         let get_leader = get_leader.expect("no leader within 15s for Get");
-        let get_resp = issue_command(
-            get_leader,
-            r#"{"Get":{"key":"k"}}"#,
-            Duration::from_secs(5),
-        );
+        let get_resp = issue_command(get_leader, r#"{"Get":{"key":"k"}}"#, Duration::from_secs(5));
         assert_eq!(
             get_resp.get("data").and_then(|v| v.as_str()),
             Some("v"),

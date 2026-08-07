@@ -92,10 +92,7 @@ async fn dst_split_brain_old_leader_truncates_divergent_log() {
     // Step 5: n1 (new leader) appends "c" and commits it on
     // n1 + n2.
     let n1_idx_c = cluster.submit_set(1, "c", "3");
-    assert_eq!(
-        n1_idx_c, 2,
-        "n1's index 2 is 'c' (n1 doesn't see n0's 'b')"
-    );
+    assert_eq!(n1_idx_c, 2, "n1's index 2 is 'c' (n1 doesn't see n0's 'b')");
     cluster
         .wait_for_replication_except(n1_idx_c, &[0], Duration::from_secs(5))
         .await;
@@ -143,7 +140,10 @@ async fn dst_split_brain_old_leader_truncates_divergent_log() {
         if std::time::Instant::now() >= deadline {
             panic!(
                 "n0 did not converge after heal: log_len={}, has_b={}, last_applied={}, term={}",
-                n0_log.len(), has_b, n0_applied, n0_term
+                n0_log.len(),
+                has_b,
+                n0_applied,
+                n0_term
             );
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -259,7 +259,10 @@ async fn dst_divergent_log_higher_term_wins() {
         if std::time::Instant::now() >= deadline {
             panic!(
                 "n0 did not converge: term={}, state={:?}, log_len={}, last_applied={}",
-                n0.current_term, n0.state, n0.log.len(), n0.last_applied
+                n0.current_term,
+                n0.state,
+                n0.log.len(),
+                n0.last_applied
             );
         }
         drop(n0);
@@ -373,9 +376,7 @@ async fn dst_stale_leader_steps_down_and_does_not_apply_uncommitted() {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         let n0 = cluster.nodes[0].raft.read().unwrap();
-        if n0.current_term >= 2
-            && n0.state == oxide_kv::raft::node::NodeState::Follower
-        {
+        if n0.current_term >= 2 && n0.state == oxide_kv::raft::node::NodeState::Follower {
             break;
         }
         if std::time::Instant::now() >= deadline {
@@ -390,15 +391,11 @@ async fn dst_stale_leader_steps_down_and_does_not_apply_uncommitted() {
 
     // n0 should not still be Leader.
     assert!(
-        cluster.nodes[1].raft.read().unwrap().state
-            == oxide_kv::raft::node::NodeState::Leader
+        cluster.nodes[1].raft.read().unwrap().state == oxide_kv::raft::node::NodeState::Leader
             && cluster.current_term(1) >= 2,
         "n1 should be the post-partition leader"
     );
-    assert_eq!(
-        cluster.read(0, "a"),
-        Some("1".to_string())
-    );
+    assert_eq!(cluster.read(0, "a"), Some("1".to_string()));
     assert_eq!(
         cluster.read(0, "b"),
         None,

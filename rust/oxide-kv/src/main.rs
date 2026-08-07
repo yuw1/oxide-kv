@@ -1,16 +1,16 @@
-use std::sync::{Arc, RwLock};
 use clap::Parser;
+use oxide_kv::client::ClientHandler;
+use oxide_kv::config::Config;
+use oxide_kv::observability::{Metrics, run_metrics_server};
+use oxide_kv::raft::coordinator;
+use oxide_kv::raft::net::{StopSignal, TcpTransport, Transport};
+use oxide_kv::raft::node::{NodeState, RaftNode};
+use oxide_kv::raft::timer::run_election_timer;
+use oxide_kv::state_machine::{StateMachine, StateMachineConfig};
+use std::sync::{Arc, RwLock};
 use tokio::net::TcpListener;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
-use oxide_kv::client::ClientHandler;
-use oxide_kv::config::Config;
-use oxide_kv::state_machine::{StateMachine, StateMachineConfig};
-use oxide_kv::raft::node::{NodeState, RaftNode};
-use oxide_kv::raft::coordinator;
-use oxide_kv::raft::net::{StopSignal, TcpTransport, Transport};
-use oxide_kv::raft::timer::run_election_timer;
-use oxide_kv::observability::{run_metrics_server, Metrics};
 
 /// Initialise the global `tracing` subscriber.
 ///
@@ -27,8 +27,8 @@ use oxide_kv::observability::{run_metrics_server, Metrics};
 /// test main installs its own), `try_init` is a no-op so we
 /// don't pull the floor out.
 fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("oxide_kv=info"));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("oxide_kv=info"));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(true)
@@ -74,7 +74,9 @@ async fn main() -> anyhow::Result<()> {
         // 4 MiB memtable threshold: tunable later via Config if needed.
         memtable_size_threshold: 4 * 1024 * 1024,
     };
-    let state_machine = Arc::new(RwLock::new(StateMachine::open(sm_config).expect("Failed to open StateMachine")));
+    let state_machine = Arc::new(RwLock::new(
+        StateMachine::open(sm_config).expect("Failed to open StateMachine"),
+    ));
 
     // 3. Create Raft instance and inject restored state
     let mut raft_node_inner = RaftNode::new(
@@ -110,8 +112,7 @@ async fn main() -> anyhow::Result<()> {
     //     gauges (`peer_match_index` / `peer_next_index`) appear
     //     in the first scrape rather than only after the first
     //     AppendEntries reply.
-    let metrics = Metrics::with_peers(&args.peers)
-        .expect("Failed to construct metrics registry");
+    let metrics = Metrics::with_peers(&args.peers).expect("Failed to construct metrics registry");
     {
         let mut node = raft_node.write().unwrap();
         node.set_metrics(metrics.clone());
@@ -182,7 +183,8 @@ async fn main() -> anyhow::Result<()> {
         let metrics_addr = args.metrics_addr.clone();
         let metrics_stop = raft_stop.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_metrics_server(metrics_for_server, metrics_addr, metrics_stop).await {
+            if let Err(e) = run_metrics_server(metrics_for_server, metrics_addr, metrics_stop).await
+            {
                 error!(error = %e, "metrics server stopped");
             }
         });
@@ -232,11 +234,16 @@ mod tests {
     fn args_parses_data_dir_flag() {
         let args = <Args as clap::Parser>::try_parse_from([
             "oxide-kv",
-            "--addr", "127.0.0.1:9001",
-            "--client-addr", "127.0.0.1:9101",
-            "--peers", "127.0.0.1:9002,127.0.0.1:9003",
-            "--data-dir", "/var/lib/oxide-kv/node-1",
-        ]).expect("--data-dir should be a valid clap flag");
+            "--addr",
+            "127.0.0.1:9001",
+            "--client-addr",
+            "127.0.0.1:9101",
+            "--peers",
+            "127.0.0.1:9002,127.0.0.1:9003",
+            "--data-dir",
+            "/var/lib/oxide-kv/node-1",
+        ])
+        .expect("--data-dir should be a valid clap flag");
         assert_eq!(args.addr, "127.0.0.1:9001");
         assert_eq!(args.client_addr, "127.0.0.1:9101");
         assert_eq!(args.peers, vec!["127.0.0.1:9002", "127.0.0.1:9003"]);
@@ -250,9 +257,12 @@ mod tests {
     fn args_data_dir_is_optional() {
         let args = <Args as clap::Parser>::try_parse_from([
             "oxide-kv",
-            "--addr", "127.0.0.1:9001",
-            "--client-addr", "127.0.0.1:9101",
-        ]).expect("data_dir should be optional");
+            "--addr",
+            "127.0.0.1:9001",
+            "--client-addr",
+            "127.0.0.1:9101",
+        ])
+        .expect("data_dir should be optional");
         assert!(args.data_dir.is_none());
     }
 
@@ -264,9 +274,12 @@ mod tests {
     fn args_metrics_addr_defaults_to_loopback_9100() {
         let args = <Args as clap::Parser>::try_parse_from([
             "oxide-kv",
-            "--addr", "127.0.0.1:9001",
-            "--client-addr", "127.0.0.1:9101",
-        ]).expect("metrics_addr should have a default");
+            "--addr",
+            "127.0.0.1:9001",
+            "--client-addr",
+            "127.0.0.1:9101",
+        ])
+        .expect("metrics_addr should have a default");
         assert_eq!(args.metrics_addr, "127.0.0.1:9100");
     }
 
@@ -274,10 +287,14 @@ mod tests {
     fn args_metrics_addr_disabled_sentinel() {
         let args = <Args as clap::Parser>::try_parse_from([
             "oxide-kv",
-            "--addr", "127.0.0.1:9001",
-            "--client-addr", "127.0.0.1:9101",
-            "--metrics-addr", "disabled",
-        ]).expect("disabled sentinel should parse");
+            "--addr",
+            "127.0.0.1:9001",
+            "--client-addr",
+            "127.0.0.1:9101",
+            "--metrics-addr",
+            "disabled",
+        ])
+        .expect("disabled sentinel should parse");
         assert_eq!(args.metrics_addr, "disabled");
     }
 }

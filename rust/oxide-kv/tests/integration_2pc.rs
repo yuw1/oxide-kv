@@ -80,8 +80,8 @@ use tokio::time::sleep;
 use oxide_kv::client::ClientHandler;
 use oxide_kv::protocol::Command;
 // TxOp constructed inline in JSON payloads — no `use` needed.
-use oxide_kv::raft::node::{NodeState, RaftNode};
 use oxide_kv::raft::net::StopSignal;
+use oxide_kv::raft::node::{NodeState, RaftNode};
 use oxide_kv::raft::rpc::RpcServer;
 use oxide_kv::raft::storage::RaftStorage;
 use oxide_kv::state_machine::{StateMachine, StateMachineConfig};
@@ -117,7 +117,12 @@ async fn spawn_node(peers: Vec<String>) -> TestNode {
 
     // 2. Tempdir for WAL + meta + snapshot + state-machine data.
     let data_dir = tempfile::tempdir().expect("tempdir");
-    let wal = data_dir.path().join("node.wal").to_str().unwrap().to_string();
+    let wal = data_dir
+        .path()
+        .join("node.wal")
+        .to_str()
+        .unwrap()
+        .to_string();
     let meta = data_dir
         .path()
         .join("node_meta.json")
@@ -238,10 +243,7 @@ async fn elect_leader(nodes: &[TestNode]) {
 /// `node_arc` directly), so we emulate the listener by spawning it
 /// once-per-node in the harness and reusing the same port. This keeps
 /// the test free of a global client port registry.
-async fn client_command(
-    listener_port: u16,
-    payload: serde_json::Value,
-) -> serde_json::Value {
+async fn client_command(listener_port: u16, payload: serde_json::Value) -> serde_json::Value {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", listener_port))
         .await
@@ -342,7 +344,10 @@ async fn happy_path_3_nodes_commits_via_quorum() {
         "leader should report commit, got: {:?}",
         resp
     );
-    assert_eq!(resp.get("decision").and_then(|v| v.as_str()), Some("commit"));
+    assert_eq!(
+        resp.get("decision").and_then(|v| v.as_str()),
+        Some("commit")
+    );
     let begin_index = resp.get("begin_index").and_then(|v| v.as_u64()).unwrap();
     let decide_index = resp.get("decide_index").and_then(|v| v.as_u64()).unwrap();
     assert_eq!(begin_index + 1, decide_index);
@@ -359,9 +364,16 @@ async fn happy_path_3_nodes_commits_via_quorum() {
             let sm = n.raft.read().unwrap().state_machine.clone();
             sm.read().unwrap().get("k2").as_deref() == Some("v2")
         });
-        let all_purged = nodes
-            .iter()
-            .all(|n| n.raft.read().unwrap().state_machine.read().unwrap().pending_tx_count() == 0);
+        let all_purged = nodes.iter().all(|n| {
+            n.raft
+                .read()
+                .unwrap()
+                .state_machine
+                .read()
+                .unwrap()
+                .pending_tx_count()
+                == 0
+        });
         if all_have_k1 && all_have_k2 && all_purged {
             break;
         }

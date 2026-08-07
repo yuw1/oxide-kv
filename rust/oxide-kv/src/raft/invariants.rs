@@ -58,10 +58,7 @@ use std::fmt;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InvariantViolation {
     /// Two or more nodes were Leader at the same term. Raft §5.2.
-    ElectionSafety {
-        term: u64,
-        leader_ids: Vec<String>,
-    },
+    ElectionSafety { term: u64, leader_ids: Vec<String> },
     /// Two nodes applied different commands at the same log index.
     /// Raft §5.4.2.
     StateMachineSafety {
@@ -235,7 +232,10 @@ pub fn check_election_safety(cluster: &SimCluster) -> InvariantResult<()> {
     for node in &cluster.nodes {
         let r = node.raft.read().unwrap();
         if r.state == NodeState::Leader {
-            by_term.entry(r.current_term).or_default().push(node.id.clone());
+            by_term
+                .entry(r.current_term)
+                .or_default()
+                .push(node.id.clone());
         }
     }
     for (term, leader_ids) in by_term {
@@ -288,8 +288,7 @@ pub fn check_log_matching_property(cluster: &SimCluster) -> InvariantResult<()> 
             let (a, b) = (&cluster.nodes[i], &cluster.nodes[j]);
             let ra = a.raft.read().unwrap();
             let rb = b.raft.read().unwrap();
-            let min_commit =
-                std::cmp::min(ra.commit_index, rb.commit_index) as usize;
+            let min_commit = std::cmp::min(ra.commit_index, rb.commit_index) as usize;
             for k in 0..min_commit {
                 let ea = &ra.log[k];
                 let eb = &rb.log[k];
@@ -329,8 +328,7 @@ pub fn check_state_machine_safety(cluster: &SimCluster) -> InvariantResult<()> {
             let (a, b) = (&cluster.nodes[i], &cluster.nodes[j]);
             let ra = a.raft.read().unwrap();
             let rb = b.raft.read().unwrap();
-            let min_applied =
-                std::cmp::min(ra.last_applied, rb.last_applied) as usize;
+            let min_applied = std::cmp::min(ra.last_applied, rb.last_applied) as usize;
             for k in 0..min_applied {
                 let ea = &ra.log[k];
                 let eb = &rb.log[k];
@@ -483,22 +481,18 @@ pub fn check_2pc_atomicity(cluster: &SimCluster) -> InvariantResult<()> {
     use std::collections::BTreeMap;
     // tx_id -> node_id -> (term, decision) at the highest index
     // for that tx on that node.
-    let mut tx_decisions: BTreeMap<String, BTreeMap<String, (u64, String)>> =
-        BTreeMap::new();
+    let mut tx_decisions: BTreeMap<String, BTreeMap<String, (u64, String)>> = BTreeMap::new();
 
     for node in &cluster.nodes {
         let r = node.raft.read().unwrap();
         for entry in r.log.iter() {
             if let Command::DecideTx { tx_id, decision } = &entry.command {
                 let decision_str = format!("{:?}", decision);
-                let node_map = tx_decisions
-                    .entry(tx_id.clone())
-                    .or_default();
+                let node_map = tx_decisions.entry(tx_id.clone()).or_default();
                 // Last write wins (the DecideTx is only
                 // emitted once per tx in healthy operation, but
                 // this guards against log mutation).
-                node_map
-                    .insert(node.id.clone(), (entry.term, decision_str));
+                node_map.insert(node.id.clone(), (entry.term, decision_str));
             }
         }
     }
@@ -510,8 +504,7 @@ pub fn check_2pc_atomicity(cluster: &SimCluster) -> InvariantResult<()> {
     // — that's a transient state, not a violation.
     for (tx_id, per_node) in &tx_decisions {
         // Collect the set of decisions.
-        let mut outcomes: Vec<String> =
-            per_node.values().map(|(_, d)| d.clone()).collect();
+        let mut outcomes: Vec<String> = per_node.values().map(|(_, d)| d.clone()).collect();
         outcomes.sort();
         outcomes.dedup();
         if outcomes.len() > 1 {
@@ -535,9 +528,9 @@ pub fn check_2pc_atomicity(cluster: &SimCluster) -> InvariantResult<()> {
     // since once decided, the entry is in the log.
 
     let _ = RaftNode::new; // keep RaftNode referenced for
-                           // callers that want to use the
-                           // individual checks without going
-                           // through SimCluster.
+    // callers that want to use the
+    // individual checks without going
+    // through SimCluster.
     Ok(())
 }
 
@@ -632,8 +625,7 @@ mod tests {
         cluster
             .wait_for_replication(2, Duration::from_secs(2))
             .await;
-        assert_invariants(&cluster)
-            .expect("2PC Commit invariants hold cluster-wide");
+        assert_invariants(&cluster).expect("2PC Commit invariants hold cluster-wide");
     }
 
     #[tokio::test]
@@ -666,28 +658,34 @@ mod tests {
         // divergent applied command at index 1.
         let cluster = new_3_node().await;
         // n0 applied "Set k1=v1" at index 1.
-        cluster.nodes[0].raft.write().unwrap().log.push(
-            crate::protocol::LogEntry {
+        cluster.nodes[0]
+            .raft
+            .write()
+            .unwrap()
+            .log
+            .push(crate::protocol::LogEntry {
                 term: 1,
                 index: 1,
                 command: Command::Set {
                     key: "k1".to_string(),
                     value: "v1".to_string(),
                 },
-            },
-        );
+            });
         cluster.nodes[0].raft.write().unwrap().last_applied = 1;
         // n1 applied "Set k1=v2" at index 1 — divergent.
-        cluster.nodes[1].raft.write().unwrap().log.push(
-            crate::protocol::LogEntry {
+        cluster.nodes[1]
+            .raft
+            .write()
+            .unwrap()
+            .log
+            .push(crate::protocol::LogEntry {
                 term: 1,
                 index: 1,
                 command: Command::Set {
                     key: "k1".to_string(),
                     value: "v2".to_string(),
                 },
-            },
-        );
+            });
         cluster.nodes[1].raft.write().unwrap().last_applied = 1;
 
         let result = check_state_machine_safety(&cluster);
@@ -704,26 +702,32 @@ mod tests {
         // should never let this happen, but the invariant
         // guards against the implementation.
         let cluster = new_3_node().await;
-        cluster.nodes[0].raft.write().unwrap().log.push(
-            crate::protocol::LogEntry {
+        cluster.nodes[0]
+            .raft
+            .write()
+            .unwrap()
+            .log
+            .push(crate::protocol::LogEntry {
                 term: 1,
                 index: 1,
                 command: Command::Set {
                     key: "k1".to_string(),
                     value: "v1".to_string(),
                 },
-            },
-        );
-        cluster.nodes[1].raft.write().unwrap().log.push(
-            crate::protocol::LogEntry {
+            });
+        cluster.nodes[1]
+            .raft
+            .write()
+            .unwrap()
+            .log
+            .push(crate::protocol::LogEntry {
                 term: 2, // different term
                 index: 1,
                 command: Command::Set {
                     key: "k1".to_string(),
                     value: "v1".to_string(),
                 },
-            },
-        );
+            });
         // Set commit_index so the invariant (which only
         // walks the committed range) actually fires on
         // this case. Without commit_index, divergent
@@ -744,26 +748,32 @@ mod tests {
     async fn two_pc_atomicity_catches_split_outcome() {
         // Same tx decided Commit on n0, Abort on n1.
         let cluster = new_3_node().await;
-        cluster.nodes[0].raft.write().unwrap().log.push(
-            crate::protocol::LogEntry {
+        cluster.nodes[0]
+            .raft
+            .write()
+            .unwrap()
+            .log
+            .push(crate::protocol::LogEntry {
                 term: 1,
                 index: 1,
                 command: Command::DecideTx {
                     tx_id: "tx1".to_string(),
                     decision: TxDecision::Commit,
                 },
-            },
-        );
-        cluster.nodes[1].raft.write().unwrap().log.push(
-            crate::protocol::LogEntry {
+            });
+        cluster.nodes[1]
+            .raft
+            .write()
+            .unwrap()
+            .log
+            .push(crate::protocol::LogEntry {
                 term: 1,
                 index: 1,
                 command: Command::DecideTx {
                     tx_id: "tx1".to_string(),
                     decision: TxDecision::Abort,
                 },
-            },
-        );
+            });
         let result = check_2pc_atomicity(&cluster);
         assert!(matches!(
             result,

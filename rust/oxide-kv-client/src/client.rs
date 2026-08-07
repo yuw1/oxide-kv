@@ -15,7 +15,7 @@
 //! # Ok(()) }
 //! ```
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::connection::Connection;
 use crate::error::{Error, Result};
@@ -78,11 +78,7 @@ impl Client {
 
     // ----- internals exposed to `Transaction` -----
 
-    pub(crate) async fn send_begin_tx(
-        &mut self,
-        tx_id: &str,
-        ops: Vec<Value>,
-    ) -> Result<TxResult> {
+    pub(crate) async fn send_begin_tx(&mut self, tx_id: &str, ops: Vec<Value>) -> Result<TxResult> {
         let resp = self
             .conn
             .send_request(&json!({"BeginTx": {"tx_id": tx_id, "ops": ops}}))
@@ -119,7 +115,9 @@ impl Client {
                     .unwrap_or("server error")
                     .to_owned(),
             )),
-            _ => Err(Error::Server(format!("unexpected BeginTx response: {resp}"))),
+            _ => Err(Error::Server(format!(
+                "unexpected BeginTx response: {resp}"
+            ))),
         }
     }
 

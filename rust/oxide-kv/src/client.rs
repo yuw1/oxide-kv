@@ -1,9 +1,9 @@
-use crate::raft::node::{RaftNode, NodeState};
 use crate::protocol::{AbortTxError, Command, MembershipError, ServerId};
+use crate::raft::node::{NodeState, RaftNode};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
-use tokio::net::TcpStream;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
 pub struct ClientHandler;
@@ -29,7 +29,9 @@ impl ClientHandler {
                         Err(e) => {
                             warn!(error = %e, "failed to parse client command");
                             let error_resp = serde_json::json!({"status": "error", "message": format!("Invalid JSON: {}", e)});
-                            let _ = writer.write_all(format!("{}\n", error_resp).as_bytes()).await;
+                            let _ = writer
+                                .write_all(format!("{}\n", error_resp).as_bytes())
+                                .await;
                             continue;
                         }
                     };
@@ -54,7 +56,10 @@ impl ClientHandler {
     }
 
     /// Routes the command based on its type and performs role validation.
-    pub async fn dispatch_command(command: Command, node_arc: &Arc<RwLock<RaftNode>>) -> serde_json::Value {
+    pub async fn dispatch_command(
+        command: Command,
+        node_arc: &Arc<RwLock<RaftNode>>,
+    ) -> serde_json::Value {
         // Quick role check; Get does its own leader check via begin_read.
         {
             let node = node_arc.read().unwrap();
@@ -66,11 +71,9 @@ impl ClientHandler {
         match command {
             Command::Set { .. } | Command::Delete { .. } => {
                 Self::apply_mutation(command, node_arc).await
-            },
-            Command::Get { key } => Self::linearizable_get(&key, node_arc).await,
-            Command::BeginTx { tx_id, ops } => {
-                Self::begin_tx(tx_id, ops, node_arc).await
             }
+            Command::Get { key } => Self::linearizable_get(&key, node_arc).await,
+            Command::BeginTx { tx_id, ops } => Self::begin_tx(tx_id, ops, node_arc).await,
             Command::DecideTx { .. } => {
                 // Manual 2PC control command for tests / admin: lets a test
                 // force a Commit/Abort without driving the full coordinator
@@ -83,7 +86,7 @@ impl ClientHandler {
             }
             Command::Compact => {
                 serde_json::json!({"status": "error", "message": "compact not supported yet"})
-            },
+            }
             Command::AddNode { server } => {
                 // P8 PR 6 (Raft thesis §6): client-facing membership
                 // change. The leader's MembershipCoordinator intercepts
@@ -113,9 +116,7 @@ impl ClientHandler {
             // forwarded to `propose_abort_tx` which validates
             // `tx_id` is in `pending_txs` and proposes a
             // `DecideTx(Abort)` log entry.
-            Command::AbortTx { tx_id } => {
-                Self::abort_tx(tx_id, node_arc).await
-            }
+            Command::AbortTx { tx_id } => Self::abort_tx(tx_id, node_arc).await,
         }
     }
 
@@ -135,7 +136,10 @@ impl ClientHandler {
     ///   - On a single-node cluster, the leader's `commit_index` advances
     ///     synchronously with each proposal, so the read is consistent with
     ///     all previously-acknowledged writes.
-    pub async fn linearizable_get(key: &str, node_arc: &Arc<RwLock<RaftNode>>) -> serde_json::Value {
+    pub async fn linearizable_get(
+        key: &str,
+        node_arc: &Arc<RwLock<RaftNode>>,
+    ) -> serde_json::Value {
         // Single-node fast path: no peers → no quorum proof → skip ReadIndex.
         let is_single_node = {
             let node = node_arc.read().unwrap();
@@ -162,7 +166,9 @@ impl ClientHandler {
         // Multi-node path: full ReadIndex for linearizable reads.
         let ri = match RaftNode::begin_read(node_arc.clone()) {
             Some(ri) => ri,
-            None => return serde_json::json!({"error": "Not a leader. Please connect to the leader node."}),
+            None => {
+                return serde_json::json!({"error": "Not a leader. Please connect to the leader node."});
+            }
         };
 
         let max_wait = Duration::from_millis(2000);
@@ -198,7 +204,10 @@ impl ClientHandler {
 
     /// Handles mutation commands (Set/Delete) by proposing them to the Raft log.
     /// Consolidates the redundant propose + sync_logs logic.
-    async fn apply_mutation(command: Command, node_arc: &Arc<RwLock<RaftNode>>) -> serde_json::Value {
+    async fn apply_mutation(
+        command: Command,
+        node_arc: &Arc<RwLock<RaftNode>>,
+    ) -> serde_json::Value {
         let (success, index) = {
             let mut node = node_arc.write().unwrap();
             let ok = node.propose(command); // Appends to local WAL
@@ -248,10 +257,7 @@ impl ClientHandler {
     /// the response reports the *final* committed index — the
     /// caller can rely on the membership being fully installed
     /// when this returns.
-    pub async fn add_node(
-        server: ServerId,
-        node_arc: &Arc<RwLock<RaftNode>>,
-    ) -> serde_json::Value {
+    pub async fn add_node(server: ServerId, node_arc: &Arc<RwLock<RaftNode>>) -> serde_json::Value {
         let joint_index = {
             let mut node = node_arc.write().unwrap();
             match node.propose_add_node(server.clone()) {
@@ -488,10 +494,7 @@ impl ClientHandler {
     ///     `DecideTx(Abort)` so they can correlate with cluster logs.
     ///
     /// P8 PR 7.
-    async fn abort_tx(
-        tx_id: String,
-        node_arc: &Arc<RwLock<RaftNode>>,
-    ) -> serde_json::Value {
+    async fn abort_tx(tx_id: String, node_arc: &Arc<RwLock<RaftNode>>) -> serde_json::Value {
         let result = {
             let mut node = node_arc.write().unwrap();
             node.propose_abort_tx(&tx_id)
@@ -544,9 +547,24 @@ mod tests {
     /// Build a single-node (no-peers) RaftNode with on-disk state in a temp dir.
     fn make_single_node(node_id: &str) -> (tempfile::TempDir, Arc<RwLock<RaftNode>>) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let wal = dir.path().join(format!("{node_id}.wal")).to_str().unwrap().to_string();
-        let meta = dir.path().join(format!("{node_id}_meta.json")).to_str().unwrap().to_string();
-        let snap = dir.path().join(format!("{node_id}_snapshot.json")).to_str().unwrap().to_string();
+        let wal = dir
+            .path()
+            .join(format!("{node_id}.wal"))
+            .to_str()
+            .unwrap()
+            .to_string();
+        let meta = dir
+            .path()
+            .join(format!("{node_id}_meta.json"))
+            .to_str()
+            .unwrap()
+            .to_string();
+        let snap = dir
+            .path()
+            .join(format!("{node_id}_snapshot.json"))
+            .to_str()
+            .unwrap()
+            .to_string();
         let storage = RaftStorage::new_with_paths(wal, meta, snap);
         let sm_dir = dir.path().join(format!("{node_id}_sm"));
         let sm_config = StateMachineConfig {
@@ -577,14 +595,27 @@ mod tests {
     fn is_single_node_false_when_peers_present() {
         let dir = tempfile::tempdir().unwrap();
         let wal = dir.path().join("n1.wal").to_str().unwrap().to_string();
-        let meta = dir.path().join("n1_meta.json").to_str().unwrap().to_string();
-        let snap = dir.path().join("n1_snapshot.json").to_str().unwrap().to_string();
+        let meta = dir
+            .path()
+            .join("n1_meta.json")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let snap = dir
+            .path()
+            .join("n1_snapshot.json")
+            .to_str()
+            .unwrap()
+            .to_string();
         let storage = RaftStorage::new_with_paths(wal, meta, snap);
         let sm_dir = dir.path().join("n1_sm");
-        let sm = Arc::new(RwLock::new(StateMachine::open(StateMachineConfig {
-            data_dir: sm_dir,
-            memtable_size_threshold: 1024 * 1024,
-        }).unwrap()));
+        let sm = Arc::new(RwLock::new(
+            StateMachine::open(StateMachineConfig {
+                data_dir: sm_dir,
+                memtable_size_threshold: 1024 * 1024,
+            })
+            .unwrap(),
+        ));
         let node = RaftNode::new_with_storage(
             "n1".to_string(),
             vec!["127.0.0.1:9002".into()],

@@ -187,8 +187,8 @@ mod tests {
         };
         let pb: pb::VoteResponse = (&d).into();
         let bytes = pb.encode_length_delimited_to_vec();
-        let decoded =
-            pb::VoteResponse::decode_length_delimited(bytes.as_slice()).expect("decode VoteResponse");
+        let decoded = pb::VoteResponse::decode_length_delimited(bytes.as_slice())
+            .expect("decode VoteResponse");
         let back: VoteResponse = decoded.into();
         assert_eq!(d, back);
     }
