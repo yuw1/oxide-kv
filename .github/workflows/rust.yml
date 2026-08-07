@@ -56,9 +56,11 @@ jobs:
       # 9100/9200/9300 for `/metrics`). The test boots the cluster via
       # `deploy/scripts/bootstrap-cluster.sh`, verifies the metrics
       # endpoint + JSON client protocol, and tears down. See the
-      # module docstring in `tests/cross_process_smoke.rs` for the
-      # split-brain / commit-advance bugs this test currently
-      # *surfaces* but does not gate on.
+      # module docstring in `tests/cross_process_smoke.rs`; the
+      # consensus-scope tests (single-leader convergence, commit
+      # advance, Set+Get round trip) were once `#[ignore]`-gated on
+      # the split-brain / commit-advance bugs and now run un-gated
+      # (fixed by PRs #50/#51).
       #
       # The test binary is gated behind the `cross-process-smoke`
       # cargo feature (see `rust/oxide-kv/Cargo.toml` [[test]]
