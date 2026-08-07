@@ -20,24 +20,32 @@
   <a href="https://github.com/yuw1/oxide-kv/actions"><img src="https://github.com/yuw1/oxide-kv/actions/workflows/rust.yml/badge.svg" alt="CI"></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License: Apache-2.0"></a>
   <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/rust-edition_2024-orange.svg" alt="Rust"></a>
-  <a href="#development"><img src="https://img.shields.io/badge/tests-105_passing-brightgreen.svg" alt="Tests"></a>
+  <a href="#development"><img src="https://img.shields.io/badge/tests-271_passing-brightgreen.svg" alt="Tests"></a>
 </p>
 
 ---
 
 ## Features
 
-### Consensus (Raft core, all of §5 + §6.4)
+### Consensus (Raft core, all of §5 + §6 + §7 + §9.6)
 
-- **Leader election** with randomized timeouts (3-5s) and term-based
-  step-down.
+- **Leader election** with randomized timeouts (5-10s) and term-based
+  step-down; 250ms heartbeats.
+- **Pre-vote** (§9.6) — a partitioned follower that recovers probes
+  for quorum before bumping its term, so partition recovery can't
+  churn the live leader ("disruptive server" problem closed).
 - **Election restriction** (§5.4.1) — votes only for candidates with a
   log at least as up-to-date as the voter's.
 - **AppendEntries** RPC with heartbeats; **commit safety** (§5.4.2) — a
   leader never commits entries from previous terms by replica count
   alone.
 - **Snapshot + InstallSnapshot RPC** (§7) — bounded WAL growth and
-  catch-up for lagging followers.
+  catch-up for lagging followers; auto-triggered by
+  `OXIDE_SNAPSHOT_THRESHOLD_BYTES` (default 64 MiB).
+- **Joint consensus membership change** (§6) — `AddNode` / `RemoveNode`
+  client commands go through a Joint→Simple two-phase configuration
+  transition without restarting the cluster; brand-new servers catch
+  up via the `JoinCluster` RPC.
 
 ### Correctness hardening
 
@@ -58,20 +66,34 @@
 
 ### Coordination
 
-- **Two-Phase Commit lifecycle** — `BeginTx` stages ops, `Vote`
-  records participant votes, `DecideTx` commits or aborts atomically.
-  Pending ops are isolated from reads until commit. Single-node
-  coordinator uses a fast path that appends BeginTx + DecideTx as one
-  Raft proposal.
+- **Two-Phase Commit lifecycle** — `BeginTx` stages ops in the Raft
+  log, the leader (acting as 2PC coordinator) collects votes from all
+  participants over a side-channel RPC, and `DecideTx` commits or
+  aborts atomically. Pending ops are isolated from reads until commit.
+  Single-node coordinator uses a fast path that appends BeginTx +
+  DecideTx as one Raft proposal. Stuck transactions are cleaned up by
+  a coordinator timeout sweep (`OXIDE_TX_TIMEOUT_MS`, default 30s)
+  and an admin `AbortTx` RPC.
+
+### Observability
+
+- **Prometheus `/metrics` endpoint** (`--metrics-addr`, default
+  `127.0.0.1:9100`, `disabled` to skip) exposing raft term / role /
+  commit index, per-peer replication progress, and 2PC counters, plus
+  a `/health` endpoint.
 
 ### Plumbing
 
 - **Protocol Buffers** over length-prefixed TCP for inter-node Raft
   RPC. Replaces the original JSON encoding; ~30% smaller payloads,
-  faster encode/decode. Wire schema lives in `proto/raft.proto`.
+  faster encode/decode. Wire schema lives in `proto/raft.proto`
+  (consensus) and `proto/coordination.proto` (2PC vote RPC); frames
+  are a 1-byte protocol discriminator + 4-byte big-endian length +
+  protobuf payload.
 - **Async Tokio** runtime for RPC handling and concurrent client
   connections.
-- **Apache-2.0** license. Zero compiler warnings. 105 unit tests.
+- **Apache-2.0** license. Zero compiler warnings. 271 lib unit tests
+  plus cross-process / integration / simulation suites.
 
 ---
 
@@ -85,11 +107,10 @@
    (JSON)   │   │ Get  │──────────────▶│ RaftStorage  │      │
             │   │ Set  │  AppendEntries │  - meta.json │      │
             │   │BeginTx│              │  - NNN.sst   │      │
-            │   │ Vote │              │  - NNN.meta  │      │
-            │   │Decide│              │  - WAL       │      │
-            │   └──────┘              └──────────────┘      │
-            │       │                       │                │
-            │       ▼                       ▼                │
+            │   │Decide│              │  - NNN.meta  │      │
+            │   └──────┘              │  - WAL       │      │
+            │       │                 └──────────────┘      │
+            │       ▼                       │                │
             │   ┌──────────┐         ┌─────────────┐          │
             │   │ LSM tree │         │  Raft log   │          │
             │   │ StateMch │         │  (bincode)  │          │
@@ -114,12 +135,19 @@
 
 | RPC | Purpose |
 |---|---|
-| `RequestVote` | Election |
-| `AppendEntries` | Log replication + heartbeat |
-| `InstallSnapshot` | Send a snapshot to a lagging follower |
+| `RequestPreVote` / `PreVoteResponse` | Pre-election probe (§9.6) |
+| `RequestVote` / `VoteResponse` | Election |
+| `AppendEntries` / `AppendReply` | Log replication + heartbeat |
+| `InstallSnapshot` / `InstallSnapshotReply` | Send a snapshot to a lagging follower |
+| `JoinCluster` / `JoinClusterResponse` | Cold-new-server membership discovery |
 
-Wire schema: [`proto/raft.proto`](./proto/raft.proto). 4-byte big-endian
-length prefix + protobuf payload.
+Vote collection for 2PC travels on the same TCP listener under a
+separate protocol discriminator (`proto/coordination.proto`).
+
+Wire schemas: [`proto/raft.proto`](./proto/raft.proto) and
+[`proto/coordination.proto`](./proto/coordination.proto). Frames are a
+1-byte protocol discriminator (0x01 = Raft, 0x02 = 2PC votes) +
+4-byte big-endian length prefix + protobuf payload.
 
 ### Storage engine
 
@@ -138,9 +166,14 @@ length prefix + protobuf payload.
 
 - **BeginTx** (log entry): stages ops in `pending_txs`, NOT in
   memtable. Reads cannot see them.
-- **Vote** (log entry): records a participant's Yes/No vote.
+- **Vote collection** (side-channel RPC, not in the log): the leader,
+  acting as 2PC coordinator, asks every participant for a Yes/No vote
+  (`proto/coordination.proto`). All-yes required; any No / timeout /
+  unreachable peer aborts the transaction.
 - **DecideTx** (log entry): `Commit` applies all pending ops
-  atomically; `Abort` discards them.
+  atomically; `Abort` discards them. A coordinator timeout sweep
+  (`OXIDE_TX_TIMEOUT_MS`) and the admin `AbortTx` RPC clean up
+  transactions whose coordinator crashed.
 
 ---
 
@@ -153,59 +186,80 @@ expects `protoc` to be on `PATH`; CI installs it automatically.
 
 ### Run a 3-node cluster
 
-Three terminals:
+The one-shot helper (same script CI uses):
+
+```bash
+cargo build --release
+./deploy/scripts/bootstrap-cluster.sh start    # 3 nodes on one host
+./deploy/scripts/bootstrap-cluster.sh status
+# Logs: /tmp/oxide-kv-node-{1,2,3}.log
+```
+
+Or by hand, three terminals (`--peers` is comma-separated):
 
 ```bash
 # Node 1
 cargo run -- \
-  --addr 127.0.0.1:8001 --client-addr 127.0.0.1:9001 \
-  --peers 127.0.0.1:8002 127.0.0.1:8003
+  --addr 127.0.0.1:9001 --client-addr 127.0.0.1:9101 \
+  --peers 127.0.0.1:9002,127.0.0.1:9003
 
 # Node 2
 cargo run -- \
-  --addr 127.0.0.1:8002 --client-addr 127.0.0.1:9002 \
-  --peers 127.0.0.1:8001 127.0.0.1:8003
+  --addr 127.0.0.1:9002 --client-addr 127.0.0.1:9102 \
+  --peers 127.0.0.1:9001,127.0.0.1:9003
 
 # Node 3
 cargo run -- \
-  --addr 127.0.0.1:8003 --client-addr 127.0.0.1:9003 \
-  --peers 127.0.0.1:8001 127.0.0.1:8002
+  --addr 127.0.0.1:9003 --client-addr 127.0.0.1:9103 \
+  --peers 127.0.0.1:9001,127.0.0.1:9002
 ```
 
 ### Single-key ops (JSON over TCP to leader's client port)
 
 ```bash
-echo '{"Set":{"key":"hello","value":"world"}}' | nc 127.0.0.1 9001
-echo '{"Get":{"key":"hello"}}' | nc 127.0.0.1 9001
-echo '{"Delete":{"key":"hello"}}' | nc 127.0.0.1 9001
+echo '{"Set":{"key":"hello","value":"world"}}' | nc 127.0.0.1 9101
+echo '{"Get":{"key":"hello"}}' | nc 127.0.0.1 9101
+echo '{"Delete":{"key":"hello"}}' | nc 127.0.0.1 9101
 ```
 
 `Get` uses the ReadIndex path, so a partitioned leader will refuse to
-serve stale data instead of returning it.
+serve stale data instead of returning it. (For scripted use prefer
+the Python SDK or the Rust CLI — some `nc` variants close the socket
+on stdin EOF before a ReadIndex reply arrives; see the deployment
+section below.)
 
-### Multi-key atomic op (2PC fast path)
+### Multi-key atomic op (2PC)
 
 ```bash
 echo '{"BeginTx":{"tx_id":"t1","ops":[
   {"Put":{"key":"a","value":"1"}},
   {"Put":{"key":"b","value":"2"}}
-]}}' | nc 127.0.0.1 9001
+]}}' | nc 127.0.0.1 9101
 ```
 
 In a single-node cluster the leader auto-pairs this with
-`DecideTx(Commit)` so the transaction applies atomically. For a
-multi-node cluster the commands are in the wire schema; the
-coordinator-side vote collection RPC is on the roadmap.
+`DecideTx(Commit)` so the transaction applies atomically. In a
+multi-node cluster the leader coordinates the full round: BeginTx
+replicates, votes are collected over the side-channel RPC, and
+DecideTx(Commit/Abort) replicates the outcome.
 
-### Manual 2PC control (for testing the lifecycle)
+### Membership change (no restart required)
 
 ```bash
-# Stage a tx
-echo '{"BeginTx":{"tx_id":"t2","ops":[{"Put":{"key":"k","value":"v"}}]}}' | nc 127.0.0.1 9001
-# Vote on it
-echo '{"Vote":{"tx_id":"t2","voter":"node-1","vote":{"Yes":null}}}' | nc 127.0.0.1 9001
-# Commit (or Abort instead)
-echo '{"DecideTx":{"tx_id":"t2","decision":"Commit"}}' | nc 127.0.0.1 9001
+# Add a node (run against the leader):
+echo '{"AddNode":{"server":{"node_id":"127.0.0.1:9004","addr":"127.0.0.1:9004"}}}' | nc 127.0.0.1 9101
+# Remove a node:
+echo '{"RemoveNode":{"node_id":"127.0.0.1:9004"}}' | nc 127.0.0.1 9101
+```
+
+Both go through the joint-consensus two-phase transition (Raft §6).
+A brand-new server can also bootstrap itself with the `JoinCluster`
+RPC given the address of any current member.
+
+### Force-abort a stuck transaction
+
+```bash
+echo '{"AbortTx":{"tx_id":"t1"}}' | nc 127.0.0.1 9101
 ```
 
 ---
@@ -236,12 +290,15 @@ The following properties are verified by the test suite.
 
 ```bash
 cargo build --all-targets     # 0 warnings
-cargo test                    # 105 passed
+cargo test                    # 271 passed (lib) + integration suites
 ```
 
-Test layout: 8 modules, in-source `#[cfg(test)] mod tests` plus a few
-integration tests in `raft::proto` and `raft::rpc`. Each test runs
-against an isolated tempdir; the production binary is not required.
+Test layout: in-source `#[cfg(test)] mod tests` plus integration
+tests in `rust/oxide-kv/tests/` (joint consensus, JoinCluster, 2PC,
+pre-vote recovery, metrics endpoint, cross-process 3-node smoke,
+deterministic-simulation fuzz). Each unit test runs against an
+isolated tempdir; the cross-process smoke suite (feature-gated
+behind `cross-process-smoke`) needs the release binary.
 
 ### Project layout
 
@@ -258,10 +315,17 @@ rust/oxide-kv/
 │   ├── observability/     Prometheus /metrics + OpenTelemetry no-op
 │   └── raft/
 │       ├── node.rs        RaftNode (election, log, snapshot, 2PC, read-index)
+│       ├── coordinator.rs 2PC coordinator + membership coordinator
 │       ├── proto.rs       Protobuf <-> domain conversions
 │       ├── rpc.rs         TCP+protobuf client/server
 │       ├── storage.rs     WAL + meta + snapshot on disk
-│       └── timer.rs       Election timer
+│       ├── timer.rs       Election timer
+│       ├── clock.rs       Clock trait (wall clock / simulation)
+│       ├── net.rs         Transport trait + TcpTransport
+│       ├── transport.rs   Transport trait definition
+│       ├── sim_transport.rs / sim_harness.rs / fault_scheduler.rs
+│       │                  Deterministic-simulation infrastructure (P7)
+│       ├── invariants.rs / reference_model.rs  Safety checkers (P7)
 rust/oxide-kv-client/    Async TCP client (JSON line protocol)
 proto/
 ├── raft.proto             Raft wire schema
@@ -270,6 +334,9 @@ python/                   Pure-Python SDK (TCP + JSON line protocol)
 ├── oxide_kv/              Client + Transaction + errors
 ├── examples/              Runnable demos (oxide_kv_demo.py)
 └── tests/                 pytest suite
+deploy/
+├── scripts/bootstrap-cluster.sh   One-host 3-node dev cluster
+└── systemd/                       Production unit + env template
 ```
 
 ---
@@ -297,9 +364,15 @@ you need internet access.
 
 | Port (convention) | Protocol | Purpose | Bound to |
 |---|---|---|---|
-| **9001** (this node) | Protobuf over TCP | Raft inter-node RPC (heartbeats, AppendEntries, RequestVote, InstallSnapshot) | Internal network only |
-| **9101** (this node) | JSON over TCP | Client API (Set/Get/Delete/2PC) | Internal network + reverse proxy |
-| **9002-9003**, **9102-9103** | — | Peers' ports (if you stagger by node-id) | Internal network only |
+| **9001** (this node) | Protobuf over TCP | Raft inter-node RPC (heartbeats, AppendEntries, RequestPreVote/RequestVote, InstallSnapshot, JoinCluster) | Internal network only |
+| **9101** (this node) | JSON over TCP | Client API (Set/Get/Delete/2PC/AddNode/RemoveNode/AbortTx) | Internal network + reverse proxy |
+| **9100** (this node) | HTTP | Prometheus `/metrics` + `/health` | Loopback by default; bind to a routable address for remote scraping |
+
+Port numbers are configurable; the production systemd env template
+uses `OXIDE_KV_ADDR=<ip>:9001` for every node, and the dev
+`bootstrap-cluster.sh` script staggers each node by `+100` (node-1 =
+9001, node-2 = 9002, node-3 = 9003, same for 9101/9102/9103 and
+9100/9200/9300).
 
 **Do not expose 9001/9002/9003 to the internet.** Raft has no auth;
 any random client could trigger spurious elections.
@@ -319,21 +392,12 @@ any random client could trigger spurious elections.
 
 ### Bootstrap order
 
-The cluster needs a **majority** to elect a leader. On a fresh
-3-node cluster, **start the first two nodes before the third**.
-A single node alone cannot reach a majority with `--peers`
-configured (peers.len() + 1 = 3 nodes total; majority = 2).
-The first node would stay in candidate state forever.
-
-**Safe startup sequence**:
-
-```
-# On node-1:  start with peers = [node-2, node-3]
-# On node-2:  start with peers = [node-1, node-3]
-# Either of these two will form a 2-of-3 majority and elect a leader.
-# On node-3:  start with peers = [node-1, node-2]
-# Node-3 catches up from whichever is leader.
-```
+The cluster needs a **majority** to elect a leader. With `--peers`
+configured for 3 nodes, any two of the three together form a
+majority and can elect; the third catches up when it starts.
+(Starting all three at once is fine too — that's what
+`bootstrap-cluster.sh` does.) A node started with **no** `--peers`
+runs in standalone single-node leader mode.
 
 ### systemd unit (production)
 
@@ -418,24 +482,37 @@ Before going to production, verify each box:
 
 ### Monitoring
 
-Minimum health checks (Prometheus or your equivalent):
+Every node serves Prometheus metrics on `--metrics-addr` (default
+`127.0.0.1:9100`; the bootstrap script staggers node-N to
+`127.0.0.1:(9000 + N*100)`), plus a `GET /health` liveness probe.
 
-| Metric | Source | Why it matters |
-|---|---|---|
-| `oxide_kv_up{node=...}` | `pgrep -f oxide-kv` or systemd `Active=` | Process died |
-| `oxide_kv_raft_port_listening{node=...}` | `ss -lnt 'sport = :9001'` | Stuck startup, port collision |
-| `oxide_kv_client_port_listening{node=...}` | `ss -lnt 'sport = :9101'` | Stuck startup, port collision |
-| `oxide_kv_last_log_index{node=...}` | log scrape / journald | Replica falling behind |
-| `oxide_kv_data_dir_size_bytes{node=...}` | `du -sb /var/lib/oxide-kv/<node-id>` | Snapshot compaction healthy |
+Registered metrics:
 
-Alert on:
+| Metric | Meaning |
+|---|---|
+| `oxide_raft_term` | Current Raft term |
+| `oxide_raft_role` | 0=follower, 1=candidate, 2=leader |
+| `oxide_raft_commit_index` | Highest committed log index |
+| `oxide_raft_last_applied` | Highest entry applied to the state machine |
+| `oxide_raft_log_length` | Current Raft log length |
+| `oxide_raft_snapshot_age_seconds` | Age of the latest snapshot |
+| `oxide_raft_snapshot_bytes` | Size of the latest snapshot |
+| `oxide_peer_match_index{peer=...}` | Per-peer replicated index (leader only) |
+| `oxide_peer_next_index{peer=...}` | Per-peer next index (leader only) |
+| `oxide_tx_pending_count` | In-flight 2PC transactions |
+| `oxide_tx_timeout_aborted_total` | Tx aborted by the timeout sweep |
+| `oxide_tx_admin_aborted_total` | Tx aborted via the `AbortTx` RPC |
 
-- Any node down > 30s.
-- `last_log_index` lag > 100 between leader and a follower
-  (suggests a stuck peer).
-- `data_dir_size_bytes` growing unbounded (> 1 GiB without a
-  recent snapshot) suggests `OXIDE_SNAPSHOT_THRESHOLD_BYTES` is
-  too high or auto-compaction broke.
+Suggested alerts:
+
+- `oxide_raft_role == 2` on more than one node at once → split brain.
+- No node with `oxide_raft_role == 2` for > 2 × election timeout
+  (~20s) → no leader.
+- Leader's `oxide_peer_match_index` lagging `oxide_raft_commit_index`
+  by > 100 → stuck / slow peer.
+- `oxide_raft_snapshot_age_seconds` growing without bound while
+  `oxide_raft_log_length` also grows → auto-compaction not firing;
+  check `OXIDE_SNAPSHOT_THRESHOLD_BYTES`.
 
 ### Backup & restore
 
@@ -443,26 +520,33 @@ The on-disk format is:
 
 ```
 /var/lib/oxide-kv/<node-id>/
-├── wal/         # append-only log; rewritten on snapshot
-├── snapshots/   # snap-<last_index>-<term>.bin
-└── meta         # term + voted-for; atomic rename
+├── node_<raft-addr>.wal            # Raft log (bincode), truncated on snapshot
+├── node_<raft-addr>_meta.json      # term + voted-for; atomic rename
+├── node_<raft-addr>_snapshot.json  # latest snapshot (if any)
+├── memtable.wal                    # state-machine op log (JSON lines)
+└── sst/                            # LSM SSTables
+    ├── 000000.sst + 000000.sst.meta
+    └── ...
 ```
 
 To restore onto a fresh node: copy the **entire** data dir from
 any peer that has been continuously in the cluster. The new node
-will replay from `wal/` + apply the latest `snapshots/` file on
-startup (auto log compaction makes this O(snapshot_interval) not
-O(total_writes)).
+will load the latest snapshot (if any), replay the remaining
+`node_<addr>.wal` + `memtable.wal`, and discover SSTables from
+`sst/` on startup (auto log compaction makes this
+O(snapshot_interval) not O(total_writes)).
 
 ### Upgrade procedure
 
-Oxide-KV doesn't have rolling-restart semantics yet (that's on
-the roadmap under §6 membership change). For now:
+Membership changes are available via joint consensus (`AddNode` /
+`RemoveNode`), so a replacement node can join before the old one
+leaves. For a plain binary upgrade in place:
 
 1. Stop one follower (`systemctl stop oxide-kv@node-X.service`).
 2. Replace its binary at `/usr/local/bin/oxide-kv`.
 3. Start it (`systemctl start oxide-kv@node-X.service`).
-4. Wait ~5s for it to catch up (check `last_log_index`).
+4. Wait ~5s for it to catch up (check `oxide_peer_match_index` on
+   the leader).
 5. Repeat for the second follower, then **finally** the leader
    (the leader is the last to be replaced; stopping it triggers
    an election on the other two, the new leader is chosen, and
@@ -471,34 +555,16 @@ the roadmap under §6 membership change). For now:
 Verify after each step: term is stable across the cluster for
 30s with no spurious elections in the journal.
 
-### Known issue: 3-node clusters can churn through terms on startup (P8 PR 5 will fix)
+### Startup behaviour note
 
-Until **Raft thesis §9.6 pre-vote** lands (planned as P8 PR 5),
-a fresh 3-node cluster can briefly oscillate through term
-values on startup: two followers wake up within the same
-election-timeout window, both call an election, the loser
-steps down, a third node races a fresh election, etc. The
-cluster **does converge** (term monotonically increases
-until a stable leader wins), but it can take 3-5 term
-flips before stabilizing on a fresh bootstrap.
-
-What this means in practice:
-
-- Reads / writes during the first ~10 seconds after bootstrap
-  may be rejected with `"Not a leader"`. Just retry.
-- For low-QPS internal-network use this is a cosmetic problem
-  (clients should retry anyway; the Python SDK and Rust
-  client both bubble up `NotLeaderError` for the caller to
-  decide).
-- For deployments where this matters (e.g., a tight health
-  check), upgrade to the `pre-vote`-enabled build once P8
-  PR 5 lands.
-
-The nightly fuzz sweep (`rust/oxide-kv/tests/raft_fuzz.rs`)
-uses a `DriveElection` action that injects elections directly,
-so it does **not** cover this timer-collision scenario. A
-follow-up test using the real timer loop would have caught
-this; adding it is on the P8 backlog.
+On a fresh bootstrap the cluster elects a leader within a few
+seconds. Early P8 builds could churn through several terms while
+three followers woke up in overlapping election windows; that was
+closed by pre-vote (Raft §9.6) plus the same-term demote fix, and
+the cross-process smoke test (`single_leader_converges_within_15_seconds`)
+now guards it in CI. Reads / writes issued before a leader exists
+are rejected with `"Not a leader"` — clients should retry (the
+Python SDK's `Client.discover` and the demo script handle this).
 
 ---
 
@@ -619,10 +685,7 @@ code; fixes don't belong inside the harness PRs.
 
 The active roadmap lives in [ROADMAP.md](./ROADMAP.md). That file is
 the single source of truth for phase status, in-progress work, and
-acceptance criteria. The current phase is **P8 — Auto log
-compaction + Deployment + Clients** (PR #33 ships auto log
-compaction; PRs #34–#35 add the Python SDK, Rust client
-crate, and a deployment guide for internal-network use).
+acceptance criteria.
 
 ### Phase summary
 
@@ -633,31 +696,17 @@ crate, and a deployment guide for internal-network use).
 | P2 | Linearizable reads via ReadIndex | ✅ | [#3](https://github.com/yuw1/oxide-kv/pull/3) |
 | P3 | Protobuf binary RPC | ✅ | [#4](https://github.com/yuw1/oxide-kv/pull/4) |
 | P4 | LSM-Tree state machine | ✅ | [#5](https://github.com/yuw1/oxide-kv/pull/5) |
-| P5 | 2PC lifecycle (BeginTx / Vote / DecideTx) | ✅ | [#6](https://github.com/yuw1/oxide-kv/pull/6) |
+| P5 | 2PC lifecycle | ✅ | [#6](https://github.com/yuw1/oxide-kv/pull/6) |
 | Bug | Election timer brain-split + heartbeat:election ratio | ✅ | [#8](https://github.com/yuw1/oxide-kv/pull/8) |
 | Bug | Single-node read fallback + commit advancement | ✅ | [#9](https://github.com/yuw1/oxide-kv/pull/9) |
 | P6 | Multi-node 2PC coordinator RPC | ✅ | [#11](https://github.com/yuw1/oxide-kv/pull/11)–[#14](https://github.com/yuw1/oxide-kv/pull/14) |
-| **P7** | **Deterministic simulation testing (DST)** | **✅** | [#25](https://github.com/yuw1/oxide-kv/pull/25)–[#31](https://github.com/yuw1/oxide-kv/pull/31) |
-| **P8** | **Auto log compaction + WAL truncation** | **✅** | [#33](https://github.com/yuw1/oxide-kv/pull/33) |
-| **P8** | **Cargo workspace + Python SDK + Rust client** | **✅** | [#34](https://github.com/yuw1/oxide-kv/pull/34), [#35](https://github.com/yuw1/oxide-kv/pull/35) |
-| **P8** | **Deployment guide + systemd unit** | **🔄 In progress** | — |
+| P7 | Deterministic simulation testing (DST) | ✅ | [#28](https://github.com/yuw1/oxide-kv/pull/28)–[#32](https://github.com/yuw1/oxide-kv/pull/32) |
+| P8 | Pre-vote, joint consensus, tx timeout, metrics, prod cluster test | ✅ | [#33](https://github.com/yuw1/oxide-kv/pull/33)–[#43](https://github.com/yuw1/oxide-kv/pull/43) (+ [#50](https://github.com/yuw1/oxide-kv/pull/50)/[#51](https://github.com/yuw1/oxide-kv/pull/51)) |
 
-### Candidate future directions (see ROADMAP.md for full list)
-
-- Deterministic simulation testing (P7) — fault injection + invariant proofs
-- Auto log compaction + WAL truncation (P8) — bound the on-disk WAL size
-- Cargo workspace + Python SDK + Rust client crate (P8) — usable from script / service
-- Deployment guide + systemd unit (P8, active) — runnable in production
-- Sharded multi-Raft
-- Joint consensus for membership change (Raft §6)
-- Tx timeout + admin-driven abort
-- Client SDKs (Python, Go)
-- Benchmark suite
-- LSM polish (bloom filters, block cache, background compaction, leveled)
-- gRPC transport
-- TLS for inter-node RPC and client API
-- Per-read ack tracking for full ReadIndex
-- Metrics export (Prometheus)
+Candidate future directions (see ROADMAP.md "Future directions"):
+sharded multi-Raft, gRPC transport, TLS, LSM polish (bloom filters,
+block cache, background compaction), client-side leader re-discovery,
+benchmark suite.
 
 ---
 
