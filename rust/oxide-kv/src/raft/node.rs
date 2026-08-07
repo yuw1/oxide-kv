@@ -1,9 +1,11 @@
 use crate::config::Config;
 use crate::coordination::{VoteRequest, VoteResponse};
-use crate::protocol::{config_quorum_reached_index, AbortTxError, Command, Configuration, LogEntry, MembershipError, ReadIndex, ServerId, Snapshot, TxDecision, Vote};
-use crate::raft::clock::{system_clock, Clock};
-use crate::raft::net::{system_transport, Transport};
-use tracing::{debug, error, info, warn};
+use crate::protocol::{
+    AbortTxError, Command, Configuration, LogEntry, MembershipError, ReadIndex, ServerId, Snapshot,
+    TxDecision, Vote, config_quorum_reached_index,
+};
+use crate::raft::clock::{Clock, system_clock};
+use crate::raft::net::{Transport, system_transport};
 use crate::raft::rpc::{
     AppendEntriesArgs, AppendReplyArgs, InstallSnapshotArgs, InstallSnapshotReplyArgs,
     JoinClusterRequest, JoinClusterResponse, RaftMessage, RequestVoteArgs, VoteResponseArgs,
@@ -13,6 +15,7 @@ use crate::state_machine::StateMachine;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
+use tracing::{debug, error, info, warn};
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum NodeState {
@@ -117,7 +120,7 @@ impl RaftNode {
     pub fn new(
         raft_addr: String,
         peers: Vec<String>,
-        state_machine: Arc<RwLock<StateMachine>>
+        state_machine: Arc<RwLock<StateMachine>>,
     ) -> Self {
         // 1. Initialize Storage component (paths come from global Config)
         let storage = RaftStorage::new();
@@ -373,9 +376,7 @@ impl RaftNode {
             if let Ok(modified) = meta.modified()
                 && let Ok(age) = modified.elapsed()
             {
-                metrics
-                    .raft_snapshot_age_seconds
-                    .set(age.as_secs() as i64);
+                metrics.raft_snapshot_age_seconds.set(age.as_secs() as i64);
             }
             metrics.raft_snapshot_bytes.set(meta.len() as i64);
         }
@@ -461,7 +462,9 @@ impl RaftNode {
 
     /// Helper to get the last log's index and term
     fn get_last_log_info(&self) -> (u64, u64) {
-        self.log.last().map_or((0, 0), |entry| (entry.index as u64, entry.term))
+        self.log
+            .last()
+            .map_or((0, 0), |entry| (entry.index as u64, entry.term))
     }
 
     /// Handle a pre-vote probe from a follower that is considering a real
@@ -533,8 +536,7 @@ impl RaftNode {
         //     up-to-date test as the real vote path; no state mutation.
         let (my_last_log_index, my_last_log_term) = self.get_last_log_info();
         let probe_log_up_to_date = (args.last_log_term > my_last_log_term)
-            || (args.last_log_term == my_last_log_term
-                && args.last_log_index >= my_last_log_index);
+            || (args.last_log_term == my_last_log_term && args.last_log_index >= my_last_log_index);
 
         VoteResponseArgs {
             term: my_term,
@@ -635,7 +637,10 @@ impl RaftNode {
             self.state = NodeState::Follower;
             self.vote_for = None;
 
-            if let Err(e) = self.storage.save_meta(self.current_term.clone(), self.vote_for.clone()) {
+            if let Err(e) = self
+                .storage
+                .save_meta(self.current_term.clone(), self.vote_for.clone())
+            {
                 error!(error = %e, "failed to save metadata after term update");
             }
         }
@@ -646,15 +651,17 @@ impl RaftNode {
         // Log is up-to-date if:
         // (a) Candidate has a higher term in last log entry
         // (b) Same term, but candidate's log is at least as long as ours
-        let is_log_up_to_date = (args.last_log_term > my_last_log_term) ||
-            (args.last_log_term == my_last_log_term && args.last_log_index >= my_last_log_index);
+        let is_log_up_to_date = (args.last_log_term > my_last_log_term)
+            || (args.last_log_term == my_last_log_term && args.last_log_index >= my_last_log_index);
 
         // 4. Voting decision
         let can_vote = self.vote_for.is_none() || self.vote_for == Some(args.candidate_id.clone());
 
         if can_vote && is_log_up_to_date {
             self.vote_for = Some(args.candidate_id.clone());
-            let _ = self.storage.save_meta(self.current_term.clone(), self.vote_for.clone());
+            let _ = self
+                .storage
+                .save_meta(self.current_term.clone(), self.vote_for.clone());
             self.last_heartbeat = self.clock.now();
 
             VoteResponseArgs {
@@ -731,8 +738,9 @@ impl RaftNode {
             self.current_term = req.term;
             self.state = NodeState::Follower;
             self.vote_for = None;
-            if let Err(e) =
-                self.storage.save_meta(self.current_term, self.vote_for.clone())
+            if let Err(e) = self
+                .storage
+                .save_meta(self.current_term, self.vote_for.clone())
             {
                 error!(error = %e, "failed to save metadata after term update in tx_vote");
             }
@@ -751,16 +759,14 @@ impl RaftNode {
         //    has fallen behind ours cannot safely collect votes.
         let (my_last_log_index, my_last_log_term) = self.get_last_log_info();
         let leader_log_up_to_date = (req.last_log_term > my_last_log_term)
-            || (req.last_log_term == my_last_log_term
-                && req.last_log_index >= my_last_log_index);
+            || (req.last_log_term == my_last_log_term && req.last_log_index >= my_last_log_index);
         if !leader_log_up_to_date {
             return VoteResponse {
                 term: self.current_term,
                 vote_granted: false,
                 reason: format!(
                     "leader log stale: leader=({}, {}) local=({}, {})",
-                    req.last_log_index, req.last_log_term,
-                    my_last_log_index, my_last_log_term
+                    req.last_log_index, req.last_log_term, my_last_log_index, my_last_log_term
                 ),
             };
         }
@@ -898,10 +904,7 @@ impl RaftNode {
     /// Returns the index of the Joint entry the caller can wait on,
     /// or `Err(NotLeader)` / `Err(AlreadyMember)` if the request
     /// can't be processed.
-    pub fn propose_add_node(
-        &mut self,
-        server: ServerId,
-    ) -> Result<u64, MembershipError> {
+    pub fn propose_add_node(&mut self, server: ServerId) -> Result<u64, MembershipError> {
         if self.state != NodeState::Leader {
             return Err(MembershipError::NotLeader);
         }
@@ -955,10 +958,7 @@ impl RaftNode {
     /// P8 PR 6: leader-side membership removal. Mirror of
     /// `propose_add_node`. Translates to `Joint { old, new \ {node_id} }`
     /// followed by `Simple(new \ {node_id})`.
-    pub fn propose_remove_node(
-        &mut self,
-        node_id: &str,
-    ) -> Result<u64, MembershipError> {
+    pub fn propose_remove_node(&mut self, node_id: &str) -> Result<u64, MembershipError> {
         if self.state != NodeState::Leader {
             return Err(MembershipError::NotLeader);
         }
@@ -1073,7 +1073,13 @@ impl RaftNode {
     pub fn sync_logs(raft_node: Arc<RwLock<Self>>) {
         let (current_term, node_id, commit_index, peers, log_len) = {
             let n = raft_node.read().unwrap();
-            (n.current_term, n.node_id.clone(), n.commit_index, n.peers.clone(), n.log.len() as u64)
+            (
+                n.current_term,
+                n.node_id.clone(),
+                n.commit_index,
+                n.peers.clone(),
+                n.log.len() as u64,
+            )
         };
 
         // Single-node fast path: with no peers, there is no AppendEntries RPC
@@ -1109,7 +1115,10 @@ impl RaftNode {
                     0
                 } else {
                     // Logic: prev_idx 1 maps to log index 0
-                    n.log.get(prev_idx as usize - 1).map(|e| e.term).unwrap_or(0)
+                    n.log
+                        .get(prev_idx as usize - 1)
+                        .map(|e| e.term)
+                        .unwrap_or(0)
                 };
                 let ents = if next <= log_len {
                     n.log[next as usize - 1..].to_vec()
@@ -1130,10 +1139,7 @@ impl RaftNode {
 
             tokio::spawn(async move {
                 match transport_for_peer
-                    .send_raft(
-                        &peer_addr_clone,
-                        RaftMessage::AppendEntries(args.clone()),
-                    )
+                    .send_raft(&peer_addr_clone, RaftMessage::AppendEntries(args.clone()))
                     .await
                 {
                     Ok(RaftMessage::AppendReply(reply)) => {
@@ -1158,7 +1164,9 @@ impl RaftNode {
                             n.current_term = reply.term;
                             n.state = NodeState::Follower;
                             n.vote_for = None;
-                            let _ = n.storage.save_meta(n.current_term.clone(), n.vote_for.clone());
+                            let _ = n
+                                .storage
+                                .save_meta(n.current_term.clone(), n.vote_for.clone());
                             n.refresh_metrics();
                         } else {
                             // Log inconsistency: decrement next_index and retry
@@ -1192,7 +1200,9 @@ impl RaftNode {
     }
 
     pub fn maybe_commit(&mut self) {
-        if self.state != NodeState::Leader { return; }
+        if self.state != NodeState::Leader {
+            return;
+        }
 
         // P8 PR 6 (Raft thesis §6): quorum rule depends on the
         // active configuration. `Simple` is plain majority;
@@ -1243,7 +1253,10 @@ impl RaftNode {
             let log_idx_to_apply = self.last_applied as usize;
 
             let Some(entry) = self.log.get(log_idx_to_apply) else {
-                error!(index = self.last_applied + 1, "log entry not found during apply");
+                error!(
+                    index = self.last_applied + 1,
+                    "log entry not found during apply"
+                );
                 break;
             };
             // Snapshot the command first so we can drop the
@@ -1299,7 +1312,8 @@ impl RaftNode {
                             index = entry_idx,
                             config = match config {
                                 Configuration::Simple(s) => format!("Simple({} servers)", s.len()),
-                                Configuration::Joint { old, new } => format!("Joint(old:{}, new:{})", old.len(), new.len()),
+                                Configuration::Joint { old, new } =>
+                                    format!("Joint(old:{}, new:{})", old.len(), new.len()),
                             }
                         );
                         self.install_configuration(config);
@@ -1376,9 +1390,7 @@ impl RaftNode {
                 let entry = LogEntry {
                     term: self.current_term,
                     index: new_index as usize,
-                    command: Command::InstallConfiguration {
-                        config: simple_new,
-                    },
+                    command: Command::InstallConfiguration { config: simple_new },
                 };
                 if let Err(e) = self.storage.append_wal_log(&entry) {
                     error!(error = %e, "failed to append Simple(new) log entry");
@@ -1403,14 +1415,22 @@ impl RaftNode {
         let mut state_machine = self.state_machine.write().unwrap();
         for entry in &self.log {
             match &entry.command {
-                Command::Set { key, value } => { let _ = state_machine.set(&*key.clone(), &*value.clone()); }
-                Command::Delete { key } => { let _ = state_machine.delete(&key); }
-                Command::BeginTx { tx_id, ops } => { let _ = state_machine.begin_tx(tx_id.clone(), ops.clone()); }
+                Command::Set { key, value } => {
+                    let _ = state_machine.set(&*key.clone(), &*value.clone());
+                }
+                Command::Delete { key } => {
+                    let _ = state_machine.delete(&key);
+                }
+                Command::BeginTx { tx_id, ops } => {
+                    let _ = state_machine.begin_tx(tx_id.clone(), ops.clone());
+                }
                 // As of P6, votes no longer travel through the Raft log:
                 // they arrive on the side-channel `VoteRequest` RPC (see
                 // `proto/coordination.proto`) and are recorded directly on
                 // the state machine via `record_vote`, bypassing the log.
-                Command::DecideTx { tx_id, decision } => { let _ = state_machine.decide_tx(tx_id, decision.clone()); }
+                Command::DecideTx { tx_id, decision } => {
+                    let _ = state_machine.decide_tx(tx_id, decision.clone());
+                }
                 Command::InstallConfiguration { config } => {
                     // Replay path: when restoring after restart, the
                     // membership configuration must reflect the
@@ -1445,10 +1465,7 @@ impl RaftNode {
         );
     }
 
-    pub async fn run_heartbeat_loop(
-        node_arc: Arc<RwLock<RaftNode>>,
-        stop: super::net::StopSignal,
-    ) {
+    pub async fn run_heartbeat_loop(node_arc: Arc<RwLock<RaftNode>>, stop: super::net::StopSignal) {
         // Pull the clock out of the node once, before entering the
         // loop, so the per-tick hot path doesn't re-lock for it.
         // The clock is `Arc<dyn Clock>`, so cloning is cheap and the
@@ -1519,7 +1536,9 @@ impl RaftNode {
         node.current_term += 1;
         node.state = NodeState::Candidate;
         node.vote_for = Some(node.node_id.clone());
-        let _ = node.storage.save_meta(node.current_term, node.vote_for.clone());
+        let _ = node
+            .storage
+            .save_meta(node.current_term, node.vote_for.clone());
         node.last_heartbeat = node.clock.now();
         node.refresh_metrics();
     }
@@ -1559,9 +1578,7 @@ impl RaftNode {
             // the timer tick and us grabbing the lock; only enter
             // PreCandidate if we're still Follower / PreCandidate at
             // a current term that matches the snapshot we just took.
-            if node.state == NodeState::Follower
-                && node.current_term + 1 == probed_term
-            {
+            if node.state == NodeState::Follower && node.current_term + 1 == probed_term {
                 node.state = NodeState::PreCandidate;
                 node.refresh_metrics();
             } else {
@@ -1678,8 +1695,7 @@ impl RaftNode {
             return;
         }
 
-        let count =
-            votes_received.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let count = votes_received.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         if count <= total_nodes / 2 {
             return; // not yet a quorum
         }
@@ -1690,7 +1706,7 @@ impl RaftNode {
         let mut n = raft_arc.write().unwrap();
         if n.state != NodeState::PreCandidate {
             return; // raced: we already promoted (single-node fast
-                    // path) or stepped down
+            // path) or stepped down
         }
         Self::promote_to_candidate_locked(&mut n);
         let new_term = n.current_term;
@@ -1751,14 +1767,20 @@ impl RaftNode {
             let transport = transport.clone();
 
             tokio::spawn(async move {
-                let args = RequestVoteArgs { term, candidate_id: cid, last_log_index: last_idx, last_log_term: last_term };
+                let args = RequestVoteArgs {
+                    term,
+                    candidate_id: cid,
+                    last_log_index: last_idx,
+                    last_log_term: last_term,
+                };
                 match transport
                     .send_raft(&peer_addr, RaftMessage::RequestVote(args))
                     .await
                 {
                     Ok(RaftMessage::VoteResponse(reply)) => {
                         if reply.vote_granted {
-                            let count = votes_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                            let count =
+                                votes_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                             if count > total_nodes / 2 {
                                 let mut n = raft_clone.write().unwrap();
                                 if n.state == NodeState::Candidate && n.current_term == term {
@@ -1770,7 +1792,9 @@ impl RaftNode {
                             n.current_term = reply.term;
                             n.state = NodeState::Follower;
                             n.vote_for = None;
-                            let _ = n.storage.save_meta(n.current_term.clone(), n.vote_for.clone());
+                            let _ = n
+                                .storage
+                                .save_meta(n.current_term.clone(), n.vote_for.clone());
                         }
                     }
                     Ok(other) => {
@@ -1792,7 +1816,9 @@ impl RaftNode {
     }
 
     pub fn become_leader(&mut self) {
-        if self.state == NodeState::Leader { return; }
+        if self.state == NodeState::Leader {
+            return;
+        }
         info!(node = %self.node_id, term = self.current_term, "elected leader");
         self.state = NodeState::Leader;
         let next_idx = self.log.len() as u64 + 1;
@@ -1803,7 +1829,10 @@ impl RaftNode {
 
     pub fn handle_append_entries(&mut self, args: &AppendEntriesArgs) -> AppendReplyArgs {
         if args.term < self.current_term {
-            return AppendReplyArgs { term: self.current_term, success: false };
+            return AppendReplyArgs {
+                term: self.current_term,
+                success: false,
+            };
         }
 
         // Two cases land here: args.term > current_term (newer
@@ -1835,22 +1864,33 @@ impl RaftNode {
         // Only same-term AE from a peer gets the "you're a duplicate,
         // I'll stay Leader" treatment.
         if args.term == self.current_term && self.state == NodeState::Leader {
-            return AppendReplyArgs { term: self.current_term, success: false };
+            return AppendReplyArgs {
+                term: self.current_term,
+                success: false,
+            };
         }
 
         if args.term > self.current_term {
             self.current_term = args.term;
             self.vote_for = None;
-            let _ = self.storage.save_meta(self.current_term.clone(), self.vote_for.clone());
+            let _ = self
+                .storage
+                .save_meta(self.current_term.clone(), self.vote_for.clone());
         }
         self.state = NodeState::Follower;
         self.last_heartbeat = self.clock.now();
 
         // Consistent check
         if args.prev_log_index > 0 {
-            let local_term = self.log.get((args.prev_log_index - 1) as usize).map(|e| e.term);
+            let local_term = self
+                .log
+                .get((args.prev_log_index - 1) as usize)
+                .map(|e| e.term);
             if local_term != Some(args.prev_log_term) {
-                return AppendReplyArgs { term: self.current_term, success: false };
+                return AppendReplyArgs {
+                    term: self.current_term,
+                    success: false,
+                };
             }
         }
 
@@ -1879,21 +1919,32 @@ impl RaftNode {
         );
         if args.leader_commit > self.commit_index {
             self.commit_index = std::cmp::min(args.leader_commit, self.log.len() as u64);
-            debug!(commit_index = self.commit_index, "AE: commit_index advanced; applying logs");
+            debug!(
+                commit_index = self.commit_index,
+                "AE: commit_index advanced; applying logs"
+            );
             self.apply_logs();
         }
 
-        AppendReplyArgs { term: self.current_term, success: true }
+        AppendReplyArgs {
+            term: self.current_term,
+            success: true,
+        }
     }
 
     /// Handle an InstallSnapshot RPC from the Leader.
     ///
     /// Per §7 of the Raft thesis: replace local state machine with the snapshot,
     /// discard log entries covered by it, and reset commit / applied indices.
-    pub fn handle_install_snapshot(&mut self, args: &InstallSnapshotArgs) -> InstallSnapshotReplyArgs {
+    pub fn handle_install_snapshot(
+        &mut self,
+        args: &InstallSnapshotArgs,
+    ) -> InstallSnapshotReplyArgs {
         // 1. Term check
         if args.term < self.current_term {
-            return InstallSnapshotReplyArgs { term: self.current_term };
+            return InstallSnapshotReplyArgs {
+                term: self.current_term,
+            };
         }
         // Same defense as handle_append_entries: same-term snapshot on
         // an incumbent Leader is a duplicate or stale message from a
@@ -1905,13 +1956,17 @@ impl RaftNode {
         // higher-term step-down. A higher term DOES demote us even
         // if we are Leader.
         if args.term == self.current_term && self.state == NodeState::Leader {
-            return InstallSnapshotReplyArgs { term: self.current_term };
+            return InstallSnapshotReplyArgs {
+                term: self.current_term,
+            };
         }
         if args.term > self.current_term {
             self.current_term = args.term;
             self.state = NodeState::Follower;
             self.vote_for = None;
-            let _ = self.storage.save_meta(self.current_term.clone(), self.vote_for.clone());
+            let _ = self
+                .storage
+                .save_meta(self.current_term.clone(), self.vote_for.clone());
         }
         self.state = NodeState::Follower;
         self.last_heartbeat = self.clock.now();
@@ -1953,7 +2008,9 @@ impl RaftNode {
         }
         self.refresh_metrics();
 
-        InstallSnapshotReplyArgs { term: self.current_term }
+        InstallSnapshotReplyArgs {
+            term: self.current_term,
+        }
     }
 
     /// Take a snapshot of the current state machine if the on-disk WAL has
@@ -2062,8 +2119,7 @@ impl RaftNode {
         match self.last_quorum_heartbeat_at {
             None => false,
             Some(t) => {
-                let fresh = t.elapsed()
-                    < Duration::from_millis(Config::max_election_timeout_ms());
+                let fresh = t.elapsed() < Duration::from_millis(Config::max_election_timeout_ms());
                 fresh && t >= ri.issued_at
             }
         }
@@ -2074,7 +2130,9 @@ impl RaftNode {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::protocol::{config_quorum_reached, Command, LogEntry, ReadIndex, Snapshot, TxDecision, TxOp};
+    use crate::protocol::{
+        Command, LogEntry, ReadIndex, Snapshot, TxDecision, TxOp, config_quorum_reached,
+    };
     use crate::raft::rpc::{AppendEntriesArgs, InstallSnapshotArgs, RequestVoteArgs};
     use crate::raft::storage::RaftStorage;
     use crate::state_machine::{StateMachine, StateMachineConfig};
@@ -2087,9 +2145,24 @@ mod tests {
     /// on disk and does not depend on the global `Config`.
     fn make_node(node_id: &str, peers: Vec<String>) -> (TempDir, RaftNode) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let wal = dir.path().join(format!("{node_id}.wal")).to_str().unwrap().to_string();
-        let meta = dir.path().join(format!("{node_id}_meta.json")).to_str().unwrap().to_string();
-        let snap = dir.path().join(format!("{node_id}_snapshot.json")).to_str().unwrap().to_string();
+        let wal = dir
+            .path()
+            .join(format!("{node_id}.wal"))
+            .to_str()
+            .unwrap()
+            .to_string();
+        let meta = dir
+            .path()
+            .join(format!("{node_id}_meta.json"))
+            .to_str()
+            .unwrap()
+            .to_string();
+        let snap = dir
+            .path()
+            .join(format!("{node_id}_snapshot.json"))
+            .to_str()
+            .unwrap()
+            .to_string();
         let storage = RaftStorage::new_with_paths(wal, meta, snap);
         let sm_dir = dir.path().join(format!("{node_id}_sm"));
         let sm_config = crate::state_machine::StateMachineConfig {
@@ -2110,8 +2183,14 @@ mod tests {
         }
     }
 
-    fn append_args(term: u64, leader: &str, prev_idx: u64, prev_term: u64,
-                   entries: Vec<LogEntry>, leader_commit: u64) -> AppendEntriesArgs {
+    fn append_args(
+        term: u64,
+        leader: &str,
+        prev_idx: u64,
+        prev_term: u64,
+        entries: Vec<LogEntry>,
+        leader_commit: u64,
+    ) -> AppendEntriesArgs {
         AppendEntriesArgs {
             term,
             leader_id: leader.to_string(),
@@ -2135,8 +2214,11 @@ mod tests {
 
     fn assert_node_state(node: &RaftNode, key: &str, expected: Option<&str>) {
         let sm = node.state_machine.read().unwrap();
-        assert_eq!(sm.get(key), expected.map(|s| s.to_string()),
-            "state machine mismatch for key={key}");
+        assert_eq!(
+            sm.get(key),
+            expected.map(|s| s.to_string()),
+            "state machine mismatch for key={key}"
+        );
     }
 
     // ---------- handle_request_vote ----------
@@ -2307,8 +2389,22 @@ mod tests {
         ];
 
         let new_entries = vec![
-            LogEntry { term: 2, index: 2, command: Command::Set { key: "b".into(), value: "v2".into() } },
-            LogEntry { term: 2, index: 3, command: Command::Set { key: "c".into(), value: "v3".into() } },
+            LogEntry {
+                term: 2,
+                index: 2,
+                command: Command::Set {
+                    key: "b".into(),
+                    value: "v2".into(),
+                },
+            },
+            LogEntry {
+                term: 2,
+                index: 3,
+                command: Command::Set {
+                    key: "c".into(),
+                    value: "v3".into(),
+                },
+            },
         ];
 
         let reply = node.handle_append_entries(&append_args(2, "n2", 1, 1, new_entries, 0));
@@ -2326,8 +2422,22 @@ mod tests {
         node.log = vec![make_entry(1, 1, "a", "1")];
 
         let entries = vec![
-            LogEntry { term: 2, index: 2, command: Command::Set { key: "b".into(), value: "B".into() } },
-            LogEntry { term: 2, index: 3, command: Command::Set { key: "c".into(), value: "C".into() } },
+            LogEntry {
+                term: 2,
+                index: 2,
+                command: Command::Set {
+                    key: "b".into(),
+                    value: "B".into(),
+                },
+            },
+            LogEntry {
+                term: 2,
+                index: 3,
+                command: Command::Set {
+                    key: "c".into(),
+                    value: "C".into(),
+                },
+            },
         ];
 
         let _ = node.handle_append_entries(&append_args(2, "n2", 1, 1, entries, 2));
@@ -2359,10 +2469,7 @@ mod tests {
         let (_d, mut node) = make_node("n1", vec!["n2".into(), "n3".into()]);
         node.state = NodeState::Leader;
         node.current_term = 2;
-        node.log = vec![
-            make_entry(2, 1, "a", "1"),
-            make_entry(2, 2, "b", "2"),
-        ];
+        node.log = vec![make_entry(2, 1, "a", "1"), make_entry(2, 2, "b", "2")];
         // One peer has replicated up to index 2, the other only to 1.
         node.match_index.insert("n2".into(), 2);
         node.match_index.insert("n3".into(), 1);
@@ -2409,7 +2516,10 @@ mod tests {
         node.maybe_commit();
 
         // Only index 3 (term=2) can be committed; index 2 (term=1) must wait.
-        assert_eq!(node.commit_index, 3, "must skip ahead to current-term entry");
+        assert_eq!(
+            node.commit_index, 3,
+            "must skip ahead to current-term entry"
+        );
         assert_eq!(node.last_applied, 3);
     }
 
@@ -2470,9 +2580,24 @@ mod tests {
         node.state = NodeState::Leader;
         node.current_term = 1;
 
-        node.propose(Command::Set { key: "a".into(), value: "1".into() }).then_some(()).unwrap();
-        node.propose(Command::Set { key: "b".into(), value: "2".into() }).then_some(()).unwrap();
-        node.propose(Command::Set { key: "c".into(), value: "3".into() }).then_some(()).unwrap();
+        node.propose(Command::Set {
+            key: "a".into(),
+            value: "1".into(),
+        })
+        .then_some(())
+        .unwrap();
+        node.propose(Command::Set {
+            key: "b".into(),
+            value: "2".into(),
+        })
+        .then_some(())
+        .unwrap();
+        node.propose(Command::Set {
+            key: "c".into(),
+            value: "3".into(),
+        })
+        .then_some(())
+        .unwrap();
 
         assert_eq!(node.log.len(), 3);
         assert_eq!(node.log[0].index, 1);
@@ -2503,13 +2628,31 @@ mod tests {
     fn replay_logs_restores_state_machine_from_scratch() {
         let node_id = "replay_node";
         let dir = tempfile::tempdir().unwrap();
-        let _sm_placeholder = Arc::new(RwLock::new(StateMachine::open(crate::state_machine::StateMachineConfig {
-            data_dir: dir.path().join(format!("{node_id}_sm_unused")),
-            memtable_size_threshold: 1024 * 1024,
-        }).unwrap()));
-        let wal = dir.path().join(format!("{node_id}.wal")).to_str().unwrap().to_string();
-        let meta = dir.path().join(format!("{node_id}_meta.json")).to_str().unwrap().to_string();
-        let snap = dir.path().join(format!("{node_id}_snapshot.json")).to_str().unwrap().to_string();
+        let _sm_placeholder = Arc::new(RwLock::new(
+            StateMachine::open(crate::state_machine::StateMachineConfig {
+                data_dir: dir.path().join(format!("{node_id}_sm_unused")),
+                memtable_size_threshold: 1024 * 1024,
+            })
+            .unwrap(),
+        ));
+        let wal = dir
+            .path()
+            .join(format!("{node_id}.wal"))
+            .to_str()
+            .unwrap()
+            .to_string();
+        let meta = dir
+            .path()
+            .join(format!("{node_id}_meta.json"))
+            .to_str()
+            .unwrap()
+            .to_string();
+        let snap = dir
+            .path()
+            .join(format!("{node_id}_snapshot.json"))
+            .to_str()
+            .unwrap()
+            .to_string();
         let storage = RaftStorage::new_with_paths(wal, meta, snap);
 
         // Simulate a fresh WAL with three committed entries.
@@ -2525,12 +2668,8 @@ mod tests {
         let sm2 = Arc::new(RwLock::new(StateMachine::open(sm_config2).unwrap()));
 
         // Construct node from disk; it should replay all three.
-        let mut node = RaftNode::new_with_storage(
-            node_id.to_string(),
-            vec![],
-            sm2.clone(),
-            storage,
-        );
+        let mut node =
+            RaftNode::new_with_storage(node_id.to_string(), vec![], sm2.clone(), storage);
         // Point the test's `sm` reference at the same state machine the node
         // is mutating, so the assertions below see the replayed writes.
         let sm = sm2.clone();
@@ -2548,7 +2687,11 @@ mod tests {
         let (_d, mut node) = make_node("n1", vec![]);
         node.log = vec![
             make_entry(1, 1, "k", "v"),
-            LogEntry { term: 1, index: 2, command: Command::Delete { key: "k".into() } },
+            LogEntry {
+                term: 1,
+                index: 2,
+                command: Command::Delete { key: "k".into() },
+            },
         ];
         node.commit_index = 2;
 
@@ -2605,8 +2748,13 @@ mod tests {
 
     // ---------- handle_install_snapshot ----------
 
-    fn snapshot_args(term: u64, leader: &str, last_idx: u64, last_term: u64,
-                     data: HashMap<String, String>) -> InstallSnapshotArgs {
+    fn snapshot_args(
+        term: u64,
+        leader: &str,
+        last_idx: u64,
+        last_term: u64,
+        data: HashMap<String, String>,
+    ) -> InstallSnapshotArgs {
         InstallSnapshotArgs {
             term,
             leader_id: leader.to_string(),
@@ -2621,7 +2769,11 @@ mod tests {
     }
 
     fn sm_data(node: &RaftNode) -> HashMap<String, String> {
-        node.state_machine.read().unwrap().snapshot_data().expect("snapshot_data")
+        node.state_machine
+            .read()
+            .unwrap()
+            .snapshot_data()
+            .expect("snapshot_data")
     }
 
     #[test]
@@ -2721,7 +2873,11 @@ mod tests {
     #[test]
     fn install_snapshot_rewrites_wal_on_disk() {
         let (_d, mut node) = make_node("n1", vec!["n2".into()]);
-        node.log = vec![make_entry(1, 1, "a", "1"), make_entry(1, 2, "b", "2"), make_entry(1, 3, "c", "3")];
+        node.log = vec![
+            make_entry(1, 1, "a", "1"),
+            make_entry(1, 2, "b", "2"),
+            make_entry(1, 3, "c", "3"),
+        ];
 
         // Persist the log to WAL so we can verify it's rewritten.
         for entry in &node.log {
@@ -2843,7 +2999,10 @@ mod tests {
         node.last_applied = 5;
         node.commit_index = 5;
         node.last_quorum_heartbeat_at = Some(Instant::now());
-        let ri = ReadIndex { index: 5, issued_at: Instant::now() };
+        let ri = ReadIndex {
+            index: 5,
+            issued_at: Instant::now(),
+        };
 
         // Now step down.
         node.state = NodeState::Follower;
@@ -2858,7 +3017,10 @@ mod tests {
         node.last_applied = 3; // Not yet applied up to read index
         node.last_quorum_heartbeat_at = Some(Instant::now());
 
-        let ri = ReadIndex { index: 5, issued_at: Instant::now() };
+        let ri = ReadIndex {
+            index: 5,
+            issued_at: Instant::now(),
+        };
         assert!(!node.confirm_read(ri));
     }
 
@@ -2870,7 +3032,10 @@ mod tests {
         node.commit_index = 5;
         node.last_quorum_heartbeat_at = None; // never heard from any peer
 
-        let ri = ReadIndex { index: 5, issued_at: Instant::now() };
+        let ri = ReadIndex {
+            index: 5,
+            issued_at: Instant::now(),
+        };
         assert!(!node.confirm_read(ri));
     }
 
@@ -2901,11 +3066,13 @@ mod tests {
         node.last_applied = 5;
         node.commit_index = 5;
         // Backdate the heartbeat proof by more than max_election_timeout_ms.
-        let stale = Instant::now()
-            - Duration::from_millis(Config::max_election_timeout_ms() + 500);
+        let stale = Instant::now() - Duration::from_millis(Config::max_election_timeout_ms() + 500);
         node.last_quorum_heartbeat_at = Some(stale);
 
-        let ri = ReadIndex { index: 5, issued_at: stale };
+        let ri = ReadIndex {
+            index: 5,
+            issued_at: stale,
+        };
         assert!(!node.confirm_read(ri));
     }
 
@@ -2918,7 +3085,10 @@ mod tests {
         let now = Instant::now();
         node.last_quorum_heartbeat_at = Some(now);
 
-        let ri = ReadIndex { index: 5, issued_at: now };
+        let ri = ReadIndex {
+            index: 5,
+            issued_at: now,
+        };
         assert!(node.confirm_read(ri));
     }
 
@@ -2934,11 +3104,17 @@ mod tests {
         let now = Instant::now();
         node.last_quorum_heartbeat_at = Some(now);
 
-        let ri = ReadIndex { index: 5, issued_at: now };
+        let ri = ReadIndex {
+            index: 5,
+            issued_at: now,
+        };
         assert!(node.confirm_read(ri), "sanity: leader confirms");
 
         node.state = NodeState::Follower;
-        assert!(!node.confirm_read(ri), "stepped-down node must not serve reads");
+        assert!(
+            !node.confirm_read(ri),
+            "stepped-down node must not serve reads"
+        );
     }
 
     // ---------- two-phase commit (apply_logs path) ----------
@@ -2955,8 +3131,14 @@ mod tests {
                 command: Command::BeginTx {
                     tx_id: "tx-replay".into(),
                     ops: vec![
-                        TxOp::Put { key: "a".into(), value: "1".into() },
-                        TxOp::Put { key: "b".into(), value: "2".into() },
+                        TxOp::Put {
+                            key: "a".into(),
+                            value: "1".into(),
+                        },
+                        TxOp::Put {
+                            key: "b".into(),
+                            value: "2".into(),
+                        },
                     ],
                 },
             },
@@ -3016,7 +3198,10 @@ mod tests {
         let ok = node.propose_batch(vec![
             Command::BeginTx {
                 tx_id: "tx-batch".into(),
-                ops: vec![TxOp::Put { key: "x".into(), value: "1".into() }],
+                ops: vec![TxOp::Put {
+                    key: "x".into(),
+                    value: "1".into(),
+                }],
             },
             Command::DecideTx {
                 tx_id: "tx-batch".into(),
@@ -3049,11 +3234,7 @@ mod tests {
     /// entry so `handle_tx_vote_request` has something to vote on.
     /// Returns the `(tx_id, last_log_index, last_log_term)` snapshot
     /// the test should mirror in its `VoteRequest`.
-    fn seed_pending_tx(
-        node: &mut RaftNode,
-        tx_id: &str,
-        ops: Vec<TxOp>,
-    ) -> (String, u64, u64) {
+    fn seed_pending_tx(node: &mut RaftNode, tx_id: &str, ops: Vec<TxOp>) -> (String, u64, u64) {
         // State machine side: register the pending tx directly. The
         // real coordinator path does this via Raft log replication +
         // apply; tests skip that machinery and call the state
@@ -3164,7 +3345,11 @@ mod tests {
 
         let resp = node.handle_tx_vote_request(&vote_req(1, &tx_id, idx, term));
 
-        assert!(resp.vote_granted, "expected Yes vote, got No: {}", resp.reason);
+        assert!(
+            resp.vote_granted,
+            "expected Yes vote, got No: {}",
+            resp.reason
+        );
         assert_eq!(resp.term, 1);
         assert!(resp.reason.is_empty());
 
@@ -3257,7 +3442,8 @@ mod tests {
         // First run: write a few entries, snapshot, drop the node.
         let (dir, mut node) = make_leader_with_committed_sets("n5", 4);
         assert!(node.maybe_snapshot(1));
-        let snapshot_index = node.storage
+        let snapshot_index = node
+            .storage
             .load_snapshot()
             .expect("snapshot saved")
             .last_included_index;
@@ -3267,8 +3453,18 @@ mod tests {
         // snapshotted keys, and commit/last_applied should match the
         // snapshot position.
         let wal = dir.path().join("n5.wal").to_str().unwrap().to_string();
-        let meta = dir.path().join("n5_meta.json").to_str().unwrap().to_string();
-        let snap = dir.path().join("n5_snapshot.json").to_str().unwrap().to_string();
+        let meta = dir
+            .path()
+            .join("n5_meta.json")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let snap = dir
+            .path()
+            .join("n5_snapshot.json")
+            .to_str()
+            .unwrap()
+            .to_string();
         let storage = RaftStorage::new_with_paths(wal, meta, snap);
         let sm_dir = dir.path().join("n5_sm");
         let sm_config = crate::state_machine::StateMachineConfig {
@@ -3363,8 +3559,14 @@ mod tests {
         assert_eq!(reply.term, term_before, "reply term must echo OUR term");
 
         // Hard invariant: nothing mutated.
-        assert_eq!(node.current_term, term_before, "pre-vote must not bump term");
-        assert_eq!(node.vote_for, vote_before, "pre-vote must not write vote_for");
+        assert_eq!(
+            node.current_term, term_before,
+            "pre-vote must not bump term"
+        );
+        assert_eq!(
+            node.vote_for, vote_before,
+            "pre-vote must not write vote_for"
+        );
         assert_eq!(node.state, state_before, "pre-vote must not change state");
 
         // Now a refused probe (probe term older). Also no mutation.
@@ -3514,8 +3716,14 @@ mod tests {
     #[test]
     fn configuration_simple_contains_and_addr_of() {
         let cfg = Configuration::Simple(vec![
-            ServerId { node_id: "n1".into(), addr: "127.0.0.1:9001".into() },
-            ServerId { node_id: "n2".into(), addr: "127.0.0.1:9002".into() },
+            ServerId {
+                node_id: "n1".into(),
+                addr: "127.0.0.1:9001".into(),
+            },
+            ServerId {
+                node_id: "n2".into(),
+                addr: "127.0.0.1:9002".into(),
+            },
         ]);
         assert!(cfg.contains("n1"));
         assert!(cfg.contains("n2"));
@@ -3529,13 +3737,28 @@ mod tests {
     fn configuration_joint_all_servers_is_union_without_dupes() {
         let cfg = Configuration::Joint {
             old: vec![
-                ServerId { node_id: "n1".into(), addr: "127.0.0.1:9001".into() },
-                ServerId { node_id: "n2".into(), addr: "127.0.0.1:9002".into() },
+                ServerId {
+                    node_id: "n1".into(),
+                    addr: "127.0.0.1:9001".into(),
+                },
+                ServerId {
+                    node_id: "n2".into(),
+                    addr: "127.0.0.1:9002".into(),
+                },
             ],
             new: vec![
-                ServerId { node_id: "n1".into(), addr: "127.0.0.1:9001".into() },
-                ServerId { node_id: "n2".into(), addr: "127.0.0.1:9002".into() },
-                ServerId { node_id: "n3".into(), addr: "127.0.0.1:9003".into() },
+                ServerId {
+                    node_id: "n1".into(),
+                    addr: "127.0.0.1:9001".into(),
+                },
+                ServerId {
+                    node_id: "n2".into(),
+                    addr: "127.0.0.1:9002".into(),
+                },
+                ServerId {
+                    node_id: "n3".into(),
+                    addr: "127.0.0.1:9003".into(),
+                },
             ],
         };
         let all = cfg.all_servers();
@@ -3552,31 +3775,28 @@ mod tests {
     fn config_quorum_simple_majority() {
         // 3 servers, 2 of them replicated index 5 -> quorum reached.
         let cfg = Configuration::Simple(vec![
-            ServerId { node_id: "n1".into(), addr: "a".into() },
-            ServerId { node_id: "n2".into(), addr: "b".into() },
-            ServerId { node_id: "n3".into(), addr: "c".into() },
+            ServerId {
+                node_id: "n1".into(),
+                addr: "a".into(),
+            },
+            ServerId {
+                node_id: "n2".into(),
+                addr: "b".into(),
+            },
+            ServerId {
+                node_id: "n3".into(),
+                addr: "c".into(),
+            },
         ]);
         let mut mi = HashMap::new();
         mi.insert("n2".into(), 5);
         mi.insert("n3".into(), 3);
         // n1 self has 5. count = 2 (n1 self + n2), len/2 = 1. 2 > 1 -> quorum.
-        assert!(config_quorum_reached(
-            &cfg,
-            &mi,
-            "n1",
-            5,
-            5
-        ));
+        assert!(config_quorum_reached(&cfg, &mi, "n1", 5, 5));
         // Now only n1 has replicated: count = 1, len/2 = 1. 1 > 1 is false.
         mi.insert("n2".into(), 0);
         mi.insert("n3".into(), 0);
-        assert!(!config_quorum_reached(
-            &cfg,
-            &mi,
-            "n1",
-            5,
-            5
-        ));
+        assert!(!config_quorum_reached(&cfg, &mi, "n1", 5, 5));
     }
 
     #[test]
@@ -3584,15 +3804,36 @@ mod tests {
         // 3-node -> 4-node transition: old = {n1, n2, n3}, new = {n1, n2, n3, n4}.
         let cfg = Configuration::Joint {
             old: vec![
-                ServerId { node_id: "n1".into(), addr: "a".into() },
-                ServerId { node_id: "n2".into(), addr: "b".into() },
-                ServerId { node_id: "n3".into(), addr: "c".into() },
+                ServerId {
+                    node_id: "n1".into(),
+                    addr: "a".into(),
+                },
+                ServerId {
+                    node_id: "n2".into(),
+                    addr: "b".into(),
+                },
+                ServerId {
+                    node_id: "n3".into(),
+                    addr: "c".into(),
+                },
             ],
             new: vec![
-                ServerId { node_id: "n1".into(), addr: "a".into() },
-                ServerId { node_id: "n2".into(), addr: "b".into() },
-                ServerId { node_id: "n3".into(), addr: "c".into() },
-                ServerId { node_id: "n4".into(), addr: "d".into() },
+                ServerId {
+                    node_id: "n1".into(),
+                    addr: "a".into(),
+                },
+                ServerId {
+                    node_id: "n2".into(),
+                    addr: "b".into(),
+                },
+                ServerId {
+                    node_id: "n3".into(),
+                    addr: "c".into(),
+                },
+                ServerId {
+                    node_id: "n4".into(),
+                    addr: "d".into(),
+                },
             ],
         };
         let mut mi = HashMap::new();
@@ -3601,24 +3842,12 @@ mod tests {
         mi.insert("n3".into(), 5);
         // old majority: n1 + n2 + n3 = 3 > 3/2 = 1 ✓
         // new majority: n1 + n2 + n3 = 3 > 4/2 = 2 ✓
-        assert!(config_quorum_reached(
-            &cfg,
-            &mi,
-            "n1",
-            5,
-            5
-        ));
+        assert!(config_quorum_reached(&cfg, &mi, "n1", 5, 5));
         // Now drop n3: only n2 replicated + self.
         mi.insert("n3".into(), 0);
         // old: n1 + n2 = 2 > 1 ✓
         // new: n1 + n2 = 2 > 2 ✗  (need 3 of 4)
-        assert!(!config_quorum_reached(
-            &cfg,
-            &mi,
-            "n1",
-            5,
-            5
-        ));
+        assert!(!config_quorum_reached(&cfg, &mi, "n1", 5, 5));
     }
 
     #[test]
@@ -3638,7 +3867,10 @@ mod tests {
     fn propose_add_node_requires_leader() {
         let (_d, mut node) = make_node("n1", vec!["n2".into()]);
         // Follower (not leader).
-        let server = ServerId { node_id: "n3".into(), addr: "n3".into() };
+        let server = ServerId {
+            node_id: "n3".into(),
+            addr: "n3".into(),
+        };
         let result = node.propose_add_node(server);
         assert_eq!(result, Err(MembershipError::NotLeader));
     }
@@ -3647,7 +3879,10 @@ mod tests {
     fn propose_add_node_rejects_already_member() {
         let (_d, mut node) = make_node("n1", vec!["n2".into()]);
         node.state = NodeState::Leader;
-        let server = ServerId { node_id: "n2".into(), addr: "n2".into() };
+        let server = ServerId {
+            node_id: "n2".into(),
+            addr: "n2".into(),
+        };
         let result = node.propose_add_node(server);
         assert_eq!(
             result,
@@ -3659,8 +3894,13 @@ mod tests {
     fn propose_add_node_appends_joint_entry_and_queues_simple() {
         let (_d, mut node) = make_node("n1", vec!["n2".into()]);
         node.state = NodeState::Leader;
-        let server = ServerId { node_id: "n3".into(), addr: "n3".into() };
-        let joint_idx = node.propose_add_node(server).expect("leader should propose");
+        let server = ServerId {
+            node_id: "n3".into(),
+            addr: "n3".into(),
+        };
+        let joint_idx = node
+            .propose_add_node(server)
+            .expect("leader should propose");
         // One log entry should be appended (the Joint).
         assert_eq!(joint_idx, 1);
         assert_eq!(node.log.len(), 1);
@@ -3724,9 +3964,18 @@ mod tests {
     fn install_configuration_updates_peers_and_current_config() {
         let (_d, mut node) = make_node("n1", vec!["n2".into()]);
         let new_cfg = Configuration::Simple(vec![
-            ServerId { node_id: "n1".into(), addr: "n1".into() },
-            ServerId { node_id: "n2".into(), addr: "n2".into() },
-            ServerId { node_id: "n3".into(), addr: "n3".into() },
+            ServerId {
+                node_id: "n1".into(),
+                addr: "n1".into(),
+            },
+            ServerId {
+                node_id: "n2".into(),
+                addr: "n2".into(),
+            },
+            ServerId {
+                node_id: "n3".into(),
+                addr: "n3".into(),
+            },
         ]);
         node.install_configuration(&new_cfg);
         assert_eq!(node.current_config, new_cfg);
@@ -3740,16 +3989,31 @@ mod tests {
         node.state = NodeState::Leader;
         // Stage the pending Simple entry as if `propose_add_node` had set it.
         let pending = Configuration::Simple(vec![
-            ServerId { node_id: "n1".into(), addr: "n1".into() },
-            ServerId { node_id: "n2".into(), addr: "n2".into() },
-            ServerId { node_id: "n3".into(), addr: "n3".into() },
+            ServerId {
+                node_id: "n1".into(),
+                addr: "n1".into(),
+            },
+            ServerId {
+                node_id: "n2".into(),
+                addr: "n2".into(),
+            },
+            ServerId {
+                node_id: "n3".into(),
+                addr: "n3".into(),
+            },
         ]);
         node.pending_post_joint_simple = Some(pending.clone());
         // Now install the matching Joint entry.
         let joint = Configuration::Joint {
             old: vec![
-                ServerId { node_id: "n1".into(), addr: "n1".into() },
-                ServerId { node_id: "n2".into(), addr: "n2".into() },
+                ServerId {
+                    node_id: "n1".into(),
+                    addr: "n1".into(),
+                },
+                ServerId {
+                    node_id: "n2".into(),
+                    addr: "n2".into(),
+                },
             ],
             new: pending.all_servers(),
         };
@@ -3771,14 +4035,25 @@ mod tests {
         node.state = NodeState::Leader;
         // Append a Simple(n1, n2, n3) entry and commit it.
         let new_cfg = Configuration::Simple(vec![
-            ServerId { node_id: "n1".into(), addr: "n1".into() },
-            ServerId { node_id: "n2".into(), addr: "n2".into() },
-            ServerId { node_id: "n3".into(), addr: "n3".into() },
+            ServerId {
+                node_id: "n1".into(),
+                addr: "n1".into(),
+            },
+            ServerId {
+                node_id: "n2".into(),
+                addr: "n2".into(),
+            },
+            ServerId {
+                node_id: "n3".into(),
+                addr: "n3".into(),
+            },
         ]);
         let entry = LogEntry {
             term: 1,
             index: 1,
-            command: Command::InstallConfiguration { config: new_cfg.clone() },
+            command: Command::InstallConfiguration {
+                config: new_cfg.clone(),
+            },
         };
         node.log.push(entry);
         node.commit_index = 1;
@@ -3795,27 +4070,57 @@ mod tests {
         // Build a log with Joint(n1, n2, n3) followed by Simple(n1, n2, n3).
         let joint = Configuration::Joint {
             old: vec![
-                ServerId { node_id: "n1".into(), addr: "n1".into() },
-                ServerId { node_id: "n2".into(), addr: "n2".into() },
+                ServerId {
+                    node_id: "n1".into(),
+                    addr: "n1".into(),
+                },
+                ServerId {
+                    node_id: "n2".into(),
+                    addr: "n2".into(),
+                },
             ],
             new: vec![
-                ServerId { node_id: "n1".into(), addr: "n1".into() },
-                ServerId { node_id: "n2".into(), addr: "n2".into() },
-                ServerId { node_id: "n3".into(), addr: "n3".into() },
+                ServerId {
+                    node_id: "n1".into(),
+                    addr: "n1".into(),
+                },
+                ServerId {
+                    node_id: "n2".into(),
+                    addr: "n2".into(),
+                },
+                ServerId {
+                    node_id: "n3".into(),
+                    addr: "n3".into(),
+                },
             ],
         };
         let simple = Configuration::Simple(vec![
-            ServerId { node_id: "n1".into(), addr: "n1".into() },
-            ServerId { node_id: "n2".into(), addr: "n2".into() },
-            ServerId { node_id: "n3".into(), addr: "n3".into() },
+            ServerId {
+                node_id: "n1".into(),
+                addr: "n1".into(),
+            },
+            ServerId {
+                node_id: "n2".into(),
+                addr: "n2".into(),
+            },
+            ServerId {
+                node_id: "n3".into(),
+                addr: "n3".into(),
+            },
         ]);
         node.log.push(LogEntry {
-            term: 1, index: 1,
-            command: Command::InstallConfiguration { config: joint.clone() },
+            term: 1,
+            index: 1,
+            command: Command::InstallConfiguration {
+                config: joint.clone(),
+            },
         });
         node.log.push(LogEntry {
-            term: 1, index: 2,
-            command: Command::InstallConfiguration { config: simple.clone() },
+            term: 1,
+            index: 2,
+            command: Command::InstallConfiguration {
+                config: simple.clone(),
+            },
         });
         node.replay_logs();
         // Final config should be Simple (the second entry overwrites the Joint).
@@ -3832,8 +4137,18 @@ mod tests {
     fn make_join_cluster_leader() -> RaftNode {
         let dir = tempfile::tempdir().expect("tempdir");
         let wal = dir.path().join("n1.wal").to_str().unwrap().to_string();
-        let meta = dir.path().join("n1_meta.json").to_str().unwrap().to_string();
-        let snap = dir.path().join("n1_snapshot.json").to_str().unwrap().to_string();
+        let meta = dir
+            .path()
+            .join("n1_meta.json")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let snap = dir
+            .path()
+            .join("n1_snapshot.json")
+            .to_str()
+            .unwrap()
+            .to_string();
         let storage = RaftStorage::new_with_paths(wal, meta, snap);
         let sm_dir = dir.path().join("n1_sm");
         let sm_config = crate::state_machine::StateMachineConfig {
@@ -3938,15 +4253,36 @@ mod tests {
         // as old and n1,n2,n3,n4 as new — i.e. mid-flight AddNode.
         let joint = Configuration::Joint {
             old: vec![
-                ServerId { node_id: "n1".into(), addr: "n1".into() },
-                ServerId { node_id: "n2".into(), addr: "n2".into() },
-                ServerId { node_id: "n3".into(), addr: "n3".into() },
+                ServerId {
+                    node_id: "n1".into(),
+                    addr: "n1".into(),
+                },
+                ServerId {
+                    node_id: "n2".into(),
+                    addr: "n2".into(),
+                },
+                ServerId {
+                    node_id: "n3".into(),
+                    addr: "n3".into(),
+                },
             ],
             new: vec![
-                ServerId { node_id: "n1".into(), addr: "n1".into() },
-                ServerId { node_id: "n2".into(), addr: "n2".into() },
-                ServerId { node_id: "n3".into(), addr: "n3".into() },
-                ServerId { node_id: "n4".into(), addr: "n4".into() },
+                ServerId {
+                    node_id: "n1".into(),
+                    addr: "n1".into(),
+                },
+                ServerId {
+                    node_id: "n2".into(),
+                    addr: "n2".into(),
+                },
+                ServerId {
+                    node_id: "n3".into(),
+                    addr: "n3".into(),
+                },
+                ServerId {
+                    node_id: "n4".into(),
+                    addr: "n4".into(),
+                },
             ],
         };
         node.install_configuration(&joint);
@@ -3957,7 +4293,10 @@ mod tests {
             candidate_addr: "n4".into(),
         });
         assert!(!resp_reject.accepted);
-        assert_eq!(resp_reject.reason, "candidate_addr is already a cluster member");
+        assert_eq!(
+            resp_reject.reason,
+            "candidate_addr is already a cluster member"
+        );
         // A genuinely-new candidate (n5) is accepted; peer list is
         // all_servers \ {self, candidate} = {n1,n2,n3,n4} \ {n1,n5}
         // = {n2,n3,n4}.
@@ -4005,12 +4344,7 @@ mod tests {
             memtable_size_threshold: 1024 * 1024,
         };
         let sm = Arc::new(RwLock::new(StateMachine::open(sm_config).unwrap()));
-        let mut node = RaftNode::new_with_storage(
-            tx_id.to_string(),
-            vec![],
-            sm.clone(),
-            storage,
-        );
+        let mut node = RaftNode::new_with_storage(tx_id.to_string(), vec![], sm.clone(), storage);
         node.state = NodeState::Leader;
         // Seed pending_txs via apply_logs path so the test mirrors
         // what happens after a BeginTx log entry commits.
@@ -4068,28 +4402,38 @@ mod tests {
         // both see the right code.
         let dir = tempfile::tempdir().expect("tempdir");
         let wal = dir.path().join("nl.wal").to_str().unwrap().to_string();
-        let meta = dir.path().join("nl_meta.json").to_str().unwrap().to_string();
-        let snap = dir.path().join("nl_snapshot.json").to_str().unwrap().to_string();
+        let meta = dir
+            .path()
+            .join("nl_meta.json")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let snap = dir
+            .path()
+            .join("nl_snapshot.json")
+            .to_str()
+            .unwrap()
+            .to_string();
         let storage = RaftStorage::new_with_paths(wal, meta, snap);
         let sm_dir = dir.path().join("nl_sm");
         let sm_config = StateMachineConfig {
             data_dir: sm_dir,
             memtable_size_threshold: 1024 * 1024,
         };
-        let sm = Arc::new(RwLock::new(
-            StateMachine::open(sm_config).unwrap(),
-        ));
-        let mut node =
-            RaftNode::new_with_storage("nl".into(), vec![], sm.clone(), storage);
+        let sm = Arc::new(RwLock::new(StateMachine::open(sm_config).unwrap()));
+        let mut node = RaftNode::new_with_storage("nl".into(), vec![], sm.clone(), storage);
         node.state = NodeState::Follower;
         // Seed a pending tx so the NotLeader check fires before the
         // NotFound check.
         sm.write()
             .unwrap()
-            .begin_tx("nl-tx".into(), vec![crate::protocol::TxOp::Put {
-                key: "k".into(),
-                value: "v".into(),
-            }])
+            .begin_tx(
+                "nl-tx".into(),
+                vec![crate::protocol::TxOp::Put {
+                    key: "k".into(),
+                    value: "v".into(),
+                }],
+            )
             .unwrap();
         let err = node.propose_abort_tx("nl-tx").unwrap_err();
         assert_eq!(err, AbortTxError::NotLeader);
@@ -4102,13 +4446,8 @@ mod tests {
         // against the operator typo / re-trying an already-aborted
         // tx from spawning a confusing empty DecideTx entry.
         let mut node = make_leader_with_pending_tx("alive");
-        let err = node
-            .propose_abort_tx("ghost")
-            .unwrap_err();
-        assert_eq!(
-            err,
-            AbortTxError::NotFound("ghost".to_string())
-        );
+        let err = node.propose_abort_tx("ghost").unwrap_err();
+        assert_eq!(err, AbortTxError::NotFound("ghost".to_string()));
     }
 
     #[test]
@@ -4136,15 +4475,10 @@ mod tests {
             // anything (Abort). Then re-insert with the old
             // timestamp.
             sm.decide_tx("node-old", TxDecision::Abort).unwrap();
-            sm.begin_tx_at(
-                "node-old".into(),
-                ops,
-                now.saturating_sub(1_000),
-            )
-            .unwrap();
+            sm.begin_tx_at("node-old".into(), ops, now.saturating_sub(1_000))
+                .unwrap();
         }
-        let stale =
-            node.pending_txs_older_than(std::time::Duration::from_millis(100));
+        let stale = node.pending_txs_older_than(std::time::Duration::from_millis(100));
         assert_eq!(stale, vec!["node-old".to_string()]);
     }
 
@@ -4180,16 +4514,16 @@ mod tests {
 
         // Must refuse (success = false) but keep the same term and
         // the same Leader state.
-        assert!(!reply.success, "incumbent Leader must refuse peer AE at same term");
+        assert!(
+            !reply.success,
+            "incumbent Leader must refuse peer AE at same term"
+        );
         assert_eq!(reply.term, initial_term, "reply must echo our term");
         assert_eq!(
             node.state, initial_state,
             "incumbent Leader must not be demoted by a same-term AE"
         );
-        assert_eq!(
-            node.current_term, initial_term,
-            "term must not change"
-        );
+        assert_eq!(node.current_term, initial_term, "term must not change");
     }
 
     /// An incumbent Leader MUST step down when receiving
@@ -4211,14 +4545,8 @@ mod tests {
         let reply = node.handle_append_entries(&args);
 
         // Must adopt the higher term and step down to Follower.
-        assert_eq!(
-            reply.term, 7,
-            "reply must echo the higher term"
-        );
-        assert_eq!(
-            node.current_term, 7,
-            "we must adopt the higher term"
-        );
+        assert_eq!(reply.term, 7, "reply must echo the higher term");
+        assert_eq!(node.current_term, 7, "we must adopt the higher term");
         assert_eq!(
             node.state,
             NodeState::Follower,
@@ -4250,18 +4578,12 @@ mod tests {
             },
         };
         let reply = node.handle_install_snapshot(&args);
-        assert_eq!(
-            reply.term, 7,
-            "reply must echo our term"
-        );
+        assert_eq!(reply.term, 7, "reply must echo our term");
         assert_eq!(
             node.state,
             NodeState::Leader,
             "incumbent Leader must not be demoted by a same-term snapshot"
         );
-        assert_eq!(
-            node.current_term, 7,
-            "term must not change"
-        );
+        assert_eq!(node.current_term, 7, "term must not change");
     }
 }

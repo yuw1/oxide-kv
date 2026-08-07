@@ -26,13 +26,13 @@
 
 use crate::coordination::VoteResponse;
 use crate::raft::node::RaftNode;
-use crate::raft::rpc::{RpcClient, RpcServer, RaftMessage};
+use crate::raft::rpc::{RaftMessage, RpcClient, RpcServer};
 use std::sync::{Arc, RwLock};
-use tracing::warn;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
+use tracing::warn;
 
 /// Errors that any `Transport` impl may surface. Mirrors the set of
 /// failure modes the existing TCP path can produce:
@@ -150,11 +150,7 @@ pub trait Transport: Send + Sync + 'static {
     /// can choose to short-circuit reply variants to a Protocol error
     /// if that aids deterministic simulation, but the abstraction
     /// itself is intentionally neutral.
-    fn send_raft<'a>(
-        &'a self,
-        to: &'a str,
-        msg: RaftMessage,
-    ) -> futures::SendRaftFuture<'a>;
+    fn send_raft<'a>(&'a self, to: &'a str, msg: RaftMessage) -> futures::SendRaftFuture<'a>;
 
     /// Send a 2PC coordinator `VoteRequest` to `to` and await its
     /// `VoteResponse`. Used by the leader's vote fan-out during a
@@ -237,7 +233,8 @@ fn classify_rpc_err(err: anyhow::Error) -> TransportError {
     let chain = format!("{:?}", err);
     if chain.contains("Connection refused") || chain.contains("No route to host") {
         TransportError::Unreachable(format!("{}", err))
-    } else if chain.contains("deadline") || chain.contains("timed out") || chain.contains("Timeout") {
+    } else if chain.contains("deadline") || chain.contains("timed out") || chain.contains("Timeout")
+    {
         // `tokio::time::timeout` returns an `Elapsed` error whose
         // Display is "deadline has elapsed"; anyhow forwards it as-is.
         TransportError::Timeout(Duration::from_secs(0))
@@ -247,11 +244,7 @@ fn classify_rpc_err(err: anyhow::Error) -> TransportError {
 }
 
 impl Transport for TcpTransport {
-    fn send_raft<'a>(
-        &'a self,
-        to: &'a str,
-        msg: RaftMessage,
-    ) -> futures::SendRaftFuture<'a> {
+    fn send_raft<'a>(&'a self, to: &'a str, msg: RaftMessage) -> futures::SendRaftFuture<'a> {
         // Pick a per-RPC timeout that matches the pre-trait behavior:
         // RequestVote gets `rpc_request_vote_timeout_ms()`; AppendEntries
         // and InstallSnapshot get the longer `rpc_append_entries_timeout_ms()`.
@@ -259,9 +252,7 @@ impl Transport for TcpTransport {
         // `tokio::time::timeout(timeout_duration, ...)`; we forward the
         // same value so the connect-timeout behavior is preserved.
         let timeout_ms = match &msg {
-            RaftMessage::RequestVote(_) => {
-                crate::config::Config::rpc_request_vote_timeout_ms()
-            }
+            RaftMessage::RequestVote(_) => crate::config::Config::rpc_request_vote_timeout_ms(),
             RaftMessage::AppendEntries(_) | RaftMessage::InstallSnapshot(_) => {
                 crate::config::Config::rpc_append_entries_timeout_ms()
             }
@@ -272,13 +263,9 @@ impl Transport for TcpTransport {
         };
         let to_owned = to.to_string();
         let fut = Box::pin(async move {
-            RpcClient::call(
-                &to_owned,
-                msg,
-                Duration::from_millis(timeout_ms),
-            )
-            .await
-            .map_err(classify_rpc_err)
+            RpcClient::call(&to_owned, msg, Duration::from_millis(timeout_ms))
+                .await
+                .map_err(classify_rpc_err)
         });
         futures::SendRaftFuture(fut)
     }
@@ -421,13 +408,20 @@ mod tests {
             let storage = RaftStorage::new_with_paths(
                 dir.path().join("t.wal").to_str().unwrap().to_string(),
                 dir.path().join("t_meta.json").to_str().unwrap().to_string(),
-                dir.path().join("t_snapshot.json").to_str().unwrap().to_string(),
+                dir.path()
+                    .join("t_snapshot.json")
+                    .to_str()
+                    .unwrap()
+                    .to_string(),
             );
             let sm_dir = dir.path().join("t_sm");
-            let sm = Arc::new(RwLock::new(StateMachine::open(StateMachineConfig {
-                data_dir: sm_dir,
-                memtable_size_threshold: 1024 * 1024,
-            }).unwrap()));
+            let sm = Arc::new(RwLock::new(
+                StateMachine::open(StateMachineConfig {
+                    data_dir: sm_dir,
+                    memtable_size_threshold: 1024 * 1024,
+                })
+                .unwrap(),
+            ));
             Arc::new(RwLock::new(RaftNode::new_with_storage(
                 "t".to_string(),
                 vec![],

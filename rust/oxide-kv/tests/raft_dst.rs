@@ -132,14 +132,8 @@ async fn dst_leader_failover_then_new_leader_accepts_writes() {
     cluster
         .wait_for_replication_except(new_idx, &[0], Duration::from_secs(5))
         .await;
-    assert_eq!(
-        cluster.read(1, "after_failover"),
-        Some("v1".to_string())
-    );
-    assert_eq!(
-        cluster.read(2, "after_failover"),
-        Some("v1".to_string())
-    );
+    assert_eq!(cluster.read(1, "after_failover"), Some("v1".to_string()));
+    assert_eq!(cluster.read(2, "after_failover"), Some("v1".to_string()));
 
     // P7 safety invariants: every teardown runs the
     // four-invariants check so any latent safety bug
@@ -213,11 +207,7 @@ async fn dst_election_restriction_stale_candidate_loses() {
         !n2_won,
         "n2 should not win — its log is stale (n1 has more entries)"
     );
-    assert_ne!(
-        cluster.leader_index(),
-        Some(2),
-        "n2 should not be leader"
-    );
+    assert_ne!(cluster.leader_index(), Some(2), "n2 should not be leader");
 
     // Now n1 starts an election — n1 has the more recent
     // log, so it should win.
@@ -382,9 +372,7 @@ async fn dst_reference_model_cross_check_under_faults() {
     // controller from the start. We can flip links on/off
     // without rebuilding the cluster.
     let partition = Arc::new(PartitionedNetwork::new());
-    let cluster = SimCluster::new_3_nodes(
-        partition.clone() as Arc<dyn FaultScheduler>
-    ).await;
+    let cluster = SimCluster::new_3_nodes(partition.clone() as Arc<dyn FaultScheduler>).await;
     cluster.drive_election(0).await;
     let leader_idx = cluster.leader_index().unwrap();
 
@@ -393,7 +381,8 @@ async fn dst_reference_model_cross_check_under_faults() {
     // Helper: drain the reference model up to the
     // current leader's commit_index.
     let drain = |rm: &mut ReferenceModel, cluster: &SimCluster| {
-        let idx = cluster.leader_index()
+        let idx = cluster
+            .leader_index()
             .map(|l| cluster.nodes[l].raft.read().unwrap().commit_index)
             .unwrap_or(0);
         rm.drain_to(cluster, idx);
@@ -403,18 +392,32 @@ async fn dst_reference_model_cross_check_under_faults() {
     let i1 = cluster.submit_set(leader_idx, "alpha", "1");
     let i2 = cluster.submit_set(leader_idx, "beta", "2");
     let i3 = cluster.submit_set(leader_idx, "gamma", "3");
-    cluster.wait_for_replication(i3, Duration::from_secs(5)).await;
+    cluster
+        .wait_for_replication(i3, Duration::from_secs(5))
+        .await;
     drain(&mut rm, &cluster);
 
     // Cross-check: every node's read should match the
     // reference model.
     for n in 0..cluster.nodes.len() {
-        assert_eq!(cluster.read(n, "alpha"), rm.get("alpha").cloned(),
-            "alpha mismatch on n{}", n);
-        assert_eq!(cluster.read(n, "beta"), rm.get("beta").cloned(),
-            "beta mismatch on n{}", n);
-        assert_eq!(cluster.read(n, "gamma"), rm.get("gamma").cloned(),
-            "gamma mismatch on n{}", n);
+        assert_eq!(
+            cluster.read(n, "alpha"),
+            rm.get("alpha").cloned(),
+            "alpha mismatch on n{}",
+            n
+        );
+        assert_eq!(
+            cluster.read(n, "beta"),
+            rm.get("beta").cloned(),
+            "beta mismatch on n{}",
+            n
+        );
+        assert_eq!(
+            cluster.read(n, "gamma"),
+            rm.get("gamma").cloned(),
+            "gamma mismatch on n{}",
+            n
+        );
     }
 
     // Phase 2: partition n2 off, write on n0/n1.
@@ -442,10 +445,18 @@ async fn dst_reference_model_cross_check_under_faults() {
     drain(&mut rm, &cluster);
 
     for n in 0..cluster.nodes.len() {
-        assert_eq!(cluster.read(n, "delta"), rm.get("delta").cloned(),
-            "post-heal delta mismatch on n{}", n);
-        assert_eq!(cluster.read(n, "epsilon"), rm.get("epsilon").cloned(),
-            "post-heal epsilon mismatch on n{}", n);
+        assert_eq!(
+            cluster.read(n, "delta"),
+            rm.get("delta").cloned(),
+            "post-heal delta mismatch on n{}",
+            n
+        );
+        assert_eq!(
+            cluster.read(n, "epsilon"),
+            rm.get("epsilon").cloned(),
+            "post-heal epsilon mismatch on n{}",
+            n
+        );
     }
 
     cluster.shutdown().await;
@@ -464,7 +475,8 @@ async fn dst_reference_model_cross_check_after_leader_failover() {
     let leader_idx = cluster.leader_index().unwrap();
     let mut rm = ReferenceModel::new();
     let drain = |rm: &mut ReferenceModel, cluster: &SimCluster| {
-        let idx = cluster.leader_index()
+        let idx = cluster
+            .leader_index()
             .map(|l| cluster.nodes[l].raft.read().unwrap().commit_index)
             .unwrap_or(0);
         rm.drain_to(cluster, idx);
@@ -472,7 +484,9 @@ async fn dst_reference_model_cross_check_after_leader_failover() {
 
     let i1 = cluster.submit_set(leader_idx, "k1", "v1");
     let i2 = cluster.submit_set(leader_idx, "k2", "v2");
-    cluster.wait_for_replication(i2, Duration::from_secs(5)).await;
+    cluster
+        .wait_for_replication(i2, Duration::from_secs(5))
+        .await;
     drain(&mut rm, &cluster);
     assert_eq!(rm.applied_index(), i2);
 
@@ -512,28 +526,43 @@ async fn dst_reference_model_cross_check_with_delete() {
     let leader_idx = cluster.leader_index().unwrap();
     let mut rm = ReferenceModel::new();
     let drain = |rm: &mut ReferenceModel, cluster: &SimCluster| {
-        let idx = cluster.leader_index()
+        let idx = cluster
+            .leader_index()
             .map(|l| cluster.nodes[l].raft.read().unwrap().commit_index)
             .unwrap_or(0);
         rm.drain_to(cluster, idx);
     };
 
     let i1 = cluster.submit_set(leader_idx, "ephemeral", "alive");
-    cluster.wait_for_replication(i1, Duration::from_secs(5)).await;
+    cluster
+        .wait_for_replication(i1, Duration::from_secs(5))
+        .await;
     drain(&mut rm, &cluster);
     assert_eq!(cluster.read(0, "ephemeral"), rm.get("ephemeral").cloned());
 
     // Delete via submit_command (submit_set hardcodes Set).
-    let cmd = oxide_kv::protocol::Command::Delete { key: "ephemeral".into() };
+    let cmd = oxide_kv::protocol::Command::Delete {
+        key: "ephemeral".into(),
+    };
     let i2 = cluster.submit_command(leader_idx, cmd);
-    cluster.wait_for_replication(i2, Duration::from_secs(5)).await;
+    cluster
+        .wait_for_replication(i2, Duration::from_secs(5))
+        .await;
     drain(&mut rm, &cluster);
 
     for n in 0..cluster.nodes.len() {
-        assert_eq!(cluster.read(n, "ephemeral"), None,
-            "n{} should observe the Delete", n);
-        assert_eq!(cluster.read(n, "ephemeral"), rm.get("ephemeral").cloned(),
-            "n{}'s view should match reference model post-Delete", n);
+        assert_eq!(
+            cluster.read(n, "ephemeral"),
+            None,
+            "n{} should observe the Delete",
+            n
+        );
+        assert_eq!(
+            cluster.read(n, "ephemeral"),
+            rm.get("ephemeral").cloned(),
+            "n{}'s view should match reference model post-Delete",
+            n
+        );
     }
 
     cluster.shutdown().await;

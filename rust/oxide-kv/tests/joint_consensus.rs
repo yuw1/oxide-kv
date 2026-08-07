@@ -53,11 +53,11 @@
 //   never commits. The pre-vote PR (P8 PR 5) made this loop more
 //   responsive (250ms cadence instead of 1000ms).
 
-use oxide_kv::raft::node::{NodeState, RaftNode};
+use oxide_kv::protocol::{Command, ServerId};
 use oxide_kv::raft::net::StopSignal;
+use oxide_kv::raft::node::{NodeState, RaftNode};
 use oxide_kv::raft::rpc::RpcServer;
 use oxide_kv::raft::storage::RaftStorage;
-use oxide_kv::protocol::{Command, ServerId};
 use oxide_kv::state_machine::{StateMachine, StateMachineConfig};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -86,9 +86,24 @@ async fn spawn_node(peers: Vec<String>) -> TestNode {
     let addr = listener.local_addr().expect("local_addr").to_string();
 
     let data_dir = tempfile::tempdir().expect("tempdir");
-    let wal = data_dir.path().join("node.wal").to_str().unwrap().to_string();
-    let meta = data_dir.path().join("node_meta.json").to_str().unwrap().to_string();
-    let snap = data_dir.path().join("node_snapshot.json").to_str().unwrap().to_string();
+    let wal = data_dir
+        .path()
+        .join("node.wal")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let meta = data_dir
+        .path()
+        .join("node_meta.json")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let snap = data_dir
+        .path()
+        .join("node_snapshot.json")
+        .to_str()
+        .unwrap()
+        .to_string();
     let storage = RaftStorage::new_with_paths(wal, meta, snap);
 
     let sm_dir = data_dir.path().join("sm");
@@ -239,10 +254,12 @@ async fn add_node_to_3_node_cluster_brings_in_4th_node_and_all_4_form_quorum() {
 
     let joint_idx = {
         let mut leader = nodes[leader_idx].raft.write().unwrap();
-        leader.propose_add_node(ServerId {
-            node_id: n4_addr.clone(),
-            addr: n4_addr.clone(),
-        }).expect("leader should accept AddNode")
+        leader
+            .propose_add_node(ServerId {
+                node_id: n4_addr.clone(),
+                addr: n4_addr.clone(),
+            })
+            .expect("leader should accept AddNode")
     };
     // Trigger replication.
     RaftNode::sync_logs(nodes[leader_idx].raft.clone());
@@ -259,7 +276,8 @@ async fn add_node_to_3_node_cluster_brings_in_4th_node_and_all_4_form_quorum() {
         assert!(
             ids.contains(&n4_addr.as_str()),
             "node {} did not install n4 in current_config; config = {:?}",
-            i, cfg
+            i,
+            cfg
         );
     }
 
@@ -335,13 +353,15 @@ async fn remove_node_shrinks_4_node_cluster_to_3_node_and_quorum_updates() {
         assert!(
             !ids.contains(&remove_addr.as_str()),
             "node {} still has removed n4 in current_config; config = {:?}",
-            i, cfg
+            i,
+            cfg
         );
         assert_eq!(
             all.len(),
             3,
             "node {} expected 3-node Simple config; got {:?}",
-            i, cfg
+            i,
+            cfg
         );
     }
 
@@ -416,7 +436,10 @@ async fn add_node_rejects_already_member() {
             addr: n2_addr.clone(),
         })
     };
-    assert!(result.is_err(), "leader should refuse to re-add existing member");
+    assert!(
+        result.is_err(),
+        "leader should refuse to re-add existing member"
+    );
 
     for n in &nodes {
         n.shutdown();

@@ -72,10 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         "delete" => {
-            let key = positional
-                .get(1)
-                .ok_or("delete requires <key>")?
-                .clone();
+            let key = positional.get(1).ok_or("delete requires <key>")?.clone();
             let idx = client.delete(&key).await?;
             println!("{idx}");
         }

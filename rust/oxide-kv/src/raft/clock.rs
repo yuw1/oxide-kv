@@ -232,7 +232,10 @@ mod tests {
         let clock = SystemClock;
         let a = clock.now();
         let b = clock.now();
-        assert!(b >= a, "SystemClock::now must be monotonically non-decreasing");
+        assert!(
+            b >= a,
+            "SystemClock::now must be monotonically non-decreasing"
+        );
     }
 
     #[test]
@@ -273,8 +276,8 @@ mod tests {
         let c2 = SimClock::with_epoch(epoch);
 
         let schedule = vec![
-            Duration::from_millis(0),     // tick immediately
-            Duration::from_millis(250),   // election timeout region
+            Duration::from_millis(0),   // tick immediately
+            Duration::from_millis(250), // election timeout region
             Duration::from_millis(500),
             Duration::from_millis(1000),
             Duration::from_millis(2_500),

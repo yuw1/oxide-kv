@@ -1,8 +1,8 @@
+use crate::config::Config;
+use crate::raft::clock::{Clock, system_clock};
 use crate::raft::node::{NodeState, RaftNode};
-use crate::raft::clock::{system_clock, Clock};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
-use crate::config::Config;
 use tracing::info;
 
 /// Pure decision function: should the node start a new election at `now`?
@@ -84,8 +84,7 @@ pub async fn run_election_timer(raft: Arc<RwLock<RaftNode>>) {
         if should_start_election(state2, last_heartbeat2, clock.now(), election_threshold) {
             info!(
                 sleep_ms,
-                jitter_ms,
-                "election timeout; starting pre-vote probe"
+                jitter_ms, "election timeout; starting pre-vote probe"
             );
             // P8 PR 5 (Raft §9.6): the timer entry point now goes
             // through the pre-vote probe phase rather than bumping

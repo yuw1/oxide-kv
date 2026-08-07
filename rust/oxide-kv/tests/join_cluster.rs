@@ -32,11 +32,11 @@
 // matching the pattern in `joint_consensus.rs`. Real cross-process
 // smoke testing lives in the P8 PR #9 systemd integration test.
 
+use oxide_kv::protocol::{Command, ServerId};
 use oxide_kv::raft::net::StopSignal;
 use oxide_kv::raft::node::{NodeState, RaftNode};
 use oxide_kv::raft::rpc::{JoinClusterRequest, JoinClusterResponse, RaftMessage, RpcServer};
 use oxide_kv::raft::storage::RaftStorage;
-use oxide_kv::protocol::{Command, ServerId};
 use oxide_kv::state_machine::{StateMachine, StateMachineConfig};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -61,9 +61,24 @@ async fn spawn_node(peers: Vec<String>) -> TestNode {
     let addr = listener.local_addr().expect("local_addr").to_string();
 
     let data_dir = tempfile::tempdir().expect("tempdir");
-    let wal = data_dir.path().join("node.wal").to_str().unwrap().to_string();
-    let meta = data_dir.path().join("node_meta.json").to_str().unwrap().to_string();
-    let snap = data_dir.path().join("node_snapshot.json").to_str().unwrap().to_string();
+    let wal = data_dir
+        .path()
+        .join("node.wal")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let meta = data_dir
+        .path()
+        .join("node_meta.json")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let snap = data_dir
+        .path()
+        .join("node_snapshot.json")
+        .to_str()
+        .unwrap()
+        .to_string();
     let storage = RaftStorage::new_with_paths(wal, meta, snap);
 
     let sm_dir = data_dir.path().join("sm");
@@ -311,15 +326,13 @@ async fn join_cluster_routed_to_follower_is_rejected() {
 
     // Pick a follower address.
     let follower_addr = cluster[(leader_idx + 1) % cluster.len()].addr.clone();
-    assert_ne!(follower_addr, leader_addr, "follower must differ from leader");
+    assert_ne!(
+        follower_addr, leader_addr,
+        "follower must differ from leader"
+    );
 
     let candidate = spawn_node(vec![]).await;
-    let resp = send_join_cluster(
-        &cluster[leader_idx],
-        &follower_addr,
-        &candidate.addr,
-    )
-    .await;
+    let resp = send_join_cluster(&cluster[leader_idx], &follower_addr, &candidate.addr).await;
     assert!(!resp.accepted);
     assert_eq!(resp.reason, "not leader");
     assert!(resp.peer_addrs.is_empty());
@@ -353,12 +366,7 @@ async fn join_cluster_rejects_self_address() {
     let leader_addr = cluster[leader_idx].addr.clone();
 
     // Candidate_addr == leader_addr (e.g. hint landed back on leader).
-    let resp = send_join_cluster(
-        &cluster[leader_idx],
-        &leader_addr,
-        &leader_addr,
-    )
-    .await;
+    let resp = send_join_cluster(&cluster[leader_idx], &leader_addr, &leader_addr).await;
     assert!(!resp.accepted);
     assert_eq!(resp.reason, "candidate_addr is the leader itself");
     assert!(resp.peer_addrs.is_empty());
@@ -392,10 +400,7 @@ async fn join_cluster_rejects_candidate_addr_already_member() {
     )
     .await;
     assert!(!resp.accepted);
-    assert_eq!(
-        resp.reason,
-        "candidate_addr is already a cluster member"
-    );
+    assert_eq!(resp.reason, "candidate_addr is already a cluster member");
     assert!(resp.peer_addrs.is_empty());
 
     for n in &cluster {

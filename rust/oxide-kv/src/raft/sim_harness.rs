@@ -241,9 +241,9 @@ impl SimCluster {
     /// after a partition, prefer polling `current_term(idx)`
     /// and waiting for the old leader to step down.
     pub fn leader_index(&self) -> Option<usize> {
-        self.nodes.iter().position(|n| {
-            n.raft.read().unwrap().state == NodeState::Leader
-        })
+        self.nodes
+            .iter()
+            .position(|n| n.raft.read().unwrap().state == NodeState::Leader)
     }
 
     /// Submit a `Set` command on the leader's state machine
@@ -349,7 +349,8 @@ impl SimCluster {
     /// [`Self::wait_for_replication_except`] with an explicit
     /// excluded list.
     pub async fn wait_for_replication(&self, target_index: u64, timeout: Duration) {
-        self.wait_for_replication_except(target_index, &[], timeout).await;
+        self.wait_for_replication_except(target_index, &[], timeout)
+            .await;
     }
 
     /// Poll until every **non-excluded** node has applied at
@@ -635,11 +636,23 @@ mod tests {
         let idx1 = cluster.submit_set(leader_idx, "a", "1");
         let idx2 = cluster.submit_set(leader_idx, "b", "2");
 
-        cluster.wait_for_replication(idx2, Duration::from_secs(5)).await;
+        cluster
+            .wait_for_replication(idx2, Duration::from_secs(5))
+            .await;
 
         for i in 0..cluster.nodes.len() {
-            assert_eq!(cluster.read(i, "a"), Some("1".to_string()), "node {} missing a", i);
-            assert_eq!(cluster.read(i, "b"), Some("2".to_string()), "node {} missing b", i);
+            assert_eq!(
+                cluster.read(i, "a"),
+                Some("1".to_string()),
+                "node {} missing a",
+                i
+            );
+            assert_eq!(
+                cluster.read(i, "b"),
+                Some("2".to_string()),
+                "node {} missing b",
+                i
+            );
         }
         // Indices should be consecutive.
         assert_eq!(idx1, 1);
@@ -709,10 +722,7 @@ mod tests {
         let leader_idx = cluster.leader_index().unwrap();
 
         // Partition n0 -> n2.
-        partition.partition(crate::raft::fault_scheduler::LinkId::new(
-            "n0",
-            "n2",
-        ));
+        partition.partition(crate::raft::fault_scheduler::LinkId::new("n0", "n2"));
 
         // n0 submits a Set; n1 catches up; n2 doesn't.
         let idx = cluster.submit_set(leader_idx, "after_partition", "v1");
@@ -786,7 +796,9 @@ mod tests {
         // applied locally on the next heartbeat tick (which
         // happens immediately because we just became
         // Leader).
-        cluster.wait_for_replication(idx, Duration::from_secs(5)).await;
+        cluster
+            .wait_for_replication(idx, Duration::from_secs(5))
+            .await;
         assert_eq!(cluster.read(0, "k"), Some("v".to_string()));
 
         cluster.shutdown().await;

@@ -4,9 +4,16 @@ use std::time::Instant;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum Command {
-    Set { key: String, value: String },
-    Get { key: String },
-    Delete { key: String },
+    Set {
+        key: String,
+        value: String,
+    },
+    Get {
+        key: String,
+    },
+    Delete {
+        key: String,
+    },
     Compact,
     /// Admin RPC: force-abort a stuck 2PC transaction by tx_id.
     ///
@@ -25,7 +32,9 @@ pub enum Command {
     ///
     /// Wire tag is the next free slot after `InstallConfiguration`
     /// (see `proto/raft.proto::Command.Body`).
-    AbortTx { tx_id: String },
+    AbortTx {
+        tx_id: String,
+    },
     // ---- Two-phase commit lifecycle (Raft thesis §6.4, simplified) ----
     //
     // As of P6 (see `ROADMAP.md`), the coordinator is the leader and votes
@@ -35,8 +44,14 @@ pub enum Command {
     // `Vote` is no longer a `Command` variant. The internal `Vote` enum
     // below still models an individual peer's decision inside
     // `StateMachine::pending_txs`, but it is populated out-of-band.
-    BeginTx { tx_id: String, ops: Vec<TxOp> },
-    DecideTx { tx_id: String, decision: TxDecision },
+    BeginTx {
+        tx_id: String,
+        ops: Vec<TxOp>,
+    },
+    DecideTx {
+        tx_id: String,
+        decision: TxDecision,
+    },
     // ---- Cluster membership change (Raft thesis §6) ----
     //
     // `AddNode` / `RemoveNode` are the *client-facing* membership commands.
@@ -48,14 +63,20 @@ pub enum Command {
     // These two variants themselves never appear in the replicated log;
     // they are consumed by the leader's `MembershipCoordinator` and
     // replaced with `InstallConfiguration` entries before append.
-    AddNode { server: ServerId },
-    RemoveNode { node_id: String },
+    AddNode {
+        server: ServerId,
+    },
+    RemoveNode {
+        node_id: String,
+    },
     /// Internal log entry: install the given configuration. Produced
     /// only by the leader's `MembershipCoordinator`; followers install
     /// it during `apply_logs` / `replay_logs`. The variant is wire-
     /// serializable (prost encodes it via a separate message type)
     /// but never appears as a client-facing command.
-    InstallConfiguration { config: Configuration },
+    InstallConfiguration {
+        config: Configuration,
+    },
 }
 
 /// Stable identity of a server in the cluster.
@@ -89,7 +110,10 @@ pub enum Configuration {
     /// `old` is the configuration that was active when this entry was
     /// proposed; `new` is the configuration that takes over once the
     /// subsequent `Simple(new)` entry commits.
-    Joint { old: Vec<ServerId>, new: Vec<ServerId> },
+    Joint {
+        old: Vec<ServerId>,
+        new: Vec<ServerId>,
+    },
 }
 
 impl Configuration {

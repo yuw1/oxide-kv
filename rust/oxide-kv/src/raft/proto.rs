@@ -8,8 +8,8 @@
 
 use crate::protocol::{
     Command as DomainCommand, Configuration as DomainConfiguration, LogEntry as DomainLogEntry,
-    ServerId as DomainServerId, Snapshot as DomainSnapshot,
-    TxDecision as DomainTxDecision, TxOp as DomainTxOp,
+    ServerId as DomainServerId, Snapshot as DomainSnapshot, TxDecision as DomainTxDecision,
+    TxOp as DomainTxOp,
 };
 use crate::raft::rpc::{
     AppendEntriesArgs as DomainAppendArgs, AppendReplyArgs as DomainAppendReply,
@@ -41,12 +41,10 @@ impl From<&DomainCommand> for pb::Command {
                 pb::command::Body::Delete(pb::Delete { key: key.clone() })
             }
             DomainCommand::Compact => pb::command::Body::Compact(pb::Empty {}),
-            DomainCommand::BeginTx { tx_id, ops } => {
-                pb::command::Body::BeginTx(pb::BeginTx {
-                    tx_id: tx_id.clone(),
-                    ops: ops.iter().map(|o| o.into()).collect(),
-                })
-            }
+            DomainCommand::BeginTx { tx_id, ops } => pb::command::Body::BeginTx(pb::BeginTx {
+                tx_id: tx_id.clone(),
+                ops: ops.iter().map(|o| o.into()).collect(),
+            }),
             // `Command::Vote` was removed in P6 (see `proto/coordination.proto`).
             // Votes now travel on the side-channel RPC; the Raft log carries
             // only `BeginTx` and `DecideTx`.
@@ -63,12 +61,8 @@ impl From<&DomainCommand> for pb::Command {
             // appear on the wire, but the encoding exists so the
             // type is closed and the proto schema matches the
             // Rust enum.
-            DomainCommand::AddNode { server } => {
-                pb::command::Body::AddNode(server.into())
-            }
-            DomainCommand::RemoveNode { node_id } => {
-                pb::command::Body::RemoveNode(node_id.clone())
-            }
+            DomainCommand::AddNode { server } => pb::command::Body::AddNode(server.into()),
+            DomainCommand::RemoveNode { node_id } => pb::command::Body::RemoveNode(node_id.clone()),
             DomainCommand::InstallConfiguration { config } => {
                 pb::command::Body::InstallConfiguration(config.into())
             }
@@ -78,9 +72,7 @@ impl From<&DomainCommand> for pb::Command {
             // client tries to send AbortTx to a Follower (or a stale
             // peer replays an old log). Encode as a plain string
             // field so the type is closed.
-            DomainCommand::AbortTx { tx_id } => {
-                pb::command::Body::AbortTx(tx_id.clone())
-            }
+            DomainCommand::AbortTx { tx_id } => pb::command::Body::AbortTx(tx_id.clone()),
         };
         pb::Command { body: Some(body) }
     }
@@ -107,9 +99,11 @@ impl From<pb::ServerId> for DomainServerId {
 impl From<&DomainConfiguration> for pb::ConfigurationEntry {
     fn from(c: &DomainConfiguration) -> Self {
         let (kind, old_servers, new_servers) = match c {
-            DomainConfiguration::Simple(servers) => {
-                (pb::configuration_entry::Kind::Simple, vec![], servers.iter().map(|s| s.into()).collect())
-            }
+            DomainConfiguration::Simple(servers) => (
+                pb::configuration_entry::Kind::Simple,
+                vec![],
+                servers.iter().map(|s| s.into()).collect(),
+            ),
             DomainConfiguration::Joint { old, new } => (
                 pb::configuration_entry::Kind::Joint,
                 old.iter().map(|s| s.into()).collect(),
@@ -263,15 +257,15 @@ pub fn encode_domain(domain: &DomainRaftMessage) -> pb::RaftMessage {
         DM::JoinCluster(req) => pb::raft_message::Body::JoinCluster(pb::JoinClusterRequest {
             candidate_addr: req.candidate_addr.clone(),
         }),
-        DM::JoinClusterResponse(resp) => pb::raft_message::Body::JoinClusterResponse(
-            pb::JoinClusterResponse {
+        DM::JoinClusterResponse(resp) => {
+            pb::raft_message::Body::JoinClusterResponse(pb::JoinClusterResponse {
                 accepted: resp.accepted,
                 term: resp.term,
                 leader_addr: resp.leader_addr.clone(),
                 peer_addrs: resp.peer_addrs.clone(),
                 reason: resp.reason.clone(),
-            },
-        ),
+            })
+        }
     };
     pb::RaftMessage { body: Some(body) }
 }
@@ -282,7 +276,10 @@ pub fn encode_domain(domain: &DomainRaftMessage) -> pb::RaftMessage {
 
 impl From<pb::Set> for DomainCommand {
     fn from(p: pb::Set) -> Self {
-        DomainCommand::Set { key: p.key, value: p.value }
+        DomainCommand::Set {
+            key: p.key,
+            value: p.value,
+        }
     }
 }
 
@@ -307,7 +304,10 @@ impl From<pb::Empty> for DomainCommand {
 impl From<pb::Command> for DomainCommand {
     fn from(p: pb::Command) -> Self {
         match p.body {
-            Some(pb::command::Body::Set(s)) => DomainCommand::Set { key: s.key, value: s.value },
+            Some(pb::command::Body::Set(s)) => DomainCommand::Set {
+                key: s.key,
+                value: s.value,
+            },
             Some(pb::command::Body::Get(g)) => DomainCommand::Get { key: g.key },
             Some(pb::command::Body::Delete(d)) => DomainCommand::Delete { key: d.key },
             Some(pb::command::Body::Compact(_)) => DomainCommand::Compact,
@@ -325,7 +325,10 @@ impl From<pb::Command> for DomainCommand {
                 } else {
                     DomainTxDecision::Abort
                 };
-                DomainCommand::DecideTx { tx_id: d.tx_id, decision }
+                DomainCommand::DecideTx {
+                    tx_id: d.tx_id,
+                    decision,
+                }
             }
             // P8 PR 6 inverse. AddNode/RemoveNode on the wire
             // only happens when a client tries to send one to a
@@ -355,7 +358,10 @@ impl From<pb::Command> for DomainCommand {
 impl From<pb::TxOp> for DomainTxOp {
     fn from(p: pb::TxOp) -> Self {
         match p.body {
-            Some(pb::tx_op::Body::Put(s)) => DomainTxOp::Put { key: s.key, value: s.value },
+            Some(pb::tx_op::Body::Put(s)) => DomainTxOp::Put {
+                key: s.key,
+                value: s.value,
+            },
             Some(pb::tx_op::Body::Delete(d)) => DomainTxOp::Delete { key: d.key },
             None => DomainTxOp::Delete { key: String::new() }, // best-effort no-op
         }
@@ -367,7 +373,10 @@ impl From<pb::LogEntry> for DomainLogEntry {
         DomainLogEntry {
             term: p.term,
             index: p.index as usize,
-            command: p.command.map(|c| c.into()).unwrap_or(DomainCommand::Compact),
+            command: p
+                .command
+                .map(|c| c.into())
+                .unwrap_or(DomainCommand::Compact),
         }
     }
 }
@@ -464,19 +473,22 @@ pub fn decode_domain(p: pb::RaftMessage) -> DomainRaftMessage {
         Some(pb::raft_message::Body::JoinCluster(req)) => DM::JoinCluster(DomainJoinReq {
             candidate_addr: req.candidate_addr,
         }),
-        Some(pb::raft_message::Body::JoinClusterResponse(resp)) => DM::JoinClusterResponse(
-            DomainJoinResp {
+        Some(pb::raft_message::Body::JoinClusterResponse(resp)) => {
+            DM::JoinClusterResponse(DomainJoinResp {
                 accepted: resp.accepted,
                 term: resp.term,
                 leader_addr: resp.leader_addr,
                 peer_addrs: resp.peer_addrs,
                 reason: resp.reason,
-            },
-        ),
+            })
+        }
         None => {
             // A top-level RaftMessage with no payload should never arrive on the
             // wire. Treat as a vote response with term=0 to fail closed.
-            DM::VoteResponse(DomainVote { term: 0, vote_granted: false })
+            DM::VoteResponse(DomainVote {
+                term: 0,
+                vote_granted: false,
+            })
         }
     }
 }
@@ -529,8 +541,14 @@ mod tests {
                 last_log_index: 10,
                 last_log_term: 2,
             }),
-            DM::VoteResponse(DomainVote { term: 3, vote_granted: true }),
-            DM::AppendReply(DomainAppendReply { term: 4, success: false }),
+            DM::VoteResponse(DomainVote {
+                term: 3,
+                vote_granted: true,
+            }),
+            DM::AppendReply(DomainAppendReply {
+                term: 4,
+                success: false,
+            }),
             DM::InstallSnapshot(DomainInstallArgs {
                 term: 5,
                 leader_id: "n1".into(),
@@ -553,10 +571,7 @@ mod tests {
                 accepted: true,
                 term: 7,
                 leader_addr: "n1@host:9001".into(),
-                peer_addrs: vec![
-                    "n2@host:9002".into(),
-                    "n3@host:9004".into(),
-                ],
+                peer_addrs: vec!["n2@host:9002".into(), "n3@host:9004".into()],
                 reason: String::new(),
             }),
             DM::JoinClusterResponse(DomainJoinResp {
@@ -579,7 +594,10 @@ mod tests {
     #[test]
     fn command_variants_roundtrip() {
         let commands = vec![
-            DomainCommand::Set { key: "k".into(), value: "v".into() },
+            DomainCommand::Set {
+                key: "k".into(),
+                value: "v".into(),
+            },
             DomainCommand::Get { key: "k".into() },
             DomainCommand::Delete { key: "k".into() },
             DomainCommand::Compact,

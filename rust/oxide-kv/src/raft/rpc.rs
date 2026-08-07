@@ -12,7 +12,7 @@ use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
 use crate::raft::transport::{
-    read_envelope, read_envelope_discriminator, read_envelope_payload, write_envelope, DispatchKind,
+    DispatchKind, read_envelope, read_envelope_discriminator, read_envelope_payload, write_envelope,
 };
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -68,7 +68,7 @@ pub struct RequestVoteArgs {
     pub term: u64,
     pub candidate_id: String,
     pub last_log_index: u64,
-    pub last_log_term: u64
+    pub last_log_term: u64,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
@@ -89,7 +89,7 @@ pub struct AppendEntriesArgs {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct AppendReplyArgs {
-    pub term: u64,    // Current term of follower, for leader to update itself
+    pub term: u64,     // Current term of follower, for leader to update itself
     pub success: bool, // True if follower contained entry matching prev_log_index and prev_log_term
 }
 
@@ -127,7 +127,11 @@ impl RpcClient {
     /// `pub(crate)` so `crate::raft::net::TcpTransport` (the P7
     /// Transport-trait real impl) can route every Raft variant through
     /// one helper instead of needing per-variant dispatcher code.
-    pub(crate) async fn call(addr: &str, msg: RaftMessage, timeout_duration: Duration) -> anyhow::Result<RaftMessage> {
+    pub(crate) async fn call(
+        addr: &str,
+        msg: RaftMessage,
+        timeout_duration: Duration,
+    ) -> anyhow::Result<RaftMessage> {
         let stream = timeout(timeout_duration, TcpStream::connect(addr)).await??;
         let (mut reader, mut writer) = stream.into_split();
 
@@ -151,9 +155,13 @@ impl RpcClient {
             &addr,
             RaftMessage::InstallSnapshot(args),
             Duration::from_secs(Config::rpc_append_entries_timeout_ms()),
-        ).await? {
+        )
+        .await?
+        {
             RaftMessage::InstallSnapshotReply(reply) => Ok(reply),
-            _ => Err(anyhow::anyhow!("Unexpected RPC response type for InstallSnapshot")),
+            _ => Err(anyhow::anyhow!(
+                "Unexpected RPC response type for InstallSnapshot"
+            )),
         }
     }
 
@@ -177,7 +185,11 @@ impl RpcClient {
         write_envelope(&mut writer, DispatchKind::Vote, &pb).await?;
         let (kind, resp_buf) = match read_envelope(&mut reader).await? {
             Some(env) => env,
-            None => return Err(anyhow::anyhow!("Vote RPC peer closed connection before reply")),
+            None => {
+                return Err(anyhow::anyhow!(
+                    "Vote RPC peer closed connection before reply"
+                ));
+            }
         };
         if kind != DispatchKind::Vote {
             return Err(anyhow::anyhow!(
@@ -230,12 +242,8 @@ impl RpcServer {
         };
 
         match kind {
-            DispatchKind::Raft => {
-                Self::handle_raft_rpc_inner(reader, writer, raft_node).await
-            }
-            DispatchKind::Vote => {
-                Self::handle_vote_rpc_inner(reader, writer, raft_node).await
-            }
+            DispatchKind::Raft => Self::handle_raft_rpc_inner(reader, writer, raft_node).await,
+            DispatchKind::Vote => Self::handle_vote_rpc_inner(reader, writer, raft_node).await,
         }
     }
 
@@ -257,12 +265,8 @@ impl RpcServer {
             None => return Ok(()),
         };
         match kind {
-            DispatchKind::Raft => {
-                Self::handle_raft_rpc_inner(reader, writer, raft_node).await
-            }
-            DispatchKind::Vote => {
-                Self::handle_vote_rpc_inner(reader, writer, raft_node).await
-            }
+            DispatchKind::Raft => Self::handle_raft_rpc_inner(reader, writer, raft_node).await,
+            DispatchKind::Vote => Self::handle_vote_rpc_inner(reader, writer, raft_node).await,
         }
     }
 
@@ -426,7 +430,9 @@ pub(crate) async fn write_framed<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     payload: &[u8],
 ) -> std::io::Result<()> {
-    writer.write_all(&(payload.len() as u32).to_be_bytes()).await?;
+    writer
+        .write_all(&(payload.len() as u32).to_be_bytes())
+        .await?;
     writer.write_all(payload).await?;
     writer.flush().await?;
     Ok(())
@@ -515,7 +521,10 @@ mod tests {
         assert_eq!(decoded, original);
 
         // Server writes a reply.
-        let reply = RaftMessage::VoteResponse(VoteResponseArgs { term: 42, vote_granted: true });
+        let reply = RaftMessage::VoteResponse(VoteResponseArgs {
+            term: 42,
+            vote_granted: true,
+        });
         let resp_payload = encode_domain(&reply).encode_to_vec();
         write_framed(&mut server_io, &resp_payload).await.unwrap();
 
@@ -534,11 +543,11 @@ mod tests {
     /// multiplexed envelope without binding a real socket.
     #[tokio::test]
     async fn vote_rpc_dispatch_roundtrip_on_duplex() {
-        use crate::coordination::{pb, VoteRequest, VoteResponse};
-        use crate::raft::transport::{read_envelope, write_envelope, DispatchKind};
+        use crate::coordination::{VoteRequest, VoteResponse, pb};
+        use crate::protocol::TxOp;
         use crate::raft::node::RaftNode;
         use crate::raft::storage::RaftStorage;
-        use crate::protocol::TxOp;
+        use crate::raft::transport::{DispatchKind, read_envelope, write_envelope};
         use crate::state_machine::{StateMachine, StateMachineConfig};
         use prost::Message;
         use std::sync::{Arc, RwLock};
@@ -547,20 +556,31 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let wal = dir.path().join("v.wal").to_str().unwrap().to_string();
         let meta = dir.path().join("v_meta.json").to_str().unwrap().to_string();
-        let snap = dir.path().join("v_snapshot.json").to_str().unwrap().to_string();
+        let snap = dir
+            .path()
+            .join("v_snapshot.json")
+            .to_str()
+            .unwrap()
+            .to_string();
         let storage = RaftStorage::new_with_paths(wal, meta, snap);
         let sm_dir = dir.path().join("v_sm");
-        let sm = Arc::new(RwLock::new(StateMachine::open(StateMachineConfig {
-            data_dir: sm_dir,
-            memtable_size_threshold: 1024 * 1024,
-        }).unwrap()));
+        let sm = Arc::new(RwLock::new(
+            StateMachine::open(StateMachineConfig {
+                data_dir: sm_dir,
+                memtable_size_threshold: 1024 * 1024,
+            })
+            .unwrap(),
+        ));
         let mut node = RaftNode::new_with_storage("v".to_string(), vec![], sm, storage);
         node.current_term = 1;
         {
             let mut sm = node.state_machine.write().unwrap();
             sm.begin_tx(
                 "tx-vote".to_string(),
-                vec![TxOp::Put { key: "k".into(), value: "v".into() }],
+                vec![TxOp::Put {
+                    key: "k".into(),
+                    value: "v".into(),
+                }],
             )
             .unwrap();
         }
@@ -570,9 +590,7 @@ mod tests {
 
         // Server task: drives the full dispatch path.
         let server_node = node_arc.clone();
-        let server = tokio::spawn(async move {
-            RpcServer::dispatch_on(b, server_node).await
-        });
+        let server = tokio::spawn(async move { RpcServer::dispatch_on(b, server_node).await });
 
         // Client side: write a VoteRequest envelope and read the
         // response envelope. We use the wire types directly (not
@@ -618,13 +636,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let wal = dir.path().join("u.wal").to_str().unwrap().to_string();
         let meta = dir.path().join("u_meta.json").to_str().unwrap().to_string();
-        let snap = dir.path().join("u_snapshot.json").to_str().unwrap().to_string();
+        let snap = dir
+            .path()
+            .join("u_snapshot.json")
+            .to_str()
+            .unwrap()
+            .to_string();
         let storage = RaftStorage::new_with_paths(wal, meta, snap);
         let sm_dir = dir.path().join("u_sm");
-        let sm = Arc::new(RwLock::new(StateMachine::open(StateMachineConfig {
-            data_dir: sm_dir,
-            memtable_size_threshold: 1024 * 1024,
-        }).unwrap()));
+        let sm = Arc::new(RwLock::new(
+            StateMachine::open(StateMachineConfig {
+                data_dir: sm_dir,
+                memtable_size_threshold: 1024 * 1024,
+            })
+            .unwrap(),
+        ));
         let node = RaftNode::new_with_storage("u".to_string(), vec![], sm, storage);
         let node_arc = Arc::new(RwLock::new(node));
 

@@ -125,11 +125,7 @@ pub trait FaultScheduler: Send + Sync + 'static {
     ///
     /// `body` is passed by reference to avoid cloning. If a
     /// scheduler needs ownership it can clone the inner variant.
-    fn before_send<'a>(
-        &'a self,
-        link: &'a LinkId,
-        body: &'a InboundMessageBody,
-    ) -> ScheduleFuture;
+    fn before_send<'a>(&'a self, link: &'a LinkId, body: &'a InboundMessageBody) -> ScheduleFuture;
 
     /// Optional side-channel for schedulers that need to react
     /// to a message *after* it's been delivered (e.g. an
@@ -167,11 +163,7 @@ impl<F: Fn(&LinkId, &InboundMessageBody) -> bool + Send + Sync + 'static> DropUn
 impl<F: Fn(&LinkId, &InboundMessageBody) -> bool + Send + Sync + 'static> FaultScheduler
     for DropUnless<F>
 {
-    fn before_send<'a>(
-        &'a self,
-        link: &'a LinkId,
-        body: &'a InboundMessageBody,
-    ) -> ScheduleFuture {
+    fn before_send<'a>(&'a self, link: &'a LinkId, body: &'a InboundMessageBody) -> ScheduleFuture {
         let keep = (self.cond)(link, body);
         Box::pin(async move {
             if keep {
@@ -450,9 +442,7 @@ mod tests {
     use super::*;
     use crate::raft::net::Transport;
     use crate::raft::net::TransportError;
-    use crate::raft::rpc::{
-        AppendEntriesArgs, InstallSnapshotArgs, RaftMessage, RequestVoteArgs,
-    };
+    use crate::raft::rpc::{AppendEntriesArgs, InstallSnapshotArgs, RaftMessage, RequestVoteArgs};
     use crate::raft::sim_transport::{InboundMessageBody, Network, SimTransport};
     use std::sync::{Arc, RwLock};
     use std::time::Duration;
@@ -577,9 +567,7 @@ mod tests {
         let link_n1_n3 = LinkId::new("n1", "n3");
 
         // n1 -> n2 / RequestVote: keep=false -> drop.
-        let outcome = drop_unless
-            .before_send(&link_n1_n2, &request_vote(1))
-            .await;
+        let outcome = drop_unless.before_send(&link_n1_n2, &request_vote(1)).await;
         assert!(matches!(outcome, ScheduleOutcome::Drop));
 
         // n1 -> n2 / AppendEntries: keep=true -> deliver.
@@ -668,15 +656,13 @@ mod tests {
             tmp.path().join("meta").to_string_lossy().to_string(),
             tmp.path().join("snap").to_string_lossy().to_string(),
         );
-        let node_n2: Arc<RwLock<RaftNode>> = Arc::new(RwLock::new(
-            RaftNode::new_with_clock(
-                "n2".to_string(),
-                vec!["n1".to_string()],
-                sm,
-                storage,
-                Arc::new(SystemClock),
-            ),
-        ));
+        let node_n2: Arc<RwLock<RaftNode>> = Arc::new(RwLock::new(RaftNode::new_with_clock(
+            "n2".to_string(),
+            vec!["n1".to_string()],
+            sm,
+            storage,
+            Arc::new(SystemClock),
+        )));
         let stop = StopSignal::new();
         let t_n2 = SimTransport::new("n2".into(), net.clone(), rx_n2);
         let serve_handle = {

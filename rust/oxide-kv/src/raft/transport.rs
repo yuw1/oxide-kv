@@ -101,7 +101,9 @@ pub(crate) async fn write_envelope<W: AsyncWriteExt + Unpin>(
         ));
     }
     writer.write_all(&[kind as u8]).await?;
-    writer.write_all(&(payload.len() as u32).to_be_bytes()).await?;
+    writer
+        .write_all(&(payload.len() as u32).to_be_bytes())
+        .await?;
     writer.write_all(payload).await?;
     writer.flush().await?;
     Ok(())
@@ -167,12 +169,14 @@ pub(crate) async fn read_envelope_discriminator<R: AsyncReadExt + Unpin>(
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e),
     }
-    DispatchKind::from_byte(kind_buf[0]).map(Some).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("unknown protocol discriminator 0x{:02x}", kind_buf[0]),
-        )
-    })
+    DispatchKind::from_byte(kind_buf[0])
+        .map(Some)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unknown protocol discriminator 0x{:02x}", kind_buf[0]),
+            )
+        })
 }
 
 /// Read the length-prefixed payload portion of a frame after
@@ -213,7 +217,9 @@ mod tests {
     async fn envelope_roundtrip_raft_kind() {
         let payload = b"some-raft-rpc-payload";
         let (mut a, mut b) = duplex(64 * 1024);
-        write_envelope(&mut a, DispatchKind::Raft, payload).await.unwrap();
+        write_envelope(&mut a, DispatchKind::Raft, payload)
+            .await
+            .unwrap();
         let (kind, got) = read_envelope(&mut b).await.unwrap().unwrap();
         assert_eq!(kind, DispatchKind::Raft);
         assert_eq!(got, payload);
@@ -223,7 +229,9 @@ mod tests {
     async fn envelope_roundtrip_vote_kind() {
         let payload = b"some-vote-payload";
         let (mut a, mut b) = duplex(64 * 1024);
-        write_envelope(&mut a, DispatchKind::Vote, payload).await.unwrap();
+        write_envelope(&mut a, DispatchKind::Vote, payload)
+            .await
+            .unwrap();
         let (kind, got) = read_envelope(&mut b).await.unwrap().unwrap();
         assert_eq!(kind, DispatchKind::Vote);
         assert_eq!(got, payload);
@@ -235,7 +243,9 @@ mod tests {
         // encoding is actually exercised.
         let payload: Vec<u8> = (0..200_000).map(|i| (i % 256) as u8).collect();
         let (mut a, mut b) = duplex(256 * 1024);
-        write_envelope(&mut a, DispatchKind::Vote, &payload).await.unwrap();
+        write_envelope(&mut a, DispatchKind::Vote, &payload)
+            .await
+            .unwrap();
         let (kind, got) = read_envelope(&mut b).await.unwrap().unwrap();
         assert_eq!(kind, DispatchKind::Vote);
         assert_eq!(got.len(), payload.len());

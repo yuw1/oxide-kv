@@ -21,7 +21,11 @@ impl RaftStorage {
     /// Primarily used by tests to isolate each scenario in its own temp dir
     /// without depending on the global `Config`.
     pub fn new_with_paths(wal_path: String, meta_path: String, snapshot_path: String) -> Self {
-        Self { wal_path, meta_path, snapshot_path }
+        Self {
+            wal_path,
+            meta_path,
+            snapshot_path,
+        }
     }
 
     pub fn load_initial_state(&self) -> (u64, Option<String>, Vec<LogEntry>) {
@@ -39,9 +43,8 @@ impl RaftStorage {
             .append(true)
             .open(self.wal_path.clone())?;
 
-        let bytes = bincode::serialize(entry).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, e)
-        })?;
+        let bytes = bincode::serialize(entry)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
         file.write_all(&bytes)?;
         file.sync_all()?; // Ensure durability
@@ -103,9 +106,8 @@ impl RaftStorage {
 
     /// Persist a snapshot to disk atomically (write to .tmp, rename).
     pub fn save_snapshot(&self, snapshot: &Snapshot) -> std::io::Result<()> {
-        let json = serde_json::to_string_pretty(snapshot).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, e)
-        })?;
+        let json = serde_json::to_string_pretty(snapshot)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         let path = self.snapshot_path.clone();
         let temp_path = format!("{}.tmp", path);
         std::fs::write(&temp_path, json)?;
@@ -136,9 +138,8 @@ impl RaftStorage {
         let temp_path = format!("{}.tmp", self.wal_path);
         let mut file = std::fs::File::create(&temp_path)?;
         for entry in &entries {
-            let bytes = bincode::serialize(entry).map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::Other, e)
-            })?;
+            let bytes = bincode::serialize(entry)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
             file.write_all(&bytes)?;
         }
         file.sync_all()?;
@@ -157,8 +158,18 @@ mod tests {
     fn temp_storage() -> (TempDir, RaftStorage) {
         let dir = tempfile::tempdir().expect("tempdir");
         let wal = dir.path().join("test.wal").to_str().unwrap().to_string();
-        let meta = dir.path().join("test_meta.json").to_str().unwrap().to_string();
-        let snap = dir.path().join("test_snapshot.json").to_str().unwrap().to_string();
+        let meta = dir
+            .path()
+            .join("test_meta.json")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let snap = dir
+            .path()
+            .join("test_snapshot.json")
+            .to_str()
+            .unwrap()
+            .to_string();
         let storage = RaftStorage::new_with_paths(wal, meta, snap);
         (dir, storage)
     }
@@ -208,7 +219,9 @@ mod tests {
         let e = LogEntry {
             term: 5,
             index: 1,
-            command: Command::Delete { key: "gone".to_string() },
+            command: Command::Delete {
+                key: "gone".to_string(),
+            },
         };
         storage.append_wal_log(&e).expect("append");
 
@@ -231,8 +244,18 @@ mod tests {
         }
 
         let wal = dir.path().join("test.wal").to_str().unwrap().to_string();
-        let meta = dir.path().join("test_meta.json").to_str().unwrap().to_string();
-        let snap = dir.path().join("test_snapshot.json").to_str().unwrap().to_string();
+        let meta = dir
+            .path()
+            .join("test_meta.json")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let snap = dir
+            .path()
+            .join("test_snapshot.json")
+            .to_str()
+            .unwrap()
+            .to_string();
         let storage2 = RaftStorage::new_with_paths(wal, meta, snap);
 
         let restored = storage2.restore_wal_log();
@@ -248,7 +271,9 @@ mod tests {
     #[test]
     fn save_meta_then_read_meta_roundtrips() {
         let (_dir, storage) = temp_storage();
-        storage.save_meta(7, Some("node-2".to_string())).expect("save");
+        storage
+            .save_meta(7, Some("node-2".to_string()))
+            .expect("save");
         let (term, vote) = storage.read_meta();
         assert_eq!(term, 7);
         assert_eq!(vote.as_deref(), Some("node-2"));
@@ -280,7 +305,11 @@ mod tests {
         let mut data = HashMap::new();
         data.insert("alpha".into(), "1".into());
         data.insert("beta".into(), "2".into());
-        Snapshot { last_included_index: index, last_included_term: term, data }
+        Snapshot {
+            last_included_index: index,
+            last_included_term: term,
+            data,
+        }
     }
 
     #[test]
@@ -307,7 +336,10 @@ mod tests {
         let (dir, storage) = temp_storage();
         storage.save_snapshot(&sample_snapshot(1, 1)).unwrap();
         let temp_path = dir.path().join("test_snapshot.json.tmp");
-        assert!(!temp_path.exists(), "atomic rename should leave no .tmp file behind");
+        assert!(
+            !temp_path.exists(),
+            "atomic rename should leave no .tmp file behind"
+        );
     }
 
     #[test]
