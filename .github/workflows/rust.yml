@@ -10,6 +10,19 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  format:
+    # P8 cleanup follow-up: enforce `cargo fmt` on every PR so the
+    # codebase can't drift from rustfmt output. PR #57 brought the
+    # entire workspace to fmt-clean as a one-shot mechanical pass;
+    # this gate keeps it that way going forward.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install rustfmt
+        run: rustup component add rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
   build:
 
     runs-on: ubuntu-latest
