@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (ci: enforce `cargo fmt` on every PR)
+
+`.github/workflows/rust.yml` gains a new `format:` job that runs
+`cargo fmt --all -- --check` on every PR. The job is the first
+in the workflow so it short-circuits before the 5+ minute `build`
+job if any \`.rs\` file is unformatted.
+
+The codebase was brought to fmt-clean by PR #57 (mechanical
+`cargo fmt --all` pass over 44 files); this gate is the lock that
+keeps it that way. Future PRs that touch Rust files must run
+`cargo fmt` locally before pushing or CI will reject the PR.
+
+Verified locally: `cargo fmt --all -- --check` exits 0 against
+the current master (the gate would pass on the PR that introduces
+it, so we know the baseline is clean).
+
 ### Changed (chore: apply `cargo fmt` to entire workspace)
 
 Mechanical formatting pass via `cargo fmt --all` against the Rust
