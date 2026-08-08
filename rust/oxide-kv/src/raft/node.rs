@@ -867,11 +867,11 @@ impl RaftNode {
         if self.state != NodeState::Leader {
             return false;
         }
-        let mut next_index = self.log.len() as u64 + 1;
-        for command in commands {
+        let first_index = self.log.len() + 1;
+        for (offset, command) in commands.into_iter().enumerate() {
             let entry = LogEntry {
                 term: self.current_term,
-                index: next_index as usize,
+                index: first_index + offset,
                 command,
             };
             if let Err(e) = self.storage.append_wal_log(&entry) {
@@ -879,7 +879,6 @@ impl RaftNode {
                 return false;
             }
             self.log.push(entry);
-            next_index += 1;
         }
         // See `propose` for rationale; the batch path needs the
         // same single refresh at the end, not per-iteration.
