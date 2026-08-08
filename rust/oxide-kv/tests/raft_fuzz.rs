@@ -1027,7 +1027,7 @@ async fn shrink_algorithm_strictly_shorter_or_equal() {
         shrunk.len()
     );
     assert!(
-        shrunk.len() >= 1,
+        !shrunk.is_empty(),
         "shrinker removed the only failing action"
     );
     assert!(

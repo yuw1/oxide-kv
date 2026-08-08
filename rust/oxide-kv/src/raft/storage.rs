@@ -8,6 +8,12 @@ pub struct RaftStorage {
     snapshot_path: String,
 }
 
+impl Default for RaftStorage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RaftStorage {
     pub fn new() -> Self {
         Self {
@@ -43,8 +49,7 @@ impl RaftStorage {
             .append(true)
             .open(self.wal_path.clone())?;
 
-        let bytes = bincode::serialize(entry)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let bytes = bincode::serialize(entry).map_err(std::io::Error::other)?;
 
         file.write_all(&bytes)?;
         file.sync_all()?; // Ensure durability
@@ -94,20 +99,19 @@ impl RaftStorage {
     }
 
     pub fn read_meta(&self) -> (u64, Option<String>) {
-        if let Ok(content) = std::fs::read_to_string(self.meta_path.clone()) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
-                let term = v["current_term"].as_u64().unwrap_or(0);
-                let vote = v["vote_for"].as_str().map(|s| s.to_string());
-                return (term, vote);
-            }
+        if let Ok(content) = std::fs::read_to_string(self.meta_path.clone())
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&content)
+        {
+            let term = v["current_term"].as_u64().unwrap_or(0);
+            let vote = v["vote_for"].as_str().map(|s| s.to_string());
+            return (term, vote);
         }
         (0, None)
     }
 
     /// Persist a snapshot to disk atomically (write to .tmp, rename).
     pub fn save_snapshot(&self, snapshot: &Snapshot) -> std::io::Result<()> {
-        let json = serde_json::to_string_pretty(snapshot)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let json = serde_json::to_string_pretty(snapshot).map_err(std::io::Error::other)?;
         let path = self.snapshot_path.clone();
         let temp_path = format!("{}.tmp", path);
         std::fs::write(&temp_path, json)?;
@@ -138,8 +142,7 @@ impl RaftStorage {
         let temp_path = format!("{}.tmp", self.wal_path);
         let mut file = std::fs::File::create(&temp_path)?;
         for entry in &entries {
-            let bytes = bincode::serialize(entry)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            let bytes = bincode::serialize(entry).map_err(std::io::Error::other)?;
             file.write_all(&bytes)?;
         }
         file.sync_all()?;

@@ -639,7 +639,7 @@ impl RaftNode {
 
             if let Err(e) = self
                 .storage
-                .save_meta(self.current_term.clone(), self.vote_for.clone())
+                .save_meta(self.current_term, self.vote_for.clone())
             {
                 error!(error = %e, "failed to save metadata after term update");
             }
@@ -661,7 +661,7 @@ impl RaftNode {
             self.vote_for = Some(args.candidate_id.clone());
             let _ = self
                 .storage
-                .save_meta(self.current_term.clone(), self.vote_for.clone());
+                .save_meta(self.current_term, self.vote_for.clone());
             self.last_heartbeat = self.clock.now();
 
             VoteResponseArgs {
@@ -867,11 +867,11 @@ impl RaftNode {
         if self.state != NodeState::Leader {
             return false;
         }
-        let mut next_index = self.log.len() as u64 + 1;
-        for command in commands {
+        let first_index = self.log.len() + 1;
+        for (offset, command) in commands.into_iter().enumerate() {
             let entry = LogEntry {
                 term: self.current_term,
-                index: next_index as usize,
+                index: first_index + offset,
                 command,
             };
             if let Err(e) = self.storage.append_wal_log(&entry) {
@@ -879,7 +879,6 @@ impl RaftNode {
                 return false;
             }
             self.log.push(entry);
-            next_index += 1;
         }
         // See `propose` for rationale; the batch path needs the
         // same single refresh at the end, not per-iteration.
@@ -1164,9 +1163,7 @@ impl RaftNode {
                             n.current_term = reply.term;
                             n.state = NodeState::Follower;
                             n.vote_for = None;
-                            let _ = n
-                                .storage
-                                .save_meta(n.current_term.clone(), n.vote_for.clone());
+                            let _ = n.storage.save_meta(n.current_term, n.vote_for.clone());
                             n.refresh_metrics();
                         } else {
                             // Log inconsistency: decrement next_index and retry
@@ -1282,11 +1279,11 @@ impl RaftNode {
                 let mut state_machine = self.state_machine.write().unwrap();
                 match &cmd {
                     Command::Set { key, value } => {
-                        let _ = state_machine.set(&*key.clone(), &*value.clone());
+                        let _ = state_machine.set(&key.clone(), &value.clone());
                         debug!(index = entry_idx, key = %key, value = %value, "apply: SET");
                     }
                     Command::Delete { key } => {
-                        let _ = state_machine.delete(&key);
+                        let _ = state_machine.delete(key);
                         debug!(index = entry_idx, key = %key, "apply: DELETE");
                     }
                     Command::BeginTx { tx_id, ops } => {
@@ -1416,10 +1413,10 @@ impl RaftNode {
         for entry in &self.log {
             match &entry.command {
                 Command::Set { key, value } => {
-                    let _ = state_machine.set(&*key.clone(), &*value.clone());
+                    let _ = state_machine.set(&key.clone(), &value.clone());
                 }
                 Command::Delete { key } => {
-                    let _ = state_machine.delete(&key);
+                    let _ = state_machine.delete(key);
                 }
                 Command::BeginTx { tx_id, ops } => {
                     let _ = state_machine.begin_tx(tx_id.clone(), ops.clone());
@@ -1509,7 +1506,7 @@ impl RaftNode {
         Self::promote_to_candidate_locked(&mut node);
         info!(node = %node.node_id, term = node.current_term, "became candidate");
         let term = node.current_term;
-        let state = node.state.clone();
+        let state = node.state;
         drop(node);
         debug_assert_eq!(state, NodeState::Candidate);
         let _ = term; // silence unused if assertions off
@@ -1710,7 +1707,7 @@ impl RaftNode {
         }
         Self::promote_to_candidate_locked(&mut n);
         let new_term = n.current_term;
-        let state_after = n.state.clone();
+        let state_after = n.state;
         drop(n);
         debug_assert_eq!(state_after, NodeState::Candidate);
         debug_assert_eq!(new_term, probed_term);
@@ -1792,9 +1789,7 @@ impl RaftNode {
                             n.current_term = reply.term;
                             n.state = NodeState::Follower;
                             n.vote_for = None;
-                            let _ = n
-                                .storage
-                                .save_meta(n.current_term.clone(), n.vote_for.clone());
+                            let _ = n.storage.save_meta(n.current_term, n.vote_for.clone());
                         }
                     }
                     Ok(other) => {
@@ -1875,7 +1870,7 @@ impl RaftNode {
             self.vote_for = None;
             let _ = self
                 .storage
-                .save_meta(self.current_term.clone(), self.vote_for.clone());
+                .save_meta(self.current_term, self.vote_for.clone());
         }
         self.state = NodeState::Follower;
         self.last_heartbeat = self.clock.now();
@@ -1896,7 +1891,7 @@ impl RaftNode {
 
         // Append entries and resolve conflicts
         for entry in &args.entries {
-            let idx = (entry.index - 1) as usize;
+            let idx = entry.index - 1;
             if idx < self.log.len() {
                 if self.log[idx].term != entry.term {
                     self.log.truncate(idx);
@@ -1966,7 +1961,7 @@ impl RaftNode {
             self.vote_for = None;
             let _ = self
                 .storage
-                .save_meta(self.current_term.clone(), self.vote_for.clone());
+                .save_meta(self.current_term, self.vote_for.clone());
         }
         self.state = NodeState::Follower;
         self.last_heartbeat = self.clock.now();
@@ -2821,8 +2816,8 @@ mod tests {
         let sm = sm_data(&node);
         assert_eq!(sm.get("alpha").map(String::as_str), Some("1"));
         assert_eq!(sm.get("beta").map(String::as_str), Some("2"));
-        assert!(sm.get("old").is_none(), "snapshot must wipe stale data");
-        assert!(sm.get("keep").is_none(), "snapshot must wipe stale data");
+        assert!(!sm.contains_key("old"), "snapshot must wipe stale data");
+        assert!(!sm.contains_key("keep"), "snapshot must wipe stale data");
     }
 
     #[test]
@@ -4223,7 +4218,7 @@ mod tests {
 
     #[test]
     fn handle_join_cluster_rejects_candidate_addr_already_member() {
-        let mut node = make_join_cluster_leader();
+        let node = make_join_cluster_leader();
         // Idempotent retry safety net: n2 is already in the cluster.
         let resp = node.handle_join_cluster(&JoinClusterRequest {
             candidate_addr: "n2".into(),
@@ -4456,7 +4451,7 @@ mod tests {
         // correctly delegates to the state machine. Seed an old tx
         // via apply_logs and verify the threshold-based filter
         // works.
-        let mut node = make_leader_with_pending_tx("node-old");
+        let node = make_leader_with_pending_tx("node-old");
         // Hand-poke the begin_unix_ms back by 1 second so it's
         // "older than now".
         {
@@ -4507,7 +4502,7 @@ mod tests {
         node.current_term = 5;
         node.state = NodeState::Leader;
         let initial_term = node.current_term;
-        let initial_state = node.state.clone();
+        let initial_state = node.state;
 
         let args = append_args(5, "n2", 0, 0, vec![], 0);
         let reply = node.handle_append_entries(&args);

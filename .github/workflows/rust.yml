@@ -23,6 +23,24 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+  clippy:
+    # Enforce a zero-warning workspace: `cargo clippy --workspace
+    # --all-targets -- -D warnings` on every PR. The one-shot cleanup
+    # (chore/clippy-clean-and-gate) brought every target — lib, bin,
+    # examples, and all integration test binaries — to clippy-clean;
+    # this gate keeps it that way going forward, mirroring the fmt
+    # gate introduced in PR #58. Needs protoc because build.rs
+    # (prost-build) runs before clippy can type-check.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install clippy
+        run: rustup component add clippy
+      - name: Run clippy (workspace, all targets, warnings = errors)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
   build:
 
     runs-on: ubuntu-latest

@@ -108,7 +108,7 @@ async fn pre_vote_isolated_follower_does_not_promote_or_disrupt() {
     // (5) node-1 must still be PreCandidate or have reverted to
     // Follower (PreCandidate if the probe is still in flight,
     // Follower if it timed out). It must NEVER be Candidate.
-    let final_state = node1.read().unwrap().state.clone();
+    let final_state = node1.read().unwrap().state;
     let final_term = node1.read().unwrap().current_term;
     assert!(
         matches!(final_state, NodeState::Follower | NodeState::PreCandidate),
@@ -195,7 +195,7 @@ async fn pre_vote_with_quorum_promotes_and_wins_election() {
     })
     .await;
 
-    let state = node1.read().unwrap().state.clone();
+    let state = node1.read().unwrap().state;
     let term = node1.read().unwrap().current_term;
     assert!(
         won,

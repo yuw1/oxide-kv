@@ -15,6 +15,7 @@
 //! - You'd need to keep two leaders alive simultaneously.
 //! - You'd need to wait for several election timeouts to elapse
 //!   (3-5 seconds each) before the post-partition election fires.
+//!
 //! The SimHarness compresses all of that into ~1 second.
 
 use oxide_kv::raft::fault_scheduler::{AlwaysDeliver, LinkId, PartitionedNetwork};
@@ -123,27 +124,26 @@ async fn dst_split_brain_old_leader_truncates_divergent_log() {
     // its last_applied should reach index 2.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let n0_log = &cluster.nodes[0].raft.read().unwrap().log;
-        let n0_applied = cluster.nodes[0].raft.read().unwrap().last_applied;
-        let n0_term = cluster.nodes[0].raft.read().unwrap().current_term;
-        // Truncation done when n0's log has 2 entries and
-        // neither of them is "b".
-        let has_b = n0_log.iter().any(|e| {
-            matches!(
-                &e.command,
-                oxide_kv::protocol::Command::Set { key, .. } if key == "b"
-            )
-        });
-        if !has_b && n0_log.len() == 2 && n0_applied >= 2 && n0_term >= 2 {
+        // Snapshot the read-locked fields then drop the guards before
+        // the await; clippy's `await_holding_lock` would otherwise
+        // fire (the lock is only a sync `RwLock`, not async-aware).
+        let (n0_log_len, has_b, n0_applied, n0_term) = {
+            let n0 = cluster.nodes[0].raft.read().unwrap();
+            let has_b = n0.log.iter().any(|e| {
+                matches!(
+                    &e.command,
+                    oxide_kv::protocol::Command::Set { key, .. } if key == "b"
+                )
+            });
+            (n0.log.len(), has_b, n0.last_applied, n0.current_term)
+        };
+        if !has_b && n0_log_len == 2 && n0_applied >= 2 && n0_term >= 2 {
             break;
         }
         if std::time::Instant::now() >= deadline {
             panic!(
                 "n0 did not converge after heal: log_len={}, has_b={}, last_applied={}, term={}",
-                n0_log.len(),
-                has_b,
-                n0_applied,
-                n0_term
+                n0_log_len, has_b, n0_applied, n0_term
             );
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -248,15 +248,20 @@ async fn dst_divergent_log_higher_term_wins() {
     // Step 7+8: wait for n0 to converge.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let n0 = cluster.nodes[0].raft.read().unwrap();
-        if n0.current_term >= 2
-            && n0.state == oxide_kv::raft::node::NodeState::Follower
-            && n0.log.len() == 2
-            && n0.last_applied >= 2
-        {
+        // Snapshot read-locked state then drop the guard before
+        // the await (clippy await_holding_lock; sync RwLock).
+        let converged = {
+            let n0 = cluster.nodes[0].raft.read().unwrap();
+            n0.current_term >= 2
+                && n0.state == oxide_kv::raft::node::NodeState::Follower
+                && n0.log.len() == 2
+                && n0.last_applied >= 2
+        };
+        if converged {
             break;
         }
         if std::time::Instant::now() >= deadline {
+            let n0 = cluster.nodes[0].raft.read().unwrap();
             panic!(
                 "n0 did not converge: term={}, state={:?}, log_len={}, last_applied={}",
                 n0.current_term,
@@ -265,7 +270,6 @@ async fn dst_divergent_log_higher_term_wins() {
                 n0.last_applied
             );
         }
-        drop(n0);
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
@@ -375,17 +379,22 @@ async fn dst_stale_leader_steps_down_and_does_not_apply_uncommitted() {
     // removed from the log immediately.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let n0 = cluster.nodes[0].raft.read().unwrap();
-        if n0.current_term >= 2 && n0.state == oxide_kv::raft::node::NodeState::Follower {
+        // Snapshot read-locked state then drop the guard before
+        // the await (clippy await_holding_lock; sync RwLock).
+        let stepped_down = {
+            let n0 = cluster.nodes[0].raft.read().unwrap();
+            n0.current_term >= 2 && n0.state == oxide_kv::raft::node::NodeState::Follower
+        };
+        if stepped_down {
             break;
         }
         if std::time::Instant::now() >= deadline {
+            let n0 = cluster.nodes[0].raft.read().unwrap();
             panic!(
                 "n0 did not step down: term={}, state={:?}",
                 n0.current_term, n0.state
             );
         }
-        drop(n0);
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 

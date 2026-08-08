@@ -40,7 +40,7 @@ impl ClientHandler {
                     let response_json = Self::dispatch_command(command, &node_arc).await;
 
                     // 3. Send response back to client
-                    let resp_str = format!("{}\n", response_json.to_string());
+                    let resp_str = format!("{}\n", response_json);
                     if let Err(e) = writer.write_all(resp_str.as_bytes()).await {
                         warn!(error = %e, "failed to send response");
                         break;
