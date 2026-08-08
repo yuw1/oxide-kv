@@ -653,8 +653,7 @@ impl StateMachine {
     }
 
     fn append_wal(&mut self, op: &WalOp) -> io::Result<()> {
-        let line =
-            serde_json::to_string(op).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let line = serde_json::to_string(op).map_err(io::Error::other)?;
         writeln!(self.wal, "{line}")?;
         self.wal.sync_all()?;
         Ok(())
@@ -662,8 +661,7 @@ impl StateMachine {
 }
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
-    let s =
-        serde_json::to_string_pretty(value).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let s = serde_json::to_string_pretty(value).map_err(io::Error::other)?;
     let tmp = path.with_extension("tmp");
     fs::write(&tmp, s)?;
     fs::rename(tmp, path)?;
@@ -682,12 +680,12 @@ fn parse_sst_id(path: &Path) -> Option<u64> {
 
 fn load_sst_meta(path: &Path) -> io::Result<SSTableMeta> {
     let raw = fs::read_to_string(meta_path(path))?;
-    serde_json::from_str(&raw).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+    serde_json::from_str(&raw).map_err(io::Error::other)
 }
 
 fn load_sst_entries(path: &Path) -> io::Result<Vec<SSTEntry>> {
     let raw = fs::read_to_string(path)?;
-    serde_json::from_str(&raw).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+    serde_json::from_str(&raw).map_err(io::Error::other)
 }
 
 fn now_unix() -> u64 {
@@ -1383,6 +1381,5 @@ mod tests {
         assert_eq!(view.op_count, 1);
         // `begin_unix_ms` is private; round-trip is verified by
         // snapshot install tests in `integration_2pc.rs`.
-        drop(view);
     }
 }

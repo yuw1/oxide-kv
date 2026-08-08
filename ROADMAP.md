@@ -356,7 +356,7 @@ All six acceptance criteria verified on `master`:
 3. ✅ Tx timeout + admin abort (PR #40): `OXIDE_TX_TIMEOUT_MS` default 30 s + `AbortTx` JSON RPC.
 4. ✅ `/metrics` endpoint (PR #42): 13 metrics + `/health`; three-node scrape verified manually.
 5. ✅ Cross-process smoke test (PR #43) green in CI; the three consensus-scope tests that were `#[ignore]`-gated on the split-brain / commit-advance bugs now pass un-gated (fixes PRs #50/#51) and run in every CI smoke run.
-6. ✅ No regressions: 268 lib tests, master CI green.
+6. ✅ No regressions: 268 lib tests, master CI green. *(Follow-up: clippy debt is now **zero** workspace-wide — every target, including all integration test binaries — and enforced per-PR by a new CI gate alongside the `cargo fmt` gate from PR #58.)*
 
 P9 directions (TLS, gRPC, LSM polish, sharded multi-Raft, client-side leader re-discovery on `NotLeaderError`, server-side `WhoIsLeader` RPC) are intentionally deferred; see "Future directions" above.
 

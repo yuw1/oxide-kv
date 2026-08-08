@@ -32,7 +32,7 @@
 // matching the pattern in `joint_consensus.rs`. Real cross-process
 // smoke testing lives in the P8 PR #9 systemd integration test.
 
-use oxide_kv::protocol::{Command, ServerId};
+use oxide_kv::protocol::ServerId;
 use oxide_kv::raft::net::StopSignal;
 use oxide_kv::raft::node::{NodeState, RaftNode};
 use oxide_kv::raft::rpc::{JoinClusterRequest, JoinClusterResponse, RaftMessage, RpcServer};
@@ -96,16 +96,11 @@ async fn spawn_node(peers: Vec<String>) -> TestNode {
     // RPC listener.
     let r = raft.clone();
     tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((stream, _)) => {
-                    let r2 = r.clone();
-                    tokio::spawn(async move {
-                        let _ = RpcServer::handle_raft_rpc(stream, r2).await;
-                    });
-                }
-                Err(_) => break,
-            }
+        while let Ok((stream, _)) = listener.accept().await {
+            let r2 = r.clone();
+            tokio::spawn(async move {
+                let _ = RpcServer::handle_raft_rpc(stream, r2).await;
+            });
         }
     });
 

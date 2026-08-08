@@ -556,6 +556,15 @@ impl Transport for SimTransport {
     }
 }
 
+// Compile-time check: SimTransport and Network must be Send + Sync
+// + 'static so they can live behind `Arc<dyn Transport>` or be
+// shared across test tasks.
+const _: fn() = || {
+    fn assert_send_sync_static<T: Send + Sync + 'static>() {}
+    assert_send_sync_static::<SimTransport>();
+    assert_send_sync_static::<Network>();
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -874,12 +883,3 @@ mod tests {
         let _ = tokio::time::timeout(Duration::from_secs(1), serve_handle).await;
     }
 }
-
-// Compile-time check: SimTransport and Network must be Send + Sync
-// + 'static so they can live behind `Arc<dyn Transport>` or be
-// shared across test tasks.
-const _: fn() = || {
-    fn assert_send_sync_static<T: Send + Sync + 'static>() {}
-    assert_send_sync_static::<SimTransport>();
-    assert_send_sync_static::<Network>();
-};

@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (ci: enforce `cargo clippy` on every PR)
+
+`.github/workflows/rust.yml` gains a new `clippy:` job that runs
+`cargo clippy --workspace --all-targets -- -D warnings` on every
+PR, mirroring the `cargo fmt` gate introduced in PR #58. All
+targets are checked — lib, bin, examples, and every integration
+test binary — so test code can no longer accrue lint debt either.
+The job installs protoc because `build.rs` (prost-build) must run
+before clippy can type-check.
+
+The accompanying cleanup commit brought the whole workspace to
+zero clippy warnings so the gate passes from day one. All fixes
+are mechanical and behavior-preserving:
+
+- `clippy::io_other_error`: `io::Error::new(ErrorKind::Other, e)`
+  → `io::Error::other(e)` (8 sites in `storage.rs` /
+  `state_machine.rs`)
+- `clippy::while_let_loop` → `while let Ok(..)` accept loops in 3
+  integration test binaries
+- `clippy::await_holding_lock`: `tests/raft_dst_log_conflict.rs`
+  now snapshots the read-locked fields and drops the guard before
+  awaiting (sync `RwLock` held across `.await` was harmless here
+  but is now structurally impossible in these loops)
+- `clippy::clone_on_copy` / redundant clones on `Copy` fields
+  (`NodeState`, `u64` term) across `node.rs` and tests
+- `clippy::collapsible_if` → let-chains in `RaftStorage::read_meta`
+- `clippy::new_without_default`: `Default` impl for `RaftStorage`
+- `clippy::len_zero`, `clippy::doc_lazy_continuation`,
+  `clippy::to_string_in_format_args`, `unused_mut`, a no-op
+  `drop(view)` and an unnecessary `as usize` cast
+- `assert!(sm.get(k).is_none())` → `assert!(!sm.contains_key(k))`
+  in snapshot-install test
+
+Verified locally: `cargo clippy --workspace --all-targets --
+-D warnings` exits 0; full workspace test sweep green (271 lib
+tests + all integration binaries + default fuzz seeds).
+
 ### Added (ci: enforce `cargo fmt` on every PR)
 
 `.github/workflows/rust.yml` gains a new `format:` job that runs

@@ -121,16 +121,11 @@ async fn spawn_node(peers: Vec<String>) -> TestNode {
     // RPC listener.
     let r = raft.clone();
     tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((stream, _)) => {
-                    let r2 = r.clone();
-                    tokio::spawn(async move {
-                        let _ = RpcServer::handle_raft_rpc(stream, r2).await;
-                    });
-                }
-                Err(_) => break,
-            }
+        while let Ok((stream, _)) = listener.accept().await {
+            let r2 = r.clone();
+            tokio::spawn(async move {
+                let _ = RpcServer::handle_raft_rpc(stream, r2).await;
+            });
         }
     });
 

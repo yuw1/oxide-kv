@@ -215,7 +215,7 @@ async fn elect_leader(nodes: &[TestNode]) {
     // state machine for a short window.
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     loop {
-        let s = leader.raft.read().unwrap().state.clone();
+        let s = leader.raft.read().unwrap().state;
         if s == NodeState::Leader {
             break;
         }
@@ -248,7 +248,7 @@ async fn client_command(listener_port: u16, payload: serde_json::Value) -> serde
     let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", listener_port))
         .await
         .expect("client connect");
-    let payload_str = format!("{}\n", payload.to_string());
+    let payload_str = format!("{}\n", payload);
     stream
         .write_all(payload_str.as_bytes())
         .await
@@ -266,16 +266,11 @@ async fn spawn_client_listener(node: Arc<RwLock<RaftNode>>) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let port = listener.local_addr().expect("addr").port();
     tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((stream, _)) => {
-                    let n = node.clone();
-                    tokio::spawn(async move {
-                        let _ = ClientHandler::handle_client_request(stream, n).await;
-                    });
-                }
-                Err(_) => break,
-            }
+        while let Ok((stream, _)) = listener.accept().await {
+            let n = node.clone();
+            tokio::spawn(async move {
+                let _ = ClientHandler::handle_client_request(stream, n).await;
+            });
         }
     });
     port

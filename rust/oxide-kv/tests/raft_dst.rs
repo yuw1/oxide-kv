@@ -389,8 +389,8 @@ async fn dst_reference_model_cross_check_under_faults() {
     };
 
     // Phase 1: 3 writes on the steady-state leader.
-    let i1 = cluster.submit_set(leader_idx, "alpha", "1");
-    let i2 = cluster.submit_set(leader_idx, "beta", "2");
+    let _i1 = cluster.submit_set(leader_idx, "alpha", "1");
+    let _i2 = cluster.submit_set(leader_idx, "beta", "2");
     let i3 = cluster.submit_set(leader_idx, "gamma", "3");
     cluster
         .wait_for_replication(i3, Duration::from_secs(5))
@@ -424,7 +424,7 @@ async fn dst_reference_model_cross_check_under_faults() {
     partition.partition(LinkId::new("n0", "n2"));
     partition.partition(LinkId::new("n1", "n2"));
 
-    let i4 = cluster.submit_set(leader_idx, "delta", "4");
+    let _i4 = cluster.submit_set(leader_idx, "delta", "4");
     let i5 = cluster.submit_set(leader_idx, "epsilon", "5");
     cluster
         .wait_for_replication_except(i5, &[2], Duration::from_secs(5))
@@ -482,7 +482,7 @@ async fn dst_reference_model_cross_check_after_leader_failover() {
         rm.drain_to(cluster, idx);
     };
 
-    let i1 = cluster.submit_set(leader_idx, "k1", "v1");
+    let _i1 = cluster.submit_set(leader_idx, "k1", "v1");
     let i2 = cluster.submit_set(leader_idx, "k2", "v2");
     cluster
         .wait_for_replication(i2, Duration::from_secs(5))
