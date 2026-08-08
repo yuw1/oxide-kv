@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (chore: pin Rust toolchain to 1.97.0)
+
+New `rust-toolchain.toml` at the repository root pins the toolchain
+to `1.97.0` (+ clippy + rustfmt components). rustup picks it up
+automatically for everyone entering the repo — developers and GitHub
+CI runners alike — with no workflow changes required.
+
+Why: CI runs whichever stable is current on the runner image, which
+can silently drift ahead of local installs. PR #59 demonstrated the
+failure mode: local stable 1.89 was clippy-clean while CI's 1.97
+flagged an additional `explicit_counter_loop` lint and failed the
+clippy job. Pinning makes lint, format, and build behavior identical
+between local and CI. Bumping the toolchain is now an explicit,
+reviewable change to this file.
+
 ### Added (ci: enforce `cargo clippy` on every PR)
 
 `.github/workflows/rust.yml` gains a new `clippy:` job that runs

@@ -1,0 +1,17 @@
+# Pin the Rust toolchain so local development and CI (GitHub
+# ubuntu-latest runners) always use the exact same version.
+#
+# Why: CI runs the latest stable available on the runner image, which
+# silently drifts ahead of local installs. PR #59 hit exactly this —
+# local stable 1.89 was clippy-clean while CI's 1.97 flagged an extra
+# `explicit_counter_loop` lint and failed the newly added clippy job.
+# Pinning makes lint/format/build behavior identical everywhere.
+#
+# Note: pin a concrete version, not "stable" — "stable" would drift
+# with time and defeat the purpose. Bumping the version is an
+# explicit, reviewable change to this file.
+#
+# rustup picks this file up automatically; no workflow changes needed.
+[toolchain]
+channel = "1.97.0"
+components = ["clippy", "rustfmt"]
